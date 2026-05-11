@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local artefacts
+*.mp4
+*.mov
+*.npy
+*.npz
+*.pt
+*.ts
+*.png
+*.jpg
+*.jpeg
+*.json
+*.out
+
+# OS
+.DS_Store
+.DS_store
+
+# Editor
+.vscode/
+.idea/
