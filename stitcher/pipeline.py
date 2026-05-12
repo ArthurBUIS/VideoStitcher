@@ -101,9 +101,13 @@ from stitcher.io_utils import (
 )
 from stitcher.motion import (
     compute_motion_mask_cpu,
+    compute_motion_mask_cpu_edges,
     compute_motion_mask_gpu,
+    compute_motion_mask_gpu_edges,
     grab_baseline_from_videos,
     load_baseline_images,
+    sobel_magnitude_cpu,
+    sobel_magnitude_gpu,
     validate_baseline_shape,
 )
 from stitcher.seam import (
@@ -446,10 +450,14 @@ def run(args):
     # --- Motion detection (baseline subtraction) --------------------------
     use_motion = bool(args.motion)
     motion_dilate_kernel = None
-    baseline_warped_a_t = None   # GPU path
+    baseline_warped_a_t = None   # GPU pixel-method baseline
     baseline_warped_b_t = None
-    baseline_warped_a = None     # CPU path
+    baseline_warped_a = None     # CPU pixel-method baseline
     baseline_warped_b = None
+    baseline_grad_a_t = None     # GPU edge-method baseline (precomputed)
+    baseline_grad_b_t = None
+    baseline_grad_a = None       # CPU edge-method baseline (precomputed)
+    baseline_grad_b = None
     if use_motion:
         paths_a = args.motion_baseline_a
         paths_b = args.motion_baseline_b
@@ -489,6 +497,9 @@ def run(args):
                 grid_pair_t, gpu_ctx["device"],
                 gain_a_t=gain_a_t, gain_b_t=gain_b_t,
             )
+            if args.motion_method == "edges":
+                baseline_grad_a_t = sobel_magnitude_gpu(baseline_warped_a_t)
+                baseline_grad_b_t = sobel_magnitude_gpu(baseline_warped_b_t)
         else:
             if lut_a is not None:
                 baseline_frame_a = apply_gain_lut(baseline_frame_a, lut_a)
@@ -497,7 +508,11 @@ def run(args):
                                           cv2.INTER_LINEAR)
             baseline_warped_b = cv2.remap(baseline_frame_b, map_bx, map_by,
                                           cv2.INTER_LINEAR)
-        print(f"[info] Motion: threshold={args.motion_threshold} "
+            if args.motion_method == "edges":
+                baseline_grad_a = sobel_magnitude_cpu(baseline_warped_a)
+                baseline_grad_b = sobel_magnitude_cpu(baseline_warped_b)
+        print(f"[info] Motion: method={args.motion_method} "
+              f"threshold={args.motion_threshold} "
               f"dilate={args.motion_dilate} penalty={args.motion_penalty:g}")
 
     W, H = output_size
@@ -617,24 +632,42 @@ def run(args):
 
         # Motion mask (baseline subtraction). Recomputed every frame;
         # reuses the already-warped current frames, so the marginal cost
-        # is just the diff + threshold + dilate.
+        # is just the diff + threshold + dilate. Method picks between
+        # pixel diff (raw |current - baseline|) and edge diff
+        # (Sobel-magnitude diff, robust to brightness drift).
         motion_mask_bbox_t = None
         motion_mask_bbox = None
         if use_motion:
             if dev["cuda_available"]:
-                motion_mask_bbox_t = compute_motion_mask_gpu(
-                    warped_a_t, warped_b_t,
-                    baseline_warped_a_t, baseline_warped_b_t,
-                    args.motion_threshold, args.motion_dilate,
-                    static["overlap_bbox"], overlap_in_bbox_t,
-                )
+                if args.motion_method == "edges":
+                    motion_mask_bbox_t = compute_motion_mask_gpu_edges(
+                        warped_a_t, warped_b_t,
+                        baseline_grad_a_t, baseline_grad_b_t,
+                        args.motion_threshold, args.motion_dilate,
+                        static["overlap_bbox"], overlap_in_bbox_t,
+                    )
+                else:  # "pixel"
+                    motion_mask_bbox_t = compute_motion_mask_gpu(
+                        warped_a_t, warped_b_t,
+                        baseline_warped_a_t, baseline_warped_b_t,
+                        args.motion_threshold, args.motion_dilate,
+                        static["overlap_bbox"], overlap_in_bbox_t,
+                    )
             else:
-                motion_mask_bbox = compute_motion_mask_cpu(
-                    warped_a, warped_b,
-                    baseline_warped_a, baseline_warped_b,
-                    args.motion_threshold, motion_dilate_kernel,
-                    static["overlap_bbox"], static["overlap_in_bbox"],
-                )
+                if args.motion_method == "edges":
+                    motion_mask_bbox = compute_motion_mask_cpu_edges(
+                        warped_a, warped_b,
+                        baseline_grad_a, baseline_grad_b,
+                        args.motion_threshold, motion_dilate_kernel,
+                        static["overlap_bbox"], static["overlap_in_bbox"],
+                    )
+                else:  # "pixel"
+                    motion_mask_bbox = compute_motion_mask_cpu(
+                        warped_a, warped_b,
+                        baseline_warped_a, baseline_warped_b,
+                        args.motion_threshold, motion_dilate_kernel,
+                        static["overlap_bbox"], static["overlap_in_bbox"],
+                    )
 
         ds = max(1, args.seam_downscale)
 

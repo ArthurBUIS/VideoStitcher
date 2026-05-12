@@ -1,11 +1,16 @@
 """
 Motion detection via baseline subtraction.
 
-For fixed cameras, the most robust "is something different from the
-empty room" signal is just `|current - baseline| > threshold` applied
-per camera, OR'd, dilated. Unlike MOG2 it doesn't fade stationary
-objects into the background, and it reuses the already-warped frames
-in the per-frame loop so the extra cost is small.
+For fixed cameras, the "is something different from the empty room"
+signal is built from a per-camera diff against a baseline frame,
+OR'd, thresholded, dilated. Two diff strategies:
+
+    * pixel : raw |current - baseline| on BGR. Cheap but sensitive
+              to camera auto-exposure / auto-white-balance drift.
+    * edges : |Sobel(current) - Sobel(baseline)| on grayscale.
+              Robust to drift since edges depend on relative
+              contrasts within a neighborhood, not absolute pixel
+              values.
 
 The motion mask is fed into the cost map as an additive penalty,
 parallel to fg_mask, gated only by the person mask (so motion never
@@ -14,16 +19,26 @@ overrides person priority).
 Baseline acquisition:
     * If both --motion_baseline_a and --motion_baseline_b are given,
       load the images from disk.
-    * Otherwise, fall back to frame 0 of each input video. Convenient
-      for quick tests when the room is empty at the very start of the
-      recording.
+    * Otherwise, fall back to frame 0 of each input video.
 """
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from stitcher.warp import dilate_gpu
+
+
+# Sobel kernels for the edge-based diff. L1 magnitude (|Gx| + |Gy|) is
+# slightly cheaper than L2 and sufficient for the threshold-then-dilate
+# pipeline that follows.
+_SOBEL_X = torch.tensor([[-1.0, 0.0, 1.0],
+                         [-2.0, 0.0, 2.0],
+                         [-1.0, 0.0, 1.0]])
+_SOBEL_Y = torch.tensor([[-1.0, -2.0, -1.0],
+                         [ 0.0,  0.0,  0.0],
+                         [ 1.0,  2.0,  1.0]])
 
 
 def load_baseline_images(path_a, path_b):
@@ -115,6 +130,89 @@ def compute_motion_mask_cpu(warped_a, warped_b,
     total_a = diff_a.astype(np.int32).sum(axis=2)
     total_b = diff_b.astype(np.int32).sum(axis=2)
     motion = ((total_a > threshold) | (total_b > threshold)).astype(np.uint8) * 255
+    if dilate_kernel is not None:
+        motion = cv2.dilate(motion, dilate_kernel)
+    x0, y0, x1, y1 = overlap_bbox
+    motion_bbox = motion[y0:y1, x0:x1].copy()
+    return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+
+
+# ---------------------------------------------------------------------------
+# Edge-based diff (Sobel gradient magnitude)
+# ---------------------------------------------------------------------------
+
+def _bgr_to_gray_gpu(frame_t):
+    """frame_t: (1, 3, H, W) uint8 BGR. Returns (1, 1, H, W) float gray
+    using the standard BGR weights (0.114, 0.587, 0.299)."""
+    return (0.114 * frame_t[:, 0:1].float()
+            + 0.587 * frame_t[:, 1:2].float()
+            + 0.299 * frame_t[:, 2:3].float())
+
+
+def sobel_magnitude_gpu(frame_t):
+    """
+    Sobel L1 gradient magnitude (|Gx| + |Gy|) of a BGR frame on GPU.
+
+    frame_t: (1, 3, H, W) uint8.
+    Returns: (1, H, W) float32 tensor on the same device.
+    """
+    gray = _bgr_to_gray_gpu(frame_t)
+    device = gray.device
+    kx = _SOBEL_X.to(device).view(1, 1, 3, 3)
+    ky = _SOBEL_Y.to(device).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    return (gx.abs() + gy.abs())[0]  # (1, H, W)
+
+
+def sobel_magnitude_cpu(frame_bgr):
+    """Sobel L1 gradient magnitude on CPU. Returns (H, W) float32."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return np.abs(gx) + np.abs(gy)
+
+
+def compute_motion_mask_gpu_edges(warped_a_t, warped_b_t,
+                                  baseline_grad_a_t, baseline_grad_b_t,
+                                  threshold, dilate_radius,
+                                  overlap_bbox, overlap_in_bbox_t):
+    """
+    Edge-based motion mask (GPU). |Sobel(current) - Sobel(baseline)|
+    thresholded per camera, OR'd, dilated, cropped to overlap bbox.
+
+    Robust to brightness/color drift because edge magnitude only
+    depends on relative contrasts within a 3x3 neighborhood.
+
+    baseline_grad_*_t : precomputed (1, H, W) float Sobel magnitudes
+                        of the baseline frames (see sobel_magnitude_gpu).
+    """
+    grad_a = sobel_magnitude_gpu(warped_a_t)
+    grad_b = sobel_magnitude_gpu(warped_b_t)
+    diff_a = (grad_a - baseline_grad_a_t).abs()
+    diff_b = (grad_b - baseline_grad_b_t).abs()
+    motion = ((diff_a > threshold) | (diff_b > threshold))[0]   # (H, W)
+    motion_u8 = motion.to(torch.uint8) * 255
+    motion_u8 = dilate_gpu(motion_u8, dilate_radius)
+    x0, y0, x1, y1 = overlap_bbox
+    motion_bbox_t = motion_u8[y0:y1, x0:x1].contiguous()
+    motion_bbox_t = torch.where(overlap_in_bbox_t > 0,
+                                motion_bbox_t,
+                                torch.zeros_like(motion_bbox_t))
+    return motion_bbox_t
+
+
+def compute_motion_mask_cpu_edges(warped_a, warped_b,
+                                  baseline_grad_a, baseline_grad_b,
+                                  threshold, dilate_kernel,
+                                  overlap_bbox, overlap_in_bbox):
+    """CPU variant of compute_motion_mask_gpu_edges. baseline_grad_*
+    are precomputed (H, W) float32 Sobel magnitudes."""
+    grad_a = sobel_magnitude_cpu(warped_a)
+    grad_b = sobel_magnitude_cpu(warped_b)
+    diff_a = np.abs(grad_a - baseline_grad_a)
+    diff_b = np.abs(grad_b - baseline_grad_b)
+    motion = ((diff_a > threshold) | (diff_b > threshold)).astype(np.uint8) * 255
     if dilate_kernel is not None:
         motion = cv2.dilate(motion, dilate_kernel)
     x0, y0, x1, y1 = overlap_bbox

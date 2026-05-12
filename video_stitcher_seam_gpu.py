@@ -142,13 +142,22 @@ Static foreground (segmentation-based):
                                 the recording. Default: 0.
 
 Motion detection (baseline subtraction):
-    For fixed cameras, the most robust "moved object" signal is just
-    "different from the empty-room baseline". Cheap, doesn't suffer
-    MOG2's stationary-object-fades failure mode. Feeds into the cost
-    map at the same priority as fg_penalty, gated by person priority.
+    For fixed cameras, the "moved object" signal is built from a
+    diff against an empty-room baseline. Feeds into the cost map at
+    the same priority as fg_penalty, gated by person priority.
+
+    Two diff strategies (--motion_method):
+        pixel : raw |current - baseline| on BGR. Cheap but sensitive
+                to camera auto-exposure / auto-white-balance drift.
+                Threshold range 0-765.
+        edges : |Sobel(current) - Sobel(baseline)| on grayscale.
+                Robust to drift since edges depend on relative
+                contrasts, not absolute pixel values. Threshold
+                range 0-2000ish; ~50 is a good start.
 
     --motion                    Enable motion detection (opt-in for
                                 now; default off).
+    --motion_method M           pixel (default) or edges.
     --motion_baseline_a PATH    Path to camera A's empty-room baseline
                                 image. Must match the camera's video
                                 resolution. If both --motion_baseline_a
@@ -156,12 +165,10 @@ Motion detection (baseline subtraction):
                                 falls back to frame 0 of each video.
     --motion_baseline_b PATH    Same for camera B. Must be provided
                                 together with --motion_baseline_a.
-    --motion_threshold T        Per-pixel sum-of-|BGR diff| threshold
-                                above which a pixel is flagged as
-                                "different from baseline". Range 0-765
-                                (3 channels x max abs diff 255).
-                                Default: 30 (catches anything genuinely
-                                changed; below typical sensor noise).
+    --motion_threshold T        Threshold above which a pixel is
+                                flagged. Scale depends on
+                                --motion_method (see above).
+                                Default: 30.
     --motion_dilate PX          Dilation radius for the motion mask.
                                 Default: 10.
     --motion_penalty F          Cost penalty added to motion-mask
@@ -335,6 +342,14 @@ def main():
                              "anything different from the empty-room "
                              "baseline gets a cost-map penalty (parallel "
                              "to fg_penalty, gated by person priority).")
+    parser.add_argument("--motion_method", choices=["pixel", "edges"],
+                        default="pixel",
+                        help="Diff strategy for motion detection. "
+                             "'pixel' diffs raw warped frames (sensitive "
+                             "to brightness/color drift). 'edges' diffs "
+                             "Sobel gradient magnitudes (robust to drift). "
+                             "Default: pixel. Threshold scales differ; "
+                             "try ~50 for edges, ~30 for pixel.")
     parser.add_argument("--motion_baseline_a", default=None,
                         help="Path to the camera-A baseline image (empty "
                              "room). If omitted along with --motion_baseline_b, "
