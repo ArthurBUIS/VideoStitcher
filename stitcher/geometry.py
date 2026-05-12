@@ -57,47 +57,137 @@ def compute_canvas(shape_a, shape_b, H_b_to_a):
 
 def find_autocrop_rect(H_b_to_a, shape_a, shape_b, canvas_size, T):
     """
-    Build a rectangle from B's two right corners (warped to canvas) and A's
-    left edge. The right side of the rectangle is the more-conservative
-    (smaller-x) of B's two right corners; the rectangle spans the y-range
-    formed by both B right corners; the left side is A's left edge on canvas.
+    Largest axis-aligned rectangle inscribed inside the union polygon of
+    camera A and warped camera B on the canvas, maximising the x-extent.
 
-    Returns (x, y, w, h) in canvas coords.
+    Algorithm:
+      1. Rasterise the union of A's footprint and warped B's footprint
+         on a canvas-sized mask, then extract its outer boundary as a
+         polygon via cv2.findContours + approxPolyDP. The polygon's
+         vertices are the genuine corners of the union — input corners
+         that lie INSIDE the other input do not appear, while edge-edge
+         intersection points DO. This is strictly more informative than
+         using only the 8 input corners, because interior input corners
+         can carry extreme y values that would shrink the strip in step
+         3 unnecessarily.
+      2. Classify each polygon vertex as "top" or "bottom" by comparing
+         its y to A's horizontal midline (y = ty + h_a/2). Above the
+         midline (smaller y) = top, below = bottom. Using A's midline
+         (A being the unwarped reference) is more robust than a polygon
+         diagonal: it handles edge-edge intersection points and
+         asymmetric polygon shapes uniformly.
+      3. Define the y-strip:
+             y_top    = max(y of top-set vertices)
+             y_bottom = min(y of bottom-set vertices)
+         Above y_top the polygon's top edge starts to bend; below
+         y_bottom the bottom edge does. Inside [y_top, y_bottom] the
+         polygon is a right trapezoid (or rectangle).
+      4. Inscribe the rectangle by collapsing any slanted edges:
+             rect.left  = max(polygon.left  at y_top, polygon.left  at y_bottom)
+             rect.right = min(polygon.right at y_top, polygon.right at y_bottom)
+         where polygon.{left,right}(y) are the smallest and largest x at
+         which the polygon contains row y. Min/max over the strip happens
+         at one of the endpoints because each polygon edge is straight.
+
+    Returns (x, y, w, h) in canvas coords. Falls back to the full canvas
+    if A and warped B are disjoint or the strip is degenerate.
     """
     canvas_w, canvas_h = canvas_size
     h_a, w_a = shape_a[:2]
     h_b, w_b = shape_b[:2]
     tx, ty = float(T[0, 2]), float(T[1, 2])
 
-    # B's right corners after warp to canvas (top_right = warped (w_b, 0),
-    # bottom_right = warped (w_b, h_b)).
-    b_right_src = np.float32([[w_b, 0], [w_b, h_b]]).reshape(-1, 1, 2)
-    b_right_canvas = cv2.perspectiveTransform(b_right_src, H_b_to_a).reshape(-1, 2)
-    b_right_canvas += np.array([tx, ty], dtype=np.float32)
-    top_right, bottom_right = b_right_canvas[0], b_right_canvas[1]
+    # A's 4 corners on canvas (axis-aligned).
+    A_corners = np.float32([
+        [tx,         ty       ],
+        [tx + w_a,   ty       ],
+        [tx + w_a,   ty + h_a ],
+        [tx,         ty + h_a ],
+    ])
 
-    # Pick the one with the lower x as (x_1, y_1); the other as (x_2, y_2).
-    if top_right[0] <= bottom_right[0]:
-        (x_1, y_1), (x_2, y_2) = top_right, bottom_right
-    else:
-        (x_1, y_1), (x_2, y_2) = bottom_right, top_right
+    # B's 4 corners on canvas (warped via H_b_to_a + T).
+    b_src = np.float32([[0, 0], [w_b, 0], [w_b, h_b], [0, h_b]]).reshape(-1, 1, 2)
+    b_canvas = cv2.perspectiveTransform(b_src, H_b_to_a).reshape(-1, 2)
+    b_canvas += np.array([tx, ty], dtype=np.float32)
 
-    # Left edge x = A's left edge on canvas (0 in A's local coords + tx).
-    x_left = tx
+    # ---- Step 1: rasterise the union, recover its outer polygon ----------
+    mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    cv2.fillPoly(mask, [A_corners.astype(np.int32)], 255)
+    cv2.fillPoly(mask, [b_canvas .astype(np.int32)], 255)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return 0, 0, canvas_w, canvas_h
+    # If A and warped B happen not to overlap there will be two contours;
+    # the larger one is the more useful side (autocrop has to fit inside
+    # one connected region).
+    contour = max(contours, key=cv2.contourArea)
+    # approxPolyDP collapses the pixel-jagged boundary down to the genuine
+    # polygon corners. 2 px epsilon is generous at typical canvas sizes.
+    polygon = cv2.approxPolyDP(contour, epsilon=2.0, closed=True) \
+                 .reshape(-1, 2).astype(np.float64)
+    if len(polygon) < 3:
+        return 0, 0, canvas_w, canvas_h
 
-    final_corners = [
-        (x_1,    y_1),
-        (x_1,    y_2),
-        (x_left, y_1),
-        (x_left, y_2),
-    ]
+    # ---- Step 2: classify each vertex as top / bottom --------------------
+    # Use A's horizontal midline as the separator: y_mid = ty + h_a/2.
+    # A vertex is "top" if its y is above the midline (smaller y in image
+    # coords) and "bottom" otherwise. This works on every polygon vertex
+    # uniformly — input corners as well as edge-edge intersection points,
+    # which a polygon-diagonal heuristic mishandles when the polygon is
+    # asymmetric.
+    y_mid = ty + h_a / 2.0
 
-    xs = [c[0] for c in final_corners]
-    ys = [c[1] for c in final_corners]
-    x0 = max(0,        int(round(min(xs))))
-    y0 = max(0,        int(round(min(ys))))
-    x1 = min(canvas_w, int(round(max(xs))))
-    y1 = min(canvas_h, int(round(max(ys))))
+    top_ys    = []
+    bottom_ys = []
+    for v in polygon:
+        if v[1] < y_mid:
+            top_ys.append(v[1])
+        else:
+            bottom_ys.append(v[1])
+
+    # ---- Step 3: y-strip where the polygon is rectangular in y -----------
+    if not top_ys or not bottom_ys:
+        # Polygon entirely above or below A's midline — degenerate.
+        return 0, 0, canvas_w, canvas_h
+    y_top    = max(top_ys)
+    y_bottom = min(bottom_ys)
+    if y_top >= y_bottom:
+        return 0, 0, canvas_w, canvas_h
+
+    # ---- Step 4: polygon x-range at the two strip boundaries -------------
+    def _polygon_x_range_at_y(poly, y):
+        """(min_x, max_x) at row y by intersecting y with every polygon
+        edge. For any simple polygon this gives the leftmost/rightmost
+        pixel coordinate that lies inside the polygon at that row."""
+        crossings = []
+        n = len(poly)
+        for i in range(n):
+            p1, p2 = poly[i], poly[(i + 1) % n]
+            y1, y2 = p1[1], p2[1]
+            if (y1 <= y <= y2) or (y2 <= y <= y1):
+                if abs(y2 - y1) < 1e-9:
+                    crossings.append(p1[0])
+                    crossings.append(p2[0])
+                else:
+                    t = (y - y1) / (y2 - y1)
+                    crossings.append(p1[0] + t * (p2[0] - p1[0]))
+        return (min(crossings), max(crossings)) if crossings else (None, None)
+
+    poly_l_top, poly_r_top = _polygon_x_range_at_y(polygon, y_top)
+    poly_l_bot, poly_r_bot = _polygon_x_range_at_y(polygon, y_bottom)
+    if None in (poly_l_top, poly_r_top, poly_l_bot, poly_r_bot):
+        return 0, 0, canvas_w, canvas_h
+
+    rect_left  = max(poly_l_top, poly_l_bot)
+    rect_right = min(poly_r_top, poly_r_bot)
+
+    x0 = max(0,        int(np.ceil (rect_left )))
+    y0 = max(0,        int(np.ceil (y_top     )))
+    x1 = min(canvas_w, int(np.floor(rect_right)))
+    y1 = min(canvas_h, int(np.floor(y_bottom  )))
+
+    if x1 <= x0 or y1 <= y0:
+        return 0, 0, canvas_w, canvas_h
     return x0, y0, x1 - x0, y1 - y0
 
 
