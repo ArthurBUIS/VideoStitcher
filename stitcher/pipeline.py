@@ -103,11 +103,15 @@ from stitcher.motion import (
     compute_mean_in_overlap_cpu,
     compute_mean_in_overlap_gpu,
     compute_motion_mask_cpu,
+    compute_motion_mask_cpu_chrominance,
     compute_motion_mask_cpu_edges,
     compute_motion_mask_gpu,
+    compute_motion_mask_gpu_chrominance,
     compute_motion_mask_gpu_edges,
     grab_baseline_from_videos,
     load_baseline_images,
+    precompute_baseline_ab_cpu,
+    precompute_baseline_ab_gpu,
     renormalize_to_baseline_cpu,
     renormalize_to_baseline_gpu,
     sobel_magnitude_cpu,
@@ -466,6 +470,10 @@ def run(args):
     baseline_mean_b_t = None
     baseline_mean_a = None       # CPU renorm baseline mean BGR
     baseline_mean_b = None
+    baseline_ab_a_t = None       # GPU chrominance baseline (LAB AB)
+    baseline_ab_b_t = None
+    baseline_ab_a = None         # CPU chrominance baseline (LAB AB)
+    baseline_ab_b = None
     if use_motion:
         paths_a = args.motion_baseline_a
         paths_b = args.motion_baseline_b
@@ -508,6 +516,9 @@ def run(args):
             if args.motion_method == "edges":
                 baseline_grad_a_t = sobel_magnitude_gpu(baseline_warped_a_t)
                 baseline_grad_b_t = sobel_magnitude_gpu(baseline_warped_b_t)
+            elif args.motion_method == "chrominance":
+                baseline_ab_a_t = precompute_baseline_ab_gpu(baseline_warped_a_t)
+                baseline_ab_b_t = precompute_baseline_ab_gpu(baseline_warped_b_t)
             if args.motion_renorm:
                 baseline_mean_a_t = compute_mean_in_overlap_gpu(
                     baseline_warped_a_t, static["overlap_bbox"],
@@ -528,6 +539,9 @@ def run(args):
             if args.motion_method == "edges":
                 baseline_grad_a = sobel_magnitude_cpu(baseline_warped_a)
                 baseline_grad_b = sobel_magnitude_cpu(baseline_warped_b)
+            elif args.motion_method == "chrominance":
+                baseline_ab_a = precompute_baseline_ab_cpu(baseline_warped_a)
+                baseline_ab_b = precompute_baseline_ab_cpu(baseline_warped_b)
             if args.motion_renorm:
                 baseline_mean_a = compute_mean_in_overlap_cpu(
                     baseline_warped_a, static["overlap_bbox"],
@@ -686,6 +700,13 @@ def run(args):
                         args.motion_threshold, args.motion_dilate,
                         static["overlap_bbox"], overlap_in_bbox_t,
                     )
+                elif args.motion_method == "chrominance":
+                    motion_mask_bbox_t = compute_motion_mask_gpu_chrominance(
+                        wa_motion_t, wb_motion_t,
+                        baseline_ab_a_t, baseline_ab_b_t,
+                        args.motion_threshold, args.motion_dilate,
+                        static["overlap_bbox"], overlap_in_bbox_t,
+                    )
                 else:  # "pixel"
                     motion_mask_bbox_t = compute_motion_mask_gpu(
                         wa_motion_t, wb_motion_t,
@@ -711,6 +732,13 @@ def run(args):
                     motion_mask_bbox = compute_motion_mask_cpu_edges(
                         wa_motion, wb_motion,
                         baseline_grad_a, baseline_grad_b,
+                        args.motion_threshold, motion_dilate_kernel,
+                        static["overlap_bbox"], static["overlap_in_bbox"],
+                    )
+                elif args.motion_method == "chrominance":
+                    motion_mask_bbox = compute_motion_mask_cpu_chrominance(
+                        wa_motion, wb_motion,
+                        baseline_ab_a, baseline_ab_b,
                         args.motion_threshold, motion_dilate_kernel,
                         static["overlap_bbox"], static["overlap_in_bbox"],
                     )

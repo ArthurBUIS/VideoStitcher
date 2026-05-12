@@ -146,18 +146,22 @@ Motion detection (baseline subtraction):
     diff against an empty-room baseline. Feeds into the cost map at
     the same priority as fg_penalty, gated by person priority.
 
-    Two diff strategies (--motion_method):
-        pixel : raw |current - baseline| on BGR. Cheap but sensitive
-                to camera auto-exposure / auto-white-balance drift.
-                Threshold range 0-765.
-        edges : |Sobel(current) - Sobel(baseline)| on grayscale.
-                Robust to drift since edges depend on relative
-                contrasts, not absolute pixel values. Threshold
-                range 0-2000ish; ~50 is a good start.
+    Three diff strategies (--motion_method):
+        pixel       : raw |current - baseline| on BGR. Cheap but
+                      sensitive to auto-exposure / auto-WB drift.
+                      Threshold range 0-765.
+        edges       : |Sobel(current) - Sobel(baseline)| on grayscale.
+                      Robust to drift since edges depend on relative
+                      contrasts, not absolute pixel values. Threshold
+                      range 0-2000ish; ~50 is a good start.
+        chrominance : diff in LAB A,B channels (no L). Robust to
+                      *brightness* drift, but not to white-balance
+                      drift (which IS chrominance). Threshold range
+                      ~0-200; ~10-20 is a good start.
 
     --motion                    Enable motion detection (opt-in for
                                 now; default off).
-    --motion_method M           pixel (default) or edges.
+    --motion_method M           pixel (default), edges, or chrominance.
     --motion_renorm             Rescale each frame's mean (per BGR
                                 channel, measured inside the overlap)
                                 to match the baseline's mean, before
@@ -348,14 +352,18 @@ def main():
                              "anything different from the empty-room "
                              "baseline gets a cost-map penalty (parallel "
                              "to fg_penalty, gated by person priority).")
-    parser.add_argument("--motion_method", choices=["pixel", "edges"],
+    parser.add_argument("--motion_method",
+                        choices=["pixel", "edges", "chrominance"],
                         default="pixel",
                         help="Diff strategy for motion detection. "
                              "'pixel' diffs raw warped frames (sensitive "
                              "to brightness/color drift). 'edges' diffs "
                              "Sobel gradient magnitudes (robust to drift). "
+                             "'chrominance' diffs LAB A,B channels (robust "
+                             "to brightness drift, NOT to white-balance). "
                              "Default: pixel. Threshold scales differ; "
-                             "try ~50 for edges, ~30 for pixel.")
+                             "try ~50 for edges, ~10 for chrominance, ~30 "
+                             "for pixel.")
     parser.add_argument("--motion_renorm", action="store_true",
                         help="Per-frame rescale of warped current frames "
                              "so their mean BGR over the overlap matches "

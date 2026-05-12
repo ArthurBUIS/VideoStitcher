@@ -271,3 +271,113 @@ def renormalize_to_baseline_cpu(warped, baseline_mean,
     scale = baseline_mean / np.maximum(current_mean, 1.0)
     return np.clip(warped.astype(np.float32) * scale,
                    0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Chrominance diff (LAB, drop the L channel)
+# ---------------------------------------------------------------------------
+#
+# Convert to LAB, drop the L (lightness) channel, diff only on A and B
+# (chrominance). Robust to brightness drift since brightness is in L.
+# Weaker than the edge method for cameras with white-balance drift,
+# since WB itself is a chrominance shift.
+
+def _bgr_to_ab_gpu(frame_t):
+    """
+    BGR uint8 (1, 3, H, W) -> LAB A,B channels float (1, 2, H, W).
+
+    No direct cv2-style LAB conversion in PyTorch, so we approximate via
+    BGR -> sRGB -> XYZ -> LAB on the GPU. Uses the standard D65 white.
+    Slightly heavier than the pixel diff but still cheap.
+    """
+    bgr = frame_t.float() / 255.0
+    b = bgr[:, 0:1]
+    g = bgr[:, 1:2]
+    r = bgr[:, 2:3]
+
+    # sRGB gamma (cheap linear approximation: skip the 2.4 power for
+    # speed, since we only need to be consistent between current and
+    # baseline, not perceptually accurate).
+    rl, gl, bl = r, g, b
+
+    # Linear RGB -> XYZ (sRGB / D65)
+    X = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl
+    Y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl
+    Z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl
+
+    # Normalize by D65 white
+    X = X / 0.95047
+    Z = Z / 1.08883
+
+    # f(t) = t**(1/3) if t > eps else (kt + 16/116). Use a smooth-enough
+    # numerical approximation via the standard formula:
+    eps = 216.0 / 24389.0
+    k = 24389.0 / 27.0
+
+    def _f(t):
+        return torch.where(t > eps,
+                           t.clamp(min=1e-8).pow(1.0 / 3.0),
+                           (k * t + 16.0) / 116.0)
+
+    fy = _f(Y)
+    A = 500.0 * (_f(X) - fy)
+    B = 200.0 * (fy - _f(Z))
+
+    return torch.cat([A, B], dim=1)  # (1, 2, H, W)
+
+
+def _bgr_to_ab_cpu(frame_bgr):
+    """CPU variant: cv2.cvtColor BGR->LAB, return only A, B channels."""
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    return lab[:, :, 1:3]    # (H, W, 2)
+
+
+def compute_motion_mask_gpu_chrominance(warped_a_t, warped_b_t,
+                                        baseline_ab_a_t, baseline_ab_b_t,
+                                        threshold, dilate_radius,
+                                        overlap_bbox, overlap_in_bbox_t):
+    """
+    Chrominance-based motion mask (GPU). |LAB_AB(current) - LAB_AB(baseline)|
+    summed across the two chroma channels, thresholded per camera, OR'd,
+    dilated.
+
+    baseline_ab_*_t : precomputed (1, 2, H, W) float A,B tensors.
+    """
+    ab_a = _bgr_to_ab_gpu(warped_a_t)            # (1, 2, H, W)
+    ab_b = _bgr_to_ab_gpu(warped_b_t)
+    diff_a = (ab_a - baseline_ab_a_t).abs().sum(dim=1)   # (1, H, W)
+    diff_b = (ab_b - baseline_ab_b_t).abs().sum(dim=1)
+    motion = ((diff_a > threshold) | (diff_b > threshold))[0]
+    motion_u8 = motion.to(torch.uint8) * 255
+    motion_u8 = dilate_gpu(motion_u8, dilate_radius)
+    x0, y0, x1, y1 = overlap_bbox
+    motion_bbox_t = motion_u8[y0:y1, x0:x1].contiguous()
+    motion_bbox_t = torch.where(overlap_in_bbox_t > 0,
+                                motion_bbox_t,
+                                torch.zeros_like(motion_bbox_t))
+    return motion_bbox_t
+
+
+def compute_motion_mask_cpu_chrominance(warped_a, warped_b,
+                                        baseline_ab_a, baseline_ab_b,
+                                        threshold, dilate_kernel,
+                                        overlap_bbox, overlap_in_bbox):
+    """CPU variant of compute_motion_mask_gpu_chrominance."""
+    ab_a = _bgr_to_ab_cpu(warped_a)
+    ab_b = _bgr_to_ab_cpu(warped_b)
+    diff_a = np.abs(ab_a - baseline_ab_a).sum(axis=2)
+    diff_b = np.abs(ab_b - baseline_ab_b).sum(axis=2)
+    motion = ((diff_a > threshold) | (diff_b > threshold)).astype(np.uint8) * 255
+    if dilate_kernel is not None:
+        motion = cv2.dilate(motion, dilate_kernel)
+    x0, y0, x1, y1 = overlap_bbox
+    motion_bbox = motion[y0:y1, x0:x1].copy()
+    return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+
+
+def precompute_baseline_ab_gpu(baseline_warped_t):
+    return _bgr_to_ab_gpu(baseline_warped_t)
+
+
+def precompute_baseline_ab_cpu(baseline_warped):
+    return _bgr_to_ab_cpu(baseline_warped)
