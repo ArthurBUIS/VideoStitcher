@@ -141,6 +141,33 @@ Static foreground (segmentation-based):
                                 furniture that gets rearranged during
                                 the recording. Default: 0.
 
+Motion detection (baseline subtraction):
+    For fixed cameras, the most robust "moved object" signal is just
+    "different from the empty-room baseline". Cheap, doesn't suffer
+    MOG2's stationary-object-fades failure mode. Feeds into the cost
+    map at the same priority as fg_penalty, gated by person priority.
+
+    --motion                    Enable motion detection (opt-in for
+                                now; default off).
+    --motion_baseline_a PATH    Path to camera A's empty-room baseline
+                                image. Must match the camera's video
+                                resolution. If both --motion_baseline_a
+                                and --motion_baseline_b are omitted,
+                                falls back to frame 0 of each video.
+    --motion_baseline_b PATH    Same for camera B. Must be provided
+                                together with --motion_baseline_a.
+    --motion_threshold T        Per-pixel sum-of-|BGR diff| threshold
+                                above which a pixel is flagged as
+                                "different from baseline". Range 0-765
+                                (3 channels x max abs diff 255).
+                                Default: 30 (catches anything genuinely
+                                changed; below typical sensor noise).
+    --motion_dilate PX          Dilation radius for the motion mask.
+                                Default: 10.
+    --motion_penalty F          Cost penalty added to motion-mask
+                                pixels (AND NOT person). Default: 5e7,
+                                same priority level as fg_penalty.
+
 Cost-map behavior:
     --cost_ema A                EMA factor in [0, 1] for the photometric
                                 cost. Lower = smoother but slower to
