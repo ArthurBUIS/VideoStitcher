@@ -218,3 +218,56 @@ def compute_motion_mask_cpu_edges(warped_a, warped_b,
     x0, y0, x1, y1 = overlap_bbox
     motion_bbox = motion[y0:y1, x0:x1].copy()
     return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+
+
+# ---------------------------------------------------------------------------
+# Per-frame baseline renormalization (--motion_renorm)
+# ---------------------------------------------------------------------------
+#
+# Cameras with auto-exposure drift the per-channel mean over time, so a
+# pixel-diff against a static baseline can fire everywhere even when no
+# real content changed. Renormalization rescales the current frame's
+# per-channel mean (measured inside the overlap region) to match the
+# baseline's, before the diff. Cancels global brightness/colour drift
+# but not spatial lighting changes. Compose with any motion_method.
+
+def compute_mean_in_overlap_gpu(warped_t, overlap_bbox, overlap_in_bbox_t):
+    """warped_t: (1, 3, H, W) uint8. Returns (3,) float tensor of mean BGR
+    over pixels where overlap_in_bbox_t > 0."""
+    x0, y0, x1, y1 = overlap_bbox
+    bb = warped_t[0, :, y0:y1, x0:x1].float()                # (3, H_bb, W_bb)
+    mask = (overlap_in_bbox_t > 0).float()                   # (H_bb, W_bb)
+    n = mask.sum().clamp(min=1.0)
+    sums = (bb * mask.unsqueeze(0)).sum(dim=(1, 2))          # (3,)
+    return sums / n
+
+
+def compute_mean_in_overlap_cpu(warped, overlap_bbox, overlap_in_bbox):
+    """CPU variant; uses cv2.mean for speed."""
+    x0, y0, x1, y1 = overlap_bbox
+    bb = warped[y0:y1, x0:x1]
+    return np.array(cv2.mean(bb, mask=overlap_in_bbox)[:3], dtype=np.float32)
+
+
+def renormalize_to_baseline_gpu(warped_t, baseline_mean_t,
+                                overlap_bbox, overlap_in_bbox_t):
+    """
+    Per-channel rescale of warped_t so its mean over the overlap matches
+    baseline_mean_t. Returns a new (1, 3, H, W) uint8 tensor.
+    """
+    current_mean = compute_mean_in_overlap_gpu(
+        warped_t, overlap_bbox, overlap_in_bbox_t,
+    )
+    scale = (baseline_mean_t / current_mean.clamp(min=1.0)).view(1, 3, 1, 1)
+    return (warped_t.float() * scale).clamp(0, 255).to(torch.uint8)
+
+
+def renormalize_to_baseline_cpu(warped, baseline_mean,
+                                overlap_bbox, overlap_in_bbox):
+    """CPU variant of renormalize_to_baseline_gpu."""
+    current_mean = compute_mean_in_overlap_cpu(
+        warped, overlap_bbox, overlap_in_bbox,
+    )
+    scale = baseline_mean / np.maximum(current_mean, 1.0)
+    return np.clip(warped.astype(np.float32) * scale,
+                   0, 255).astype(np.uint8)

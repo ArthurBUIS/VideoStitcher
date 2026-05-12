@@ -158,6 +158,12 @@ Motion detection (baseline subtraction):
     --motion                    Enable motion detection (opt-in for
                                 now; default off).
     --motion_method M           pixel (default) or edges.
+    --motion_renorm             Rescale each frame's mean (per BGR
+                                channel, measured inside the overlap)
+                                to match the baseline's mean, before
+                                diffing. Cancels global brightness/
+                                colour drift from camera AE. Orthogonal:
+                                composes with any --motion_method.
     --motion_baseline_a PATH    Path to camera A's empty-room baseline
                                 image. Must match the camera's video
                                 resolution. If both --motion_baseline_a
@@ -350,6 +356,13 @@ def main():
                              "Sobel gradient magnitudes (robust to drift). "
                              "Default: pixel. Threshold scales differ; "
                              "try ~50 for edges, ~30 for pixel.")
+    parser.add_argument("--motion_renorm", action="store_true",
+                        help="Per-frame rescale of warped current frames "
+                             "so their mean BGR over the overlap matches "
+                             "the baseline's, before diffing. Cancels "
+                             "global brightness/colour drift from camera "
+                             "auto-exposure. Composes with any "
+                             "--motion_method.")
     parser.add_argument("--motion_baseline_a", default=None,
                         help="Path to the camera-A baseline image (empty "
                              "room). If omitted along with --motion_baseline_b, "
