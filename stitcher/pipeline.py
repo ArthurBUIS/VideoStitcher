@@ -99,6 +99,13 @@ from stitcher.io_utils import (
     draw_mask_overlay,
     draw_seam_overlay,
 )
+from stitcher.motion import (
+    compute_motion_mask_cpu,
+    compute_motion_mask_gpu,
+    grab_baseline_from_videos,
+    load_baseline_images,
+    validate_baseline_shape,
+)
 from stitcher.seam import (
     add_edge_margin_penalty,
     add_seam_regularizer,
@@ -436,6 +443,63 @@ def run(args):
         print(f"[info] FG recompute every {fg_recompute_frames} frames "
               f"(~{args.fg_recompute_seconds}s).")
 
+    # --- Motion detection (baseline subtraction) --------------------------
+    use_motion = bool(args.motion)
+    motion_dilate_kernel = None
+    baseline_warped_a_t = None   # GPU path
+    baseline_warped_b_t = None
+    baseline_warped_a = None     # CPU path
+    baseline_warped_b = None
+    if use_motion:
+        paths_a = args.motion_baseline_a
+        paths_b = args.motion_baseline_b
+        if (paths_a is None) != (paths_b is None):
+            raise RuntimeError(
+                "--motion_baseline_a and --motion_baseline_b must be "
+                "provided together (or both omitted, to fall back to "
+                "frame 0 of each video)."
+            )
+        if paths_a is not None:
+            print(f"[info] Loading motion baselines: A={paths_a} B={paths_b}")
+            baseline_frame_a, baseline_frame_b = load_baseline_images(
+                paths_a, paths_b,
+            )
+        else:
+            print("[info] Motion baselines not provided; falling back to "
+                  "frame 0 of each video.")
+            baseline_frame_a, baseline_frame_b = grab_baseline_from_videos(
+                args.video_a, args.video_b,
+            )
+        validate_baseline_shape(
+            frame_a, frame_b, baseline_frame_a, baseline_frame_b,
+        )
+
+        motion_dilate_kernel = (
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * args.motion_dilate + 1, 2 * args.motion_dilate + 1),
+            ) if args.motion_dilate > 0 else None
+        )
+
+        if dev["cuda_available"]:
+            # Batched warp through grid_pair_t (built at output_size, so
+            # the warped baselines share the per-frame warped shape).
+            baseline_warped_a_t, baseline_warped_b_t = warp_pair_gpu(
+                baseline_frame_a, baseline_frame_b,
+                grid_pair_t, gpu_ctx["device"],
+                gain_a_t=gain_a_t, gain_b_t=gain_b_t,
+            )
+        else:
+            if lut_a is not None:
+                baseline_frame_a = apply_gain_lut(baseline_frame_a, lut_a)
+                baseline_frame_b = apply_gain_lut(baseline_frame_b, lut_b)
+            baseline_warped_a = cv2.remap(baseline_frame_a, map_ax, map_ay,
+                                          cv2.INTER_LINEAR)
+            baseline_warped_b = cv2.remap(baseline_frame_b, map_bx, map_by,
+                                          cv2.INTER_LINEAR)
+        print(f"[info] Motion: threshold={args.motion_threshold} "
+              f"dilate={args.motion_dilate} penalty={args.motion_penalty:g}")
+
     W, H = output_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
@@ -551,6 +615,27 @@ def run(args):
             if args.debug_mask:
                 person_for_debug = latest_mask.get("person_mask_cpu")
 
+        # Motion mask (baseline subtraction). Recomputed every frame;
+        # reuses the already-warped current frames, so the marginal cost
+        # is just the diff + threshold + dilate.
+        motion_mask_bbox_t = None
+        motion_mask_bbox = None
+        if use_motion:
+            if dev["cuda_available"]:
+                motion_mask_bbox_t = compute_motion_mask_gpu(
+                    warped_a_t, warped_b_t,
+                    baseline_warped_a_t, baseline_warped_b_t,
+                    args.motion_threshold, args.motion_dilate,
+                    static["overlap_bbox"], overlap_in_bbox_t,
+                )
+            else:
+                motion_mask_bbox = compute_motion_mask_cpu(
+                    warped_a, warped_b,
+                    baseline_warped_a, baseline_warped_b,
+                    args.motion_threshold, motion_dilate_kernel,
+                    static["overlap_bbox"], static["overlap_in_bbox"],
+                )
+
         ds = max(1, args.seam_downscale)
 
         if dev["cuda_available"]:
@@ -563,6 +648,8 @@ def run(args):
                 fg_mask_bbox_t if use_fg else None,
                 args.fg_penalty, args.person_penalty,
                 static["overlap_bbox"],
+                motion_mask_bbox_t=motion_mask_bbox_t,
+                motion_penalty=args.motion_penalty,
             )
             if args.seam_edge_margin > 0:
                 m = min(args.seam_edge_margin,
@@ -595,12 +682,18 @@ def run(args):
             cost_for_dp = cost_ema.copy()
             has_person_cpu = (person_mask_bbox is not None
                               and person_mask_bbox.any())
+            # Mirror the GPU penalty hierarchy: fg (lower) and motion
+            # (lower) where mask AND NOT person, then person_penalty.
             if use_fg and fg_mask_bbox is not None:
-                if has_person_cpu:
-                    fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
-                else:
-                    fg_only = fg_mask_bbox > 0
+                fg_bool = fg_mask_bbox > 0
+                fg_only = (fg_bool & (person_mask_bbox == 0)
+                           if has_person_cpu else fg_bool)
                 cost_for_dp[fg_only] += args.fg_penalty
+            if use_motion and motion_mask_bbox is not None:
+                motion_bool = motion_mask_bbox > 0
+                motion_only = (motion_bool & (person_mask_bbox == 0)
+                               if has_person_cpu else motion_bool)
+                cost_for_dp[motion_only] += args.motion_penalty
             if has_person_cpu:
                 cost_for_dp[person_mask_bbox > 0] += args.person_penalty
             add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
@@ -619,16 +712,23 @@ def run(args):
         seam_prev_small = seam_x_small.copy()
         seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
 
-        # Snapshot the FG mask for the debug overlay (composite stage may
-        # run a frame later, so we capture the version that's current
-        # for THIS frame here). person_for_debug was already set above
-        # when we read mask_holder.
+        # Snapshot the FG / motion masks for the debug overlay (composite
+        # stage may run a frame later, so we capture the version that's
+        # current for THIS frame here). person_for_debug was already set
+        # above when we read mask_holder.
         fg_for_debug = None
-        if args.debug_mask and use_fg:
-            if fg_mask_bbox_t is not None:
-                fg_for_debug = fg_mask_bbox_t.cpu().numpy()
-            elif fg_mask_bbox is not None:
-                fg_for_debug = fg_mask_bbox
+        motion_for_debug = None
+        if args.debug_mask:
+            if use_fg:
+                if fg_mask_bbox_t is not None:
+                    fg_for_debug = fg_mask_bbox_t.cpu().numpy()
+                elif fg_mask_bbox is not None:
+                    fg_for_debug = fg_mask_bbox
+            if use_motion:
+                if motion_mask_bbox_t is not None:
+                    motion_for_debug = motion_mask_bbox_t.cpu().numpy()
+                elif motion_mask_bbox is not None:
+                    motion_for_debug = motion_mask_bbox
 
         # Record an event on the current (compute) stream so the composite
         # stage's stream can wait on it before reading our output tensors.
@@ -646,6 +746,7 @@ def run(args):
             "seam_x_full": seam_x_full,
             "person_for_debug": person_for_debug,
             "fg_for_debug": fg_for_debug,
+            "motion_for_debug": motion_for_debug,
             "compute_done_event": compute_done_event,
         }
 
@@ -680,20 +781,27 @@ def run(args):
             )
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
+            motion_for_debug = payload["motion_for_debug"]
 
             # Closure runs on the writer thread AFTER copy_event has
             # been synchronised; sees the pinned numpy view as `arr`.
             # static["overlap_bbox"] is already in output (crop) coords
             # because the geometry was rebuilt at output_size up front.
+            # Debug overlay layering: FG (yellow) < motion (blue) < person (red).
             def post_sync_fn(arr,
                              seam_x_full=seam_x_full,
                              fg_for_debug=fg_for_debug,
+                             motion_for_debug=motion_for_debug,
                              person_for_debug=person_for_debug):
                 if args.debug_mask:
                     if fg_for_debug is not None:
                         draw_mask_overlay(arr, fg_for_debug,
                                           static["overlap_bbox"],
                                           color=(0, 255, 255), alpha=0.25)
+                    if motion_for_debug is not None:
+                        draw_mask_overlay(arr, motion_for_debug,
+                                          static["overlap_bbox"],
+                                          color=(255, 0, 0), alpha=0.30)
                     if person_for_debug is not None:
                         draw_mask_overlay(arr, person_for_debug,
                                           static["overlap_bbox"])
@@ -712,11 +820,17 @@ def run(args):
             args.blend_width, args.blend_levels, out_buf,
         )
         if args.debug_mask:
+            # Layer FG (yellow) < motion (blue) < person (red).
             fg_for_debug = payload["fg_for_debug"]
             if fg_for_debug is not None:
                 draw_mask_overlay(stitched, fg_for_debug,
                                   static["overlap_bbox"],
                                   color=(0, 255, 255), alpha=0.25)
+            motion_for_debug = payload["motion_for_debug"]
+            if motion_for_debug is not None:
+                draw_mask_overlay(stitched, motion_for_debug,
+                                  static["overlap_bbox"],
+                                  color=(255, 0, 0), alpha=0.30)
             person_for_debug = payload["person_for_debug"]
             if person_for_debug is not None:
                 draw_mask_overlay(stitched, person_for_debug,

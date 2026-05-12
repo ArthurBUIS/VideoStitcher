@@ -302,6 +302,31 @@ def main():
     parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
                         help="Seconds between FG recomputations "
                              "(0 = startup only).")
+    # Motion detection (baseline subtraction) -----------------------------
+    parser.add_argument("--motion", action="store_true",
+                        help="Enable baseline-subtraction motion detection: "
+                             "anything different from the empty-room "
+                             "baseline gets a cost-map penalty (parallel "
+                             "to fg_penalty, gated by person priority).")
+    parser.add_argument("--motion_baseline_a", default=None,
+                        help="Path to the camera-A baseline image (empty "
+                             "room). If omitted along with --motion_baseline_b, "
+                             "frame 0 of --video_a is used as fallback.")
+    parser.add_argument("--motion_baseline_b", default=None,
+                        help="Path to the camera-B baseline image (empty "
+                             "room). Must be provided together with "
+                             "--motion_baseline_a.")
+    parser.add_argument("--motion_threshold", type=float, default=30,
+                        help="Per-pixel sum-of-|BGR diff| threshold above "
+                             "which a pixel is flagged as 'different from "
+                             "baseline'. Range 0-765. Default: 30.")
+    parser.add_argument("--motion_dilate", type=int, default=10,
+                        help="Dilation radius for the motion mask in px. "
+                             "Default: 10.")
+    parser.add_argument("--motion_penalty", type=float, default=5e7,
+                        help="Cost penalty added to motion-mask pixels "
+                             "(AND NOT person). Default: 5e7 (same as "
+                             "fg_penalty).")
     # Diagnostics --------------------------------------------------------
     parser.add_argument("--profile", action="store_true",
                         help="Print rolling per-stage timings (decode, "
