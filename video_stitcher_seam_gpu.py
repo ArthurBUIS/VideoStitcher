@@ -103,7 +103,7 @@ same type):
 Person mask:
     --yolo_every N              Run the person model once every N frames;
                                 reuse the cached mask in between. Lower =
-                                fresher mask but slower. Default: 3.
+                                fresher mask but slower. Default: 5.
     --mask_dilate PX            Dilation radius applied to the unioned
                                 person mask, in pixels. Absorbs the
                                 parallax offset between A and B's view of
@@ -234,7 +234,7 @@ def main():
     parser.add_argument("--autocrop", action="store_true",
                         help="Crop output to the largest axis-aligned "
                              "rectangle inside the stitched canvas.")
-    parser.add_argument("--yolo_every", type=int, default=3)
+    parser.add_argument("--yolo_every", type=int, default=5)
     parser.add_argument("--mask_dilate", type=int, default=15)
     parser.add_argument("--mask_ema", type=float, default=1.0,
                         help="EMA factor in [0, 1] for the person mask. "
