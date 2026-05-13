@@ -154,49 +154,51 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     x_strip_max = min(W_bb, seam_max + blend_width + 1)
     strip_w = x_strip_max - x_strip_min
 
-    a_full_t = warped_a_t[0].permute(1, 2, 0).contiguous()
-    b_full_t = warped_b_t[0].permute(1, 2, 0).contiguous()
+    # Stay channel-first (C, H, W) for the whole composite to avoid two
+    # full-canvas .permute(1, 2, 0).contiguous() copies of the warped
+    # frames (~6 MB each, ~3 ms each). Pyramid math expects channel-first
+    # anyway; the layout swap only matters for the final cv2 output, so
+    # we permute once at the very end onto the (H, W, 3) pinned host
+    # buffer.
+    a_t = warped_a_t[0]   # (3, H_canvas, W_canvas) — view, no copy
+    b_t = warped_b_t[0]
 
-    H_canvas, W_canvas = a_full_t.shape[:2]
-    out_t = torch.zeros((H_canvas, W_canvas, 3), dtype=torch.uint8,
+    H_canvas = a_t.shape[1]
+    W_canvas = a_t.shape[2]
+    out_t = torch.zeros((3, H_canvas, W_canvas), dtype=torch.uint8,
                         device=device)
 
-    # Step 1: hard-copy only_A and only_B canvas-wide.
-    only_a_m = gpu_ctx["only_a_u8_t"].unsqueeze(-1) > 0
-    only_b_m = gpu_ctx["only_b_u8_t"].unsqueeze(-1) > 0
-    out_t = torch.where(only_a_m, a_full_t, out_t)
-    out_t = torch.where(only_b_m, b_full_t, out_t)
+    # Step 1: hard-copy only_A and only_B canvas-wide. Masks are (H, W);
+    # unsqueeze(0) broadcasts across the 3-channel dim of the tensors.
+    only_a_m = (gpu_ctx["only_a_u8_t"] > 0).unsqueeze(0)
+    only_b_m = (gpu_ctx["only_b_u8_t"] > 0).unsqueeze(0)
+    out_t = torch.where(only_a_m, a_t, out_t)
+    out_t = torch.where(only_b_m, b_t, out_t)
 
     # Step 2: in the overlap, hard-copy A left of the strip and B right.
     overlap_bb_t = gpu_ctx["overlap_in_bbox_t"]
     if x_strip_min > 0:
-        left_overlap = (overlap_bb_t[:, :x_strip_min] > 0).unsqueeze(-1)
-        a_left = a_full_t[y0:y1, x0:x0 + x_strip_min]
-        cur = out_t[y0:y1, x0:x0 + x_strip_min]
-        out_t[y0:y1, x0:x0 + x_strip_min] = torch.where(left_overlap, a_left, cur)
+        left_overlap = (overlap_bb_t[:, :x_strip_min] > 0).unsqueeze(0)
+        a_left = a_t[:, y0:y1, x0:x0 + x_strip_min]
+        cur = out_t[:, y0:y1, x0:x0 + x_strip_min]
+        out_t[:, y0:y1, x0:x0 + x_strip_min] = torch.where(left_overlap, a_left, cur)
     if x_strip_max < W_bb:
-        right_overlap = (overlap_bb_t[:, x_strip_max:] > 0).unsqueeze(-1)
-        b_right = b_full_t[y0:y1, x0 + x_strip_max:x1]
-        cur = out_t[y0:y1, x0 + x_strip_max:x1]
-        out_t[y0:y1, x0 + x_strip_max:x1] = torch.where(right_overlap, b_right, cur)
+        right_overlap = (overlap_bb_t[:, x_strip_max:] > 0).unsqueeze(0)
+        b_right = b_t[:, y0:y1, x0 + x_strip_max:x1]
+        cur = out_t[:, y0:y1, x0 + x_strip_max:x1]
+        out_t[:, y0:y1, x0 + x_strip_max:x1] = torch.where(right_overlap, b_right, cur)
 
-    # Step 3: multi-band on the strip.
-    a_strip_t = a_full_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
-    b_strip_t = b_full_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
+    # Step 3: multi-band on the strip. Strip slices are also channel-first.
+    a_strip_t = a_t[:, y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
+    b_strip_t = b_t[:, y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
 
-    # Fill cross-camera holes inside the strip (only_a region in A gets B,
-    # and vice versa) so the pyramid blur doesn't pull in zeros at hard
-    # edges. Inside a typical strip these masks are mostly empty.
     only_a_strip = (gpu_ctx["only_a_in_bbox_t"][:, x_strip_min:x_strip_max]
-                    .unsqueeze(-1) > 0)
+                    > 0).unsqueeze(0)
     only_b_strip = (gpu_ctx["only_b_in_bbox_t"][:, x_strip_min:x_strip_max]
-                    .unsqueeze(-1) > 0)
+                    > 0).unsqueeze(0)
     a_strip_filled = torch.where(only_b_strip, b_strip_t, a_strip_t)
     b_strip_filled = torch.where(only_a_strip, a_strip_t, b_strip_t)
 
-    # Soft mask on the strip. build_soft_mask_fast expects per-row seam
-    # indices relative to the polygon it's masking, so subtract the strip
-    # origin and clip.
     strip_static = {
         "only_a_in_bbox": static["only_a_in_bbox"][:, x_strip_min:x_strip_max],
         "only_b_in_bbox": static["only_b_in_bbox"][:, x_strip_min:x_strip_max],
@@ -208,8 +210,10 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     )
     mask_strip_t = torch.from_numpy(mask_strip_np).to(device, non_blocking=True)
 
-    a_f = a_strip_filled.permute(2, 0, 1).float()
-    b_f = b_strip_filled.permute(2, 0, 1).float()
+    # Channel-first already: a_strip_filled is (3, H_bb, strip_w). No
+    # .permute(2, 0, 1) needed.
+    a_f = a_strip_filled.float()
+    b_f = b_strip_filled.float()
     m_f = mask_strip_t.unsqueeze(0)
 
     min_dim = min(H_bb, strip_w)
@@ -223,30 +227,26 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     blended_lp = [la * gm + lb * (1.0 - gm)
                   for la, lb, gm in zip(lp_a, lp_b, gp_m)]
     recon = _reconstruct_from_laplacian_torch(blended_lp, kernel2d).clamp(0, 255)
-    blended_strip_t = recon.permute(1, 2, 0).to(torch.uint8).contiguous()
+    blended_strip_t = recon.to(torch.uint8).contiguous()  # (3, H_bb, strip_w)
 
     valid_strip = (gpu_ctx["valid_in_bbox_t"][:, x_strip_min:x_strip_max]
-                   .unsqueeze(-1) > 0)
-    cur = out_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max]
-    out_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max] = torch.where(
+                   > 0).unsqueeze(0)
+    cur = out_t[:, y0:y1, x0 + x_strip_min:x0 + x_strip_max]
+    out_t[:, y0:y1, x0 + x_strip_min:x0 + x_strip_max] = torch.where(
         valid_strip, blended_strip_t, cur,
     )
 
-    # Transfer to a pinned-memory tensor with non_blocking=True. Pinned
-    # memory is page-locked, which lets CUDA do the DMA copy directly
-    # without the extra staging copy the default pageable-memory path
-    # would incur. The numpy view of the pinned tensor shares storage,
-    # so np.copyto into out_buf is a single host-side memcpy.
+    # One final permute+contiguous to (H, W, 3) for the pinned host
+    # buffer (cv2 / VideoWriter expect that layout). This replaces the
+    # two earlier full-canvas permutes; net save ~3 ms.
+    out_hwc = out_t.permute(1, 2, 0).contiguous()
     pinned = gpu_ctx.get("pinned_output_t")
-    if pinned is not None and pinned.shape == out_t.shape:
-        pinned.copy_(out_t, non_blocking=True)
-        # We still need a sync before reading on the CPU, but the copy
-        # itself runs on the DMA engine and may overlap with whatever
-        # compute we queued earlier that wasn't yet drained.
+    if pinned is not None and pinned.shape == out_hwc.shape:
+        pinned.copy_(out_hwc, non_blocking=True)
         torch.cuda.synchronize()
         np.copyto(out_buf, pinned.numpy())
     else:
-        result_np = out_t.cpu().numpy()
+        result_np = out_hwc.cpu().numpy()
         np.copyto(out_buf, result_np)
     return out_buf
 

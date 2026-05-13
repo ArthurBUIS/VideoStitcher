@@ -69,6 +69,39 @@ def build_grid_sample_tensor(map_x, map_y, src_shape, device):
     return grid_t
 
 
+def warp_pair_gpu(frame_a_bgr_cpu, frame_b_bgr_cpu,
+                  grid_pair_t, device,
+                  gain_a_t=None, gain_b_t=None,
+                  non_blocking=True):
+    """
+    Batched two-frame warp. Uploads A and B, stacks them into a
+    (2, 3, H_src, W_src) tensor, runs a SINGLE grid_sample against the
+    precomputed (2, H_canvas, W_canvas, 2) grid stack. Saves the
+    kernel-launch + scheduling overhead vs two separate warp_gpu calls.
+
+    Returns (warped_a_t, warped_b_t), each (1, 3, H_canvas, W_canvas)
+    uint8 — same shapes as warp_gpu returns, so downstream code is
+    unchanged.
+    """
+    ta = torch.from_numpy(frame_a_bgr_cpu).to(device, non_blocking=non_blocking)
+    tb = torch.from_numpy(frame_b_bgr_cpu).to(device, non_blocking=non_blocking)
+    ta = ta.permute(2, 0, 1).unsqueeze(0).float()
+    tb = tb.permute(2, 0, 1).unsqueeze(0).float()
+    if gain_a_t is not None:
+        ta = (ta * gain_a_t).clamp(0, 255)
+    if gain_b_t is not None:
+        tb = (tb * gain_b_t).clamp(0, 255)
+    t = torch.cat([ta, tb], dim=0)
+    warped = F.grid_sample(
+        t, grid_pair_t,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    warped = warped.clamp(0, 255).to(torch.uint8)
+    return warped[0:1], warped[1:2]
+
+
 def warp_gpu(frame_bgr_cpu, grid_t, device, gain_t=None, non_blocking=True):
     """
     Upload a BGR frame to GPU and warp it to canvas via grid_sample.

@@ -58,6 +58,7 @@ from stitcher.warp import (
     dilate_gpu,
     warp_gpu,
     warp_mask_gpu,
+    warp_pair_gpu,
 )
 
 
@@ -299,6 +300,9 @@ def run(args):
         }
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
+        # Stacked grid for the batched warp_pair_gpu call. Built once
+        # since the grids are static for the whole run.
+        grid_pair_t = torch.cat([grid_a_t, grid_b_t], dim=0)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
         # Downsampled overlap mask for the cost+ema fast path: we run
         # photometric diff / EMA / penalty injection on a ds-stride
@@ -410,10 +414,13 @@ def run(args):
                         static["overlap_bbox"], static["overlap_in_bbox"],
                     )
             if dev["cuda_available"]:
-                warped_a_t = warp_gpu(frame_a, grid_a_t, gpu_ctx["device"],
-                                      gain_t=gain_a_t)
-                warped_b_t = warp_gpu(frame_b, grid_b_t, gpu_ctx["device"],
-                                      gain_t=gain_b_t)
+                # Batched warp: one grid_sample on the stacked (2, 3, H, W)
+                # tensor instead of two separate calls. Saves the second
+                # kernel launch + scheduling overhead.
+                warped_a_t, warped_b_t = warp_pair_gpu(
+                    frame_a, frame_b, grid_pair_t, gpu_ctx["device"],
+                    gain_a_t=gain_a_t, gain_b_t=gain_b_t,
+                )
             else:
                 if lut_a is not None:
                     frame_a_g = apply_gain_lut(frame_a, lut_a)
