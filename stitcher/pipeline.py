@@ -429,11 +429,14 @@ def run(args):
         # binary mask between runs.
         if frame_idx % args.yolo_every == 0:
             if dev["cuda_available"]:
-                mask_a_src_t = person_segmenter.predict_classes_mask_gpu(
-                    frame_a, frame_a.shape[:2], person_class_ids,
-                )
-                mask_b_src_t = person_segmenter.predict_classes_mask_gpu(
-                    frame_b, frame_b.shape[:2], person_class_ids,
+                # Batched YOLO call for both cameras (one model.predict
+                # over the stacked pair instead of two separate calls).
+                mask_a_src_t, mask_b_src_t = (
+                    person_segmenter.predict_classes_mask_pair_gpu(
+                        frame_a, frame_b,
+                        frame_a.shape[:2], frame_b.shape[:2],
+                        person_class_ids,
+                    )
                 )
                 mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
                 mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
@@ -454,11 +457,10 @@ def run(args):
                 if args.debug_mask:
                     person_mask_bbox = person_mask_bbox_t.cpu().numpy()
             else:
-                mask_a_src = person_segmenter.predict_classes_mask(
-                    frame_a, person_class_ids,
-                )
-                mask_b_src = person_segmenter.predict_classes_mask(
-                    frame_b, person_class_ids,
+                mask_a_src, mask_b_src = (
+                    person_segmenter.predict_classes_mask_pair(
+                        frame_a, frame_b, person_class_ids,
+                    )
                 )
                 mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
                 mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)

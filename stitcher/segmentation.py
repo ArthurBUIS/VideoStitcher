@@ -106,6 +106,64 @@ class PersonSegmenter:
         mask = (m[0, 0] * 255).to(torch.uint8)
         return mask
 
+    def predict_classes_mask_pair_gpu(self, frame_a_bgr, frame_b_bgr,
+                                      target_hw_a, target_hw_b,
+                                      class_ids=(PERSON_CLASS_ID,)):
+        """
+        Batched two-frame inference. Calls model.predict with both frames
+        in one go (ultralytics batches over the list) and returns
+        (mask_a, mask_b) as (H, W) uint8 GPU tensors at each target size.
+
+        Saves the per-call overhead (kernel-launch + pre/post-processing)
+        of the second predict() vs invoking predict_classes_mask_gpu twice.
+        """
+        results = self.model.predict(
+            [frame_a_bgr, frame_b_bgr], classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        for i, target_hw in enumerate((target_hw_a, target_hw_b)):
+            H_tgt, W_tgt = target_hw
+            if not results or i >= len(results):
+                out.append(torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
+                                       device=self.device))
+                continue
+            r = results[i]
+            if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
+                out.append(torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
+                                       device=self.device))
+                continue
+            mdata = r.masks.data
+            merged = (mdata > 0.5).any(dim=0).float()
+            m = merged.unsqueeze(0).unsqueeze(0)
+            m = F.interpolate(m, size=(H_tgt, W_tgt), mode="nearest")
+            out.append((m[0, 0] * 255).to(torch.uint8))
+        return out[0], out[1]
+
+    def predict_classes_mask_pair(self, frame_a_bgr, frame_b_bgr,
+                                  class_ids=(PERSON_CLASS_ID,)):
+        """CPU/numpy variant of predict_classes_mask_pair_gpu."""
+        results = self.model.predict(
+            [frame_a_bgr, frame_b_bgr], classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        for i, frame_bgr in enumerate((frame_a_bgr, frame_b_bgr)):
+            H, W = frame_bgr.shape[:2]
+            mask = np.zeros((H, W), dtype=np.uint8)
+            if results and i < len(results):
+                r = results[i]
+                if r.masks is not None and r.masks.data is not None \
+                        and len(r.masks.data) > 0:
+                    mdata = r.masks.data.cpu().numpy()
+                    merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
+                    mask = cv2.resize(merged_small, (W, H),
+                                      interpolation=cv2.INTER_NEAREST)
+            out.append(mask)
+        return out[0], out[1]
+
 
 def compute_fg_mask_seg_gpu(segmenter, frame_a, frame_b, class_ids,
                              grid_a_t, grid_b_t, dilate_radius,
