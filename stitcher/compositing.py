@@ -122,11 +122,37 @@ def _reconstruct_from_laplacian_torch(lp, kernel2d):
 def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full,
                                      blend_width, blend_levels, out_buf,
                                      gpu_ctx):
-    """GPU multi-band Laplacian blend, fully resident on device until the
-    final cpu().numpy() that copies the output frame."""
+    """
+    GPU multi-band Laplacian blend, restricted to a strip around the seam.
+
+    The multi-band blend only affects pixels within ±blend_width of the
+    seam — outside that strip the soft mask is hard 0 or 1 and the
+    blend reduces to a copy. Building the pyramid on the entire overlap
+    bbox is wasteful; instead we:
+
+      1. Compute strip = [seam.min() - blend_width, seam.max() + blend_width]
+         clipped to the bbox.
+      2. Hard-copy A on the overlap region left of the strip, B on the
+         overlap region right. only_A / only_B regions are filled
+         canvas-wide first.
+      3. Multi-band only on the strip (typically 4-5x smaller than the
+         full bbox in x).
+
+    Fully GPU-resident until the final cpu().numpy() that copies the
+    output frame back to host memory.
+    """
     device = gpu_ctx["device"]
     kernel2d = gpu_ctx["kernel2d"]
     x0, y0, x1, y1 = static["overlap_bbox"]
+    H_bb = y1 - y0
+    W_bb = x1 - x0
+
+    # Strip x-range in bbox-local coords.
+    seam_min = int(seam_x_full.min())
+    seam_max = int(seam_x_full.max())
+    x_strip_min = max(0, seam_min - blend_width)
+    x_strip_max = min(W_bb, seam_max + blend_width + 1)
+    strip_w = x_strip_max - x_strip_min
 
     a_full_t = warped_a_t[0].permute(1, 2, 0).contiguous()
     b_full_t = warped_b_t[0].permute(1, 2, 0).contiguous()
@@ -134,31 +160,59 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     H_canvas, W_canvas = a_full_t.shape[:2]
     out_t = torch.zeros((H_canvas, W_canvas, 3), dtype=torch.uint8,
                         device=device)
+
+    # Step 1: hard-copy only_A and only_B canvas-wide.
     only_a_m = gpu_ctx["only_a_u8_t"].unsqueeze(-1) > 0
     only_b_m = gpu_ctx["only_b_u8_t"].unsqueeze(-1) > 0
     out_t = torch.where(only_a_m, a_full_t, out_t)
     out_t = torch.where(only_b_m, b_full_t, out_t)
 
-    a_bb_t = a_full_t[y0:y1, x0:x1].contiguous()
-    b_bb_t = b_full_t[y0:y1, x0:x1].contiguous()
-    only_a_bb = gpu_ctx["only_a_in_bbox_t"].unsqueeze(-1) > 0
-    only_b_bb = gpu_ctx["only_b_in_bbox_t"].unsqueeze(-1) > 0
-    a_bb_filled = torch.where(only_b_bb, b_bb_t, a_bb_t)
-    b_bb_filled = torch.where(only_a_bb, a_bb_t, b_bb_t)
+    # Step 2: in the overlap, hard-copy A left of the strip and B right.
+    overlap_bb_t = gpu_ctx["overlap_in_bbox_t"]
+    if x_strip_min > 0:
+        left_overlap = (overlap_bb_t[:, :x_strip_min] > 0).unsqueeze(-1)
+        a_left = a_full_t[y0:y1, x0:x0 + x_strip_min]
+        cur = out_t[y0:y1, x0:x0 + x_strip_min]
+        out_t[y0:y1, x0:x0 + x_strip_min] = torch.where(left_overlap, a_left, cur)
+    if x_strip_max < W_bb:
+        right_overlap = (overlap_bb_t[:, x_strip_max:] > 0).unsqueeze(-1)
+        b_right = b_full_t[y0:y1, x0 + x_strip_max:x1]
+        cur = out_t[y0:y1, x0 + x_strip_max:x1]
+        out_t[y0:y1, x0 + x_strip_max:x1] = torch.where(right_overlap, b_right, cur)
 
-    H_bb = y1 - y0
-    W_bb = x1 - x0
-    bbox_shape = (H_bb, W_bb)
-    mask_f32_np = build_soft_mask_fast(
-        seam_x_full, bbox_shape, static, blend_width,
+    # Step 3: multi-band on the strip.
+    a_strip_t = a_full_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
+    b_strip_t = b_full_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max].contiguous()
+
+    # Fill cross-camera holes inside the strip (only_a region in A gets B,
+    # and vice versa) so the pyramid blur doesn't pull in zeros at hard
+    # edges. Inside a typical strip these masks are mostly empty.
+    only_a_strip = (gpu_ctx["only_a_in_bbox_t"][:, x_strip_min:x_strip_max]
+                    .unsqueeze(-1) > 0)
+    only_b_strip = (gpu_ctx["only_b_in_bbox_t"][:, x_strip_min:x_strip_max]
+                    .unsqueeze(-1) > 0)
+    a_strip_filled = torch.where(only_b_strip, b_strip_t, a_strip_t)
+    b_strip_filled = torch.where(only_a_strip, a_strip_t, b_strip_t)
+
+    # Soft mask on the strip. build_soft_mask_fast expects per-row seam
+    # indices relative to the polygon it's masking, so subtract the strip
+    # origin and clip.
+    strip_static = {
+        "only_a_in_bbox": static["only_a_in_bbox"][:, x_strip_min:x_strip_max],
+        "only_b_in_bbox": static["only_b_in_bbox"][:, x_strip_min:x_strip_max],
+    }
+    seam_x_strip = (seam_x_full.astype(np.int32) - x_strip_min)
+    seam_x_strip = np.clip(seam_x_strip, 0, strip_w - 1)
+    mask_strip_np = build_soft_mask_fast(
+        seam_x_strip, (H_bb, strip_w), strip_static, blend_width,
     )
-    mask_t = torch.from_numpy(mask_f32_np).to(device, non_blocking=True)
+    mask_strip_t = torch.from_numpy(mask_strip_np).to(device, non_blocking=True)
 
-    a_f = a_bb_filled.permute(2, 0, 1).float()
-    b_f = b_bb_filled.permute(2, 0, 1).float()
-    m_f = mask_t.unsqueeze(0)
+    a_f = a_strip_filled.permute(2, 0, 1).float()
+    b_f = b_strip_filled.permute(2, 0, 1).float()
+    m_f = mask_strip_t.unsqueeze(0)
 
-    min_dim = min(H_bb, W_bb)
+    min_dim = min(H_bb, strip_w)
     max_levels = max(1, int(np.log2(min_dim)) - 2)
     levels = min(blend_levels, max_levels)
 
@@ -166,18 +220,17 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     lp_b = _build_laplacian_pyramid_torch(b_f, levels, kernel2d)
     gp_m = _build_gaussian_pyramid_torch(m_f, levels, kernel2d)
 
-    blended_lp = []
-    for la, lb, gm in zip(lp_a, lp_b, gp_m):
-        blended_lp.append(la * gm + lb * (1.0 - gm))
+    blended_lp = [la * gm + lb * (1.0 - gm)
+                  for la, lb, gm in zip(lp_a, lp_b, gp_m)]
+    recon = _reconstruct_from_laplacian_torch(blended_lp, kernel2d).clamp(0, 255)
+    blended_strip_t = recon.permute(1, 2, 0).to(torch.uint8).contiguous()
 
-    recon = _reconstruct_from_laplacian_torch(blended_lp, kernel2d)
-    recon = recon.clamp(0, 255)
-    blended_bb_t = recon.permute(1, 2, 0).to(torch.uint8).contiguous()
-
-    valid_bb = gpu_ctx["valid_in_bbox_t"].unsqueeze(-1) > 0
-    out_bbox_slice = out_t[y0:y1, x0:x1]
-    out_bbox_slice = torch.where(valid_bb, blended_bb_t, out_bbox_slice)
-    out_t[y0:y1, x0:x1] = out_bbox_slice
+    valid_strip = (gpu_ctx["valid_in_bbox_t"][:, x_strip_min:x_strip_max]
+                   .unsqueeze(-1) > 0)
+    cur = out_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max]
+    out_t[y0:y1, x0 + x_strip_min:x0 + x_strip_max] = torch.where(
+        valid_strip, blended_strip_t, cur,
+    )
 
     result_np = out_t.cpu().numpy()
     np.copyto(out_buf, result_np)

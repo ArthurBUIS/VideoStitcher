@@ -285,6 +285,7 @@ def run(args):
             "only_b_u8_t": torch.from_numpy(static["only_b_u8"]).to(torch_device),
             "only_a_in_bbox_t": torch.from_numpy(static["only_a_in_bbox"]).to(torch_device),
             "only_b_in_bbox_t": torch.from_numpy(static["only_b_in_bbox"]).to(torch_device),
+            "overlap_in_bbox_t": torch.from_numpy(static["overlap_in_bbox"]).to(torch_device),
             "valid_in_bbox_t": torch.from_numpy(valid_in_bbox_np).to(torch_device),
         }
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
