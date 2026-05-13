@@ -300,6 +300,18 @@ def run(args):
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
+        # Downsampled overlap mask for the cost+ema fast path: we run
+        # photometric diff / EMA / penalty injection on a ds-stride
+        # version of the bbox, since the DP only ever sees the
+        # downsampled cost anyway. 16x less data at ds=4.
+        ds_init = max(1, args.seam_downscale)
+        if ds_init > 1:
+            overlap_in_bbox_t_ds = F.max_pool2d(
+                overlap_in_bbox_t.unsqueeze(0).unsqueeze(0).float(),
+                kernel_size=ds_init, stride=ds_init,
+            )[0, 0].to(torch.uint8)
+        else:
+            overlap_in_bbox_t_ds = overlap_in_bbox_t
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
@@ -484,30 +496,59 @@ def run(args):
             if dev["cuda_available"]:
                 has_person = (person_mask_bbox_t.any().item()
                               if person_mask_bbox_t is not None else False)
-                # compute_cost_and_ema_gpu now returns a GPU tensor; we
-                # apply the edge-margin penalty and downsample on device
-                # so only the small post-downsample cost is transferred.
+                # Downsample the bbox-cropped warped frames + dynamic
+                # masks BEFORE the cost computation. cost+ema then runs
+                # on a 16x smaller (at ds=4) tensor instead of on the
+                # full bbox followed by a downsample at the end.
+                x0_bb, y0_bb, x1_bb, y1_bb = static["overlap_bbox"]
+                if ds > 1:
+                    wa_for_cost = F.avg_pool2d(
+                        warped_a_t[:, :, y0_bb:y1_bb, x0_bb:x1_bb].float(),
+                        kernel_size=ds, stride=ds,
+                    )
+                    wb_for_cost = F.avg_pool2d(
+                        warped_b_t[:, :, y0_bb:y1_bb, x0_bb:x1_bb].float(),
+                        kernel_size=ds, stride=ds,
+                    )
+                    overlap_for_cost = overlap_in_bbox_t_ds
+                    person_for_cost = None
+                    if has_person:
+                        person_for_cost = F.max_pool2d(
+                            person_mask_bbox_t.unsqueeze(0).unsqueeze(0).float(),
+                            kernel_size=ds, stride=ds,
+                        )[0, 0].to(torch.uint8)
+                    fg_for_cost = None
+                    if use_fg and fg_mask_bbox_t is not None:
+                        fg_for_cost = F.max_pool2d(
+                            fg_mask_bbox_t.unsqueeze(0).unsqueeze(0).float(),
+                            kernel_size=ds, stride=ds,
+                        )[0, 0].to(torch.uint8)
+                else:
+                    wa_for_cost = warped_a_t[:, :, y0_bb:y1_bb, x0_bb:x1_bb].float()
+                    wb_for_cost = warped_b_t[:, :, y0_bb:y1_bb, x0_bb:x1_bb].float()
+                    overlap_for_cost = overlap_in_bbox_t
+                    person_for_cost = person_mask_bbox_t if has_person else None
+                    fg_for_cost = fg_mask_bbox_t if use_fg else None
+
+                H_ds = wa_for_cost.shape[2]
+                W_ds = wa_for_cost.shape[3]
+                # compute_cost_and_ema_gpu slices its inputs by overlap_bbox;
+                # since we've already cropped to bbox, pass a bbox covering
+                # the full passed tensor so the slice is a no-op.
                 cost_ema_t, cost_for_dp_t = compute_cost_and_ema_gpu(
-                    warped_a_t, warped_b_t, overlap_in_bbox_t,
+                    wa_for_cost, wb_for_cost, overlap_for_cost,
                     cost_ema_t, ema_eff,
-                    person_mask_bbox_t if has_person else None,
-                    fg_mask_bbox_t if use_fg else None,
+                    person_for_cost, fg_for_cost,
                     args.fg_penalty, args.person_penalty,
-                    static["overlap_bbox"],
+                    (0, 0, W_ds, H_ds),
                 )
                 if args.seam_edge_margin > 0:
-                    m = min(args.seam_edge_margin,
-                            cost_for_dp_t.shape[1] // 2)
+                    # Scale the edge margin into downscaled-cost coords.
+                    m = max(1, args.seam_edge_margin // ds)
+                    m = min(m, cost_for_dp_t.shape[1] // 2)
                     cost_for_dp_t[:, :m] += args.edge_penalty
                     cost_for_dp_t[:, -m:] += args.edge_penalty
-                if ds > 1:
-                    cost_small_t = F.avg_pool2d(
-                        cost_for_dp_t.unsqueeze(0).unsqueeze(0),
-                        kernel_size=ds, stride=ds,
-                    )[0, 0]
-                else:
-                    cost_small_t = cost_for_dp_t
-                cost_small = cost_small_t.cpu().numpy()
+                cost_small = cost_for_dp_t.cpu().numpy()
             else:
                 wa_bb = warped_a[y0:y1, x0:x1]
                 wb_bb = warped_b[y0:y1, x0:x1]
