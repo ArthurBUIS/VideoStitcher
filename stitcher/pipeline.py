@@ -7,10 +7,15 @@ entry point script (`video_stitcher_seam_gpu.py`) owns the argparse;
 this module owns the actual work.
 """
 
+import contextlib
 import os
 import queue
 import threading
 import time
+
+# `with _nullcontext():` is a no-op context manager — used when CUDA isn't
+# available so we can keep one code path for both GPU + CPU workers.
+_nullcontext = contextlib.nullcontext
 
 import cv2
 import numpy as np
@@ -306,6 +311,12 @@ def run(args):
         # since the grids are static for the whole run.
         grid_pair_t = torch.cat([grid_a_t, grid_b_t], dim=0)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
+        # Tier-2 pipeline parallelism: each worker thread runs its CUDA
+        # work on its own stream so the GPU can interleave kernels from
+        # consecutive frames (composite N + compute N+1) instead of
+        # serialising them on the default stream.
+        compute_stream = torch.cuda.Stream()
+        composite_stream = torch.cuda.Stream()
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
@@ -557,6 +568,13 @@ def run(args):
 
         person_for_debug = person_mask_bbox if args.debug_mask else None
 
+        # Record an event on the current (compute) stream so the composite
+        # stage's stream can wait on it before reading our output tensors.
+        compute_done_event = None
+        if dev["cuda_available"]:
+            compute_done_event = torch.cuda.Event()
+            compute_done_event.record()
+
         return {
             "frame_idx": frame_idx,
             "warped_a_t": warped_a_t,
@@ -566,11 +584,19 @@ def run(args):
             "seam_x_full": seam_x_full,
             "person_for_debug": person_for_debug,
             "fg_for_debug": fg_for_debug,
+            "compute_done_event": compute_done_event,
         }
 
     def composite_one(payload):
         """Run the multi-band composite, debug overlays, autocrop, and
         enqueue the final frame to the writer."""
+        # Wait for the compute stage's output tensors to be ready (their
+        # writes happened on compute_stream; we read them on
+        # composite_stream). Stream wait is the cheap, GPU-side
+        # synchronisation primitive — no host stall.
+        compute_event = payload.get("compute_done_event")
+        if compute_event is not None:
+            compute_event.wait()
         seam_x_full = payload["seam_x_full"]
         if gpu_ctx is not None:
             stitched = composite_multiband_gpu_resident(
@@ -609,27 +635,41 @@ def run(args):
     worker_error = [None]
 
     def compute_worker():
+        # Pin this thread's CUDA stream so every CUDA op in compute_one
+        # runs on compute_stream and can overlap with composite_stream.
+        stream_ctx = (
+            torch.cuda.stream(compute_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
         try:
-            while True:
-                item = compute_in_q.get()
-                if item is SENTINEL:
-                    composite_in_q.put(SENTINEL)
-                    return
-                fa, fb, idx = item
-                payload = compute_one(fa, fb, idx)
-                composite_in_q.put(payload)
+            with stream_ctx:
+                while True:
+                    item = compute_in_q.get()
+                    if item is SENTINEL:
+                        composite_in_q.put(SENTINEL)
+                        return
+                    fa, fb, idx = item
+                    payload = compute_one(fa, fb, idx)
+                    composite_in_q.put(payload)
         except Exception as e:
             worker_error[0] = e
             composite_in_q.put(SENTINEL)
 
     def composite_worker():
+        stream_ctx = (
+            torch.cuda.stream(composite_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
         try:
-            while True:
-                item = composite_in_q.get()
-                if item is SENTINEL:
-                    return
-                stitched = composite_one(item)
-                writer.write(stitched)
+            with stream_ctx:
+                while True:
+                    item = composite_in_q.get()
+                    if item is SENTINEL:
+                        return
+                    stitched = composite_one(item)
+                    writer.write(stitched)
         except Exception as e:
             worker_error[0] = e
 

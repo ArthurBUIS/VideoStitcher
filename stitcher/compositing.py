@@ -243,7 +243,11 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
     pinned = gpu_ctx.get("pinned_output_t")
     if pinned is not None and pinned.shape == out_hwc.shape:
         pinned.copy_(out_hwc, non_blocking=True)
-        torch.cuda.synchronize()
+        # Use current_stream().synchronize() (not torch.cuda.synchronize)
+        # so we only wait for THIS stream's queue to drain. The other
+        # stream's work continues. Matters for the tier-2 pipeline
+        # where compute runs on its own stream.
+        torch.cuda.current_stream().synchronize()
         np.copyto(out_buf, pinned.numpy())
     else:
         result_np = out_hwc.cpu().numpy()
