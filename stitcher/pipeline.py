@@ -8,6 +8,8 @@ this module owns the actual work.
 """
 
 import os
+import queue
+import threading
 import time
 
 import cv2
@@ -362,272 +364,312 @@ def run(args):
         raise RuntimeError(f"Could not open output writer for {args.output}")
     writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
 
-    t_read = t_warp = t_gain = t_yolo = t_maskwarp = 0.0
-    t_cost = t_seam = t_composite = t_write = 0.0
-    frame_idx = 0
-    t_start = time.time()
-
     # Reuse the homography frame as the first iteration; subsequent
     # iterations pull from a background thread that decodes the next
-    # paired frame in parallel with the compute loop. The 10-20 ms
-    # of decode/sync overhead per frame is now hidden behind compute.
+    # paired frame in parallel with the compute loop.
     pending_first_pair = (frame_a, frame_b)
     prefetch_reader = PrefetchingFrameReader(sync_reader, queue_depth=3)
 
+    # --- Per-frame compute and composite, as nested closures ---------------
+    #
+    # The pipeline runs two worker threads (compute_worker and
+    # composite_worker) plus the prefetch decode thread (PrefetchingFrameReader)
+    # and the write thread (ThreadedVideoWriter). Per-frame work is split at
+    # the natural data boundary: everything that produces the seam and the
+    # warped frames (compute_one) vs everything that consumes them to make
+    # the final stitched image (composite_one). The two stages run on
+    # consecutive frames at the same time.
+
+    def compute_one(frame_a, frame_b, frame_idx):
+        """Warp + (every yolo_every) YOLO + mask + cost + EMA + DP seam.
+        Updates inter-frame state in the enclosing scope. Returns a payload
+        dict consumed by composite_one."""
+        nonlocal cost_ema_t, cost_ema
+        nonlocal person_mask_bbox_t, person_mask_bbox
+        nonlocal person_mask_ema_t, person_mask_ema
+        nonlocal seam_prev_small
+        nonlocal fg_mask_bbox_t, fg_mask_bbox
+
+        # Periodic FG recompute.
+        if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
+                and frame_idx % fg_recompute_frames == 0):
+            if dev["cuda_available"]:
+                fg_mask_bbox_t = compute_fg_mask_seg_gpu(
+                    fg_segmenter, frame_a, frame_b, fg_class_ids,
+                    grid_a_t, grid_b_t, args.fg_dilate,
+                    static["overlap_bbox"], overlap_in_bbox_t,
+                )
+            else:
+                fg_mask_bbox = compute_fg_mask_seg_cpu(
+                    fg_segmenter, frame_a, frame_b, fg_class_ids,
+                    map_ax, map_ay, map_bx, map_by,
+                    fg_dilate_kernel,
+                    static["overlap_bbox"], static["overlap_in_bbox"],
+                )
+
+        # Warp.
+        warped_a_t = warped_b_t = None
+        warped_a = warped_b = None
+        if dev["cuda_available"]:
+            warped_a_t, warped_b_t = warp_pair_gpu(
+                frame_a, frame_b, grid_pair_t, gpu_ctx["device"],
+                gain_a_t=gain_a_t, gain_b_t=gain_b_t,
+            )
+        else:
+            if lut_a is not None:
+                frame_a_g = apply_gain_lut(frame_a, lut_a)
+                frame_b_g = apply_gain_lut(frame_b, lut_b)
+            else:
+                frame_a_g = frame_a
+                frame_b_g = frame_b
+            warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
+            warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
+
+        # YOLO person mask (every yolo_every frames). Stateful EMA on the
+        # binary mask between runs.
+        if frame_idx % args.yolo_every == 0:
+            if dev["cuda_available"]:
+                mask_a_src_t = person_segmenter.predict_classes_mask_gpu(
+                    frame_a, frame_a.shape[:2], person_class_ids,
+                )
+                mask_b_src_t = person_segmenter.predict_classes_mask_gpu(
+                    frame_b, frame_b.shape[:2], person_class_ids,
+                )
+                mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
+                mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
+                union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
+                union_t = dilate_gpu(union_t, args.mask_dilate)
+                raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
+                new_float = (raw_mask_t > 0).float()
+                if person_mask_ema_t is None:
+                    person_mask_ema_t = new_float
+                else:
+                    a = args.mask_ema
+                    person_mask_ema_t = (a * new_float
+                                         + (1.0 - a) * person_mask_ema_t)
+                person_mask_bbox_t = (
+                    (person_mask_ema_t > args.mask_ema_threshold)
+                    .to(torch.uint8) * 255
+                ).contiguous()
+                if args.debug_mask:
+                    person_mask_bbox = person_mask_bbox_t.cpu().numpy()
+            else:
+                mask_a_src = person_segmenter.predict_classes_mask(
+                    frame_a, person_class_ids,
+                )
+                mask_b_src = person_segmenter.predict_classes_mask(
+                    frame_b, person_class_ids,
+                )
+                mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
+                mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
+                union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
+                union = cv2.dilate(union, dilate_kernel)
+                raw_mask = union[y0:y1, x0:x1]
+                new_float = (raw_mask > 0).astype(np.float32)
+                if person_mask_ema is None:
+                    person_mask_ema = new_float
+                else:
+                    a = args.mask_ema
+                    person_mask_ema = (a * new_float
+                                       + (1.0 - a) * person_mask_ema)
+                person_mask_bbox = (
+                    (person_mask_ema > args.mask_ema_threshold)
+                    .astype(np.uint8) * 255
+                )
+
+        ds = max(1, args.seam_downscale)
+
+        if dev["cuda_available"]:
+            has_person = (person_mask_bbox_t.any().item()
+                          if person_mask_bbox_t is not None else False)
+            cost_ema_t, cost_for_dp_t = compute_cost_and_ema_gpu(
+                warped_a_t, warped_b_t, overlap_in_bbox_t,
+                cost_ema_t, ema_eff,
+                person_mask_bbox_t if has_person else None,
+                fg_mask_bbox_t if use_fg else None,
+                args.fg_penalty, args.person_penalty,
+                static["overlap_bbox"],
+            )
+            if args.seam_edge_margin > 0:
+                m = min(args.seam_edge_margin,
+                        cost_for_dp_t.shape[1] // 2)
+                cost_for_dp_t[:, :m] += args.edge_penalty
+                cost_for_dp_t[:, -m:] += args.edge_penalty
+            if ds > 1:
+                cost_small_t = F.avg_pool2d(
+                    cost_for_dp_t.unsqueeze(0).unsqueeze(0),
+                    kernel_size=ds, stride=ds,
+                )[0, 0]
+            else:
+                cost_small_t = cost_for_dp_t
+            cost_small = cost_small_t.cpu().numpy()
+        else:
+            wa_bb = warped_a[y0:y1, x0:x1]
+            wb_bb = warped_b[y0:y1, x0:x1]
+            photo_cost = compute_cost_fast_cpu(
+                wa_bb, wb_bb, static["overlap_in_bbox"], cost_scratch,
+            )
+            if ema_eff >= 1.0 or cost_ema is None:
+                if cost_ema is None or cost_ema.shape != photo_cost.shape:
+                    cost_ema = photo_cost.copy()
+                else:
+                    np.copyto(cost_ema, photo_cost)
+            else:
+                cv2.addWeighted(photo_cost, ema_eff,
+                                cost_ema, 1.0 - ema_eff,
+                                0, dst=cost_ema)
+            cost_for_dp = cost_ema.copy()
+            if use_fg and fg_mask_bbox is not None:
+                if person_mask_bbox.any():
+                    fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
+                else:
+                    fg_only = fg_mask_bbox > 0
+                cost_for_dp[fg_only] += args.fg_penalty
+            if person_mask_bbox.any():
+                cost_for_dp[person_mask_bbox > 0] += args.person_penalty
+            add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
+                                    edge_penalty=args.edge_penalty)
+            if ds > 1:
+                cost_small = cv2.resize(
+                    cost_for_dp,
+                    (cost_for_dp.shape[1] // ds, cost_for_dp.shape[0] // ds),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                cost_small = cost_for_dp.copy()
+
+        add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
+        seam_x_small = find_dp_seam(cost_small)
+        seam_prev_small = seam_x_small.copy()
+        seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
+
+        # Snapshot the FG mask for the debug overlay (composite stage may
+        # run a frame later, so we capture the version that's current
+        # for THIS frame here).
+        fg_for_debug = None
+        if args.debug_mask and use_fg:
+            if fg_mask_bbox_t is not None:
+                fg_for_debug = fg_mask_bbox_t.cpu().numpy()
+            elif fg_mask_bbox is not None:
+                fg_for_debug = fg_mask_bbox
+
+        person_for_debug = person_mask_bbox if args.debug_mask else None
+
+        return {
+            "frame_idx": frame_idx,
+            "warped_a_t": warped_a_t,
+            "warped_b_t": warped_b_t,
+            "warped_a": warped_a,
+            "warped_b": warped_b,
+            "seam_x_full": seam_x_full,
+            "person_for_debug": person_for_debug,
+            "fg_for_debug": fg_for_debug,
+        }
+
+    def composite_one(payload):
+        """Run the multi-band composite, debug overlays, autocrop, and
+        enqueue the final frame to the writer."""
+        seam_x_full = payload["seam_x_full"]
+        if gpu_ctx is not None:
+            stitched = composite_multiband_gpu_resident(
+                payload["warped_a_t"], payload["warped_b_t"],
+                static, seam_x_full,
+                args.blend_width, args.blend_levels, out_buf,
+                gpu_ctx,
+            )
+        else:
+            stitched = composite_multiband_cpu(
+                payload["warped_a"], payload["warped_b"],
+                static, seam_x_full,
+                args.blend_width, args.blend_levels, out_buf,
+            )
+        if args.debug_mask:
+            fg_for_debug = payload["fg_for_debug"]
+            if fg_for_debug is not None:
+                draw_mask_overlay(stitched, fg_for_debug,
+                                  static["overlap_bbox"],
+                                  color=(0, 255, 255), alpha=0.25)
+            person_for_debug = payload["person_for_debug"]
+            if person_for_debug is not None:
+                draw_mask_overlay(stitched, person_for_debug,
+                                  static["overlap_bbox"])
+        if args.debug_seam:
+            draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
+        if crop_rect is not None:
+            cx, cy, cw, ch = crop_rect
+            stitched = stitched[cy:cy + ch, cx:cx + cw]
+        return stitched
+
+    # --- Pipelined execution with two worker threads ---------------------
+    SENTINEL = object()
+    compute_in_q = queue.Queue(maxsize=4)
+    composite_in_q = queue.Queue(maxsize=4)
+    worker_error = [None]
+
+    def compute_worker():
+        try:
+            while True:
+                item = compute_in_q.get()
+                if item is SENTINEL:
+                    composite_in_q.put(SENTINEL)
+                    return
+                fa, fb, idx = item
+                payload = compute_one(fa, fb, idx)
+                composite_in_q.put(payload)
+        except Exception as e:
+            worker_error[0] = e
+            composite_in_q.put(SENTINEL)
+
+    def composite_worker():
+        try:
+            while True:
+                item = composite_in_q.get()
+                if item is SENTINEL:
+                    return
+                stitched = composite_one(item)
+                writer.write(stitched)
+        except Exception as e:
+            worker_error[0] = e
+
+    compute_thread = threading.Thread(
+        target=compute_worker, name="compute", daemon=True,
+    )
+    composite_thread = threading.Thread(
+        target=composite_worker, name="composite", daemon=True,
+    )
+    compute_thread.start()
+    composite_thread.start()
+
+    frame_idx = 0
+    t_start = time.time()
     try:
         while True:
-            tt = time.perf_counter()
             if pending_first_pair is not None:
-                frame_a, frame_b = pending_first_pair
+                fa, fb = pending_first_pair
                 pending_first_pair = None
             else:
-                ok, frame_a, frame_b = prefetch_reader.read()
+                ok, fa, fb = prefetch_reader.read()
                 if not ok:
                     break
-            t1 = time.perf_counter()
-            # Periodic FG recompute.
-            if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
-                    and frame_idx % fg_recompute_frames == 0):
-                if dev["cuda_available"]:
-                    fg_mask_bbox_t = compute_fg_mask_seg_gpu(
-                        fg_segmenter, frame_a, frame_b, fg_class_ids,
-                        grid_a_t, grid_b_t, args.fg_dilate,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-                else:
-                    fg_mask_bbox = compute_fg_mask_seg_cpu(
-                        fg_segmenter, frame_a, frame_b, fg_class_ids,
-                        map_ax, map_ay, map_bx, map_by,
-                        fg_dilate_kernel,
-                        static["overlap_bbox"], static["overlap_in_bbox"],
-                    )
-            if dev["cuda_available"]:
-                # Batched warp: one grid_sample on the stacked (2, 3, H, W)
-                # tensor instead of two separate calls. Saves the second
-                # kernel launch + scheduling overhead.
-                warped_a_t, warped_b_t = warp_pair_gpu(
-                    frame_a, frame_b, grid_pair_t, gpu_ctx["device"],
-                    gain_a_t=gain_a_t, gain_b_t=gain_b_t,
-                )
-            else:
-                if lut_a is not None:
-                    frame_a_g = apply_gain_lut(frame_a, lut_a)
-                    frame_b_g = apply_gain_lut(frame_b, lut_b)
-                else:
-                    frame_a_g = frame_a
-                    frame_b_g = frame_b
-                t_gain_end = time.perf_counter()
-                t_gain += t_gain_end - t1
-                warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
-                warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
-            t3 = time.perf_counter()
-            if dev["cuda_available"]:
-                t_warp += t3 - t1
-            else:
-                t_warp += t3 - t_gain_end
-
-            if frame_idx % args.yolo_every == 0:
-                if dev["cuda_available"]:
-                    mask_a_src_t = person_segmenter.predict_classes_mask_gpu(
-                        frame_a, frame_a.shape[:2], person_class_ids,
-                    )
-                    mask_b_src_t = person_segmenter.predict_classes_mask_gpu(
-                        frame_b, frame_b.shape[:2], person_class_ids,
-                    )
-                    t_after_yolo = time.perf_counter()
-                    mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
-                    mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
-                    union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
-                    union_t = dilate_gpu(union_t, args.mask_dilate)
-                    raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
-                    # Temporal EMA on the float mask, then re-binarize.
-                    new_float = (raw_mask_t > 0).float()
-                    if person_mask_ema_t is None:
-                        person_mask_ema_t = new_float
-                    else:
-                        a = args.mask_ema
-                        person_mask_ema_t = (a * new_float
-                                             + (1.0 - a) * person_mask_ema_t)
-                    person_mask_bbox_t = (
-                        (person_mask_ema_t > args.mask_ema_threshold)
-                        .to(torch.uint8) * 255
-                    ).contiguous()
-                    if args.debug_mask:
-                        person_mask_bbox = person_mask_bbox_t.cpu().numpy()
-                    t_after_mask = time.perf_counter()
-                else:
-                    mask_a_src = person_segmenter.predict_classes_mask(
-                        frame_a, person_class_ids,
-                    )
-                    mask_b_src = person_segmenter.predict_classes_mask(
-                        frame_b, person_class_ids,
-                    )
-                    t_after_yolo = time.perf_counter()
-                    mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
-                    mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
-                    union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
-                    union = cv2.dilate(union, dilate_kernel)
-                    raw_mask = union[y0:y1, x0:x1]
-                    # Temporal EMA on the float mask, then re-binarize.
-                    new_float = (raw_mask > 0).astype(np.float32)
-                    if person_mask_ema is None:
-                        person_mask_ema = new_float
-                    else:
-                        a = args.mask_ema
-                        person_mask_ema = (a * new_float
-                                           + (1.0 - a) * person_mask_ema)
-                    person_mask_bbox = (
-                        (person_mask_ema > args.mask_ema_threshold)
-                        .astype(np.uint8) * 255
-                    )
-                    t_after_mask = time.perf_counter()
-                t_yolo += t_after_yolo - t3
-                t_maskwarp += t_after_mask - t_after_yolo
-            else:
-                t_after_mask = t3
-
-            ds = max(1, args.seam_downscale)
-
-            if dev["cuda_available"]:
-                has_person = (person_mask_bbox_t.any().item()
-                              if person_mask_bbox_t is not None else False)
-                # compute_cost_and_ema_gpu now returns a GPU tensor; we
-                # apply the edge-margin penalty and downsample on device
-                # so only the small post-downsample cost is transferred.
-                cost_ema_t, cost_for_dp_t = compute_cost_and_ema_gpu(
-                    warped_a_t, warped_b_t, overlap_in_bbox_t,
-                    cost_ema_t, ema_eff,
-                    person_mask_bbox_t if has_person else None,
-                    fg_mask_bbox_t if use_fg else None,
-                    args.fg_penalty, args.person_penalty,
-                    static["overlap_bbox"],
-                )
-                if args.seam_edge_margin > 0:
-                    m = min(args.seam_edge_margin,
-                            cost_for_dp_t.shape[1] // 2)
-                    cost_for_dp_t[:, :m] += args.edge_penalty
-                    cost_for_dp_t[:, -m:] += args.edge_penalty
-                if ds > 1:
-                    cost_small_t = F.avg_pool2d(
-                        cost_for_dp_t.unsqueeze(0).unsqueeze(0),
-                        kernel_size=ds, stride=ds,
-                    )[0, 0]
-                else:
-                    cost_small_t = cost_for_dp_t
-                cost_small = cost_small_t.cpu().numpy()
-            else:
-                wa_bb = warped_a[y0:y1, x0:x1]
-                wb_bb = warped_b[y0:y1, x0:x1]
-                photo_cost = compute_cost_fast_cpu(
-                    wa_bb, wb_bb, static["overlap_in_bbox"], cost_scratch,
-                )
-                if ema_eff >= 1.0 or cost_ema is None:
-                    if cost_ema is None or cost_ema.shape != photo_cost.shape:
-                        cost_ema = photo_cost.copy()
-                    else:
-                        np.copyto(cost_ema, photo_cost)
-                else:
-                    cv2.addWeighted(photo_cost, ema_eff,
-                                    cost_ema, 1.0 - ema_eff,
-                                    0, dst=cost_ema)
-                cost_for_dp = cost_ema.copy()
-                # Mirror the GPU penalty hierarchy: FG (lower priority) where
-                # fg_mask AND NOT person_mask, then person_penalty on person.
-                if use_fg and fg_mask_bbox is not None:
-                    if person_mask_bbox.any():
-                        fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
-                    else:
-                        fg_only = fg_mask_bbox > 0
-                    cost_for_dp[fg_only] += args.fg_penalty
-                if person_mask_bbox.any():
-                    cost_for_dp[person_mask_bbox > 0] += args.person_penalty
-                add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
-                                        edge_penalty=args.edge_penalty)
-                if ds > 1:
-                    cost_small = cv2.resize(
-                        cost_for_dp,
-                        (cost_for_dp.shape[1] // ds, cost_for_dp.shape[0] // ds),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                else:
-                    cost_small = cost_for_dp.copy()
-
-            t5 = time.perf_counter()
-            t_cost += t5 - t_after_mask
-
-            add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
-
-            seam_x_small = find_dp_seam(cost_small)
-            seam_prev_small = seam_x_small.copy()
-            seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
-            t6 = time.perf_counter()
-            t_seam += t6 - t5
-
-            if gpu_ctx is not None:
-                stitched = composite_multiband_gpu_resident(
-                    warped_a_t, warped_b_t, static, seam_x_full,
-                    args.blend_width, args.blend_levels, out_buf,
-                    gpu_ctx,
-                )
-            else:
-                stitched = composite_multiband_cpu(
-                    warped_a, warped_b, static, seam_x_full,
-                    args.blend_width, args.blend_levels, out_buf,
-                )
-            if args.debug_mask:
-                # Layer FG (yellow, bottom) under person (red, top).
-                if use_fg:
-                    fg_overlay = (fg_mask_bbox_t.cpu().numpy()
-                                  if fg_mask_bbox_t is not None
-                                  else fg_mask_bbox)
-                    if fg_overlay is not None:
-                        draw_mask_overlay(stitched, fg_overlay,
-                                          static["overlap_bbox"],
-                                          color=(0, 255, 255), alpha=0.25)
-                draw_mask_overlay(stitched, person_mask_bbox, static["overlap_bbox"])
-            if args.debug_seam:
-                draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
-            t7 = time.perf_counter()
-            t_composite += t7 - t6
-
-            if crop_rect is not None:
-                cx, cy, cw, ch = crop_rect
-                stitched = stitched[cy:cy + ch, cx:cx + cw]
-            writer.write(stitched)
-            t8 = time.perf_counter()
-            t_write += t8 - t7
-
-            t_read += t1 - tt
-
+            compute_in_q.put((fa, fb, frame_idx))
             frame_idx += 1
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
+        compute_in_q.put(SENTINEL)
+        compute_thread.join()
+        composite_thread.join()
         prefetch_reader.close()
         writer.close()
 
+    if worker_error[0] is not None:
+        raise worker_error[0]
+
     elapsed = time.time() - t_start
-    n = max(frame_idx, 1)
-    stages = [
-        ("read",          t_read),
-        ("gain",          t_gain),
-        ("warp",          t_warp),
-        ("yolo",          t_yolo),
-        ("mask warp+dil", t_maskwarp),
-        ("cost + ema",    t_cost),
-        ("dp seam",       t_seam),
-        ("composite",     t_composite),
-        ("write (enq)",   t_write),
-    ]
-    total = max(sum(t for _, t in stages), 1e-9)
     print()
-    for name, t in stages:
-        print(f"[timing] {name:<14s} {t*1000/n:7.2f} ms  "
-              f"({100*t/total:5.1f}%)")
-    if dev["cuda_available"]:
-        print("[info] On GPU path, gain is folded into warp.")
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
-          f"({frame_idx / max(elapsed, 1e-6):.2f} fps)")
+          f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
+          f"-- pipelined (compute + composite on separate threads)")
     print(sync_reader.summary_post())
     print(f"[info] Output written to {args.output}")
 
