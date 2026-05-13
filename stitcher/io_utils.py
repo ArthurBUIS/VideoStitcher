@@ -7,6 +7,86 @@ import cv2
 import numpy as np
 
 
+class PrefetchingFrameReader:
+    """
+    Wraps a FrameSyncReader (or any object with a `.read()` returning
+    `(ok, frame_a, frame_b)`) and decodes the next paired frame on a
+    background thread, so the pipeline's compute and the FFmpeg /
+    OpenCV decode run in parallel.
+
+    The decode side typically blocks the pipeline for ~10-20 ms per
+    frame at 1080p; running it in parallel with compute hides that
+    cost.
+
+    Usage:
+        prefetch = PrefetchingFrameReader(sync_reader, queue_depth=3)
+        while True:
+            ok, frame_a, frame_b = prefetch.read()
+            if not ok:
+                break
+            ...
+        prefetch.close()
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, underlying_reader, queue_depth=3):
+        self.reader = underlying_reader
+        self.q = queue.Queue(maxsize=queue_depth)
+        self._stopped = False
+        self.exception = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            while not self._stopped:
+                ok, fa, fb = self.reader.read()
+                if not ok:
+                    break
+                # Block until the consumer drains a slot, but check the
+                # stop flag periodically so close() can unblock us.
+                placed = False
+                while not placed and not self._stopped:
+                    try:
+                        self.q.put((fa, fb), timeout=0.5)
+                        placed = True
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            self.exception = e
+        finally:
+            # Signal end-of-stream to the consumer (best-effort: skip
+            # if the queue is full and we're stopping, since close()
+            # will be draining anyway).
+            try:
+                self.q.put(self._SENTINEL, timeout=1.0)
+            except queue.Full:
+                pass
+
+    def read(self):
+        """Returns (ok, frame_a, frame_b). ok=False at end-of-stream."""
+        if self.exception is not None:
+            raise self.exception
+        item = self.q.get()
+        if item is self._SENTINEL:
+            return False, None, None
+        fa, fb = item
+        return True, fa, fb
+
+    def close(self):
+        self._stopped = True
+        # Drain the queue so the worker can unblock from a full-queue put.
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+        self.thread.join(timeout=5)
+        if self.exception is not None:
+            raise self.exception
+
+
 class ThreadedVideoWriter:
     """
     Wrap cv2.VideoWriter on a background thread so encode/disk-write

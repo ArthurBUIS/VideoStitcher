@@ -28,6 +28,7 @@ from stitcher.geometry import (
     find_autocrop_rect,
 )
 from stitcher.io_utils import (
+    PrefetchingFrameReader,
     ThreadedVideoWriter,
     draw_mask_overlay,
     draw_seam_overlay,
@@ -352,9 +353,12 @@ def run(args):
     frame_idx = 0
     t_start = time.time()
 
-    # Reuse the homography frame as the first iteration; subsequent iterations
-    # pull from the sync reader.
+    # Reuse the homography frame as the first iteration; subsequent
+    # iterations pull from a background thread that decodes the next
+    # paired frame in parallel with the compute loop. The 10-20 ms
+    # of decode/sync overhead per frame is now hidden behind compute.
     pending_first_pair = (frame_a, frame_b)
+    prefetch_reader = PrefetchingFrameReader(sync_reader, queue_depth=3)
 
     try:
         while True:
@@ -363,7 +367,7 @@ def run(args):
                 frame_a, frame_b = pending_first_pair
                 pending_first_pair = None
             else:
-                ok, frame_a, frame_b = sync_reader.read()
+                ok, frame_a, frame_b = prefetch_reader.read()
                 if not ok:
                     break
             t1 = time.perf_counter()
@@ -567,6 +571,7 @@ def run(args):
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
+        prefetch_reader.close()
         writer.close()
 
     elapsed = time.time() - t_start
