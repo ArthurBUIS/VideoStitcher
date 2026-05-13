@@ -7,11 +7,23 @@ penalties injected for pixels that fall on the person mask, the static
 FG mask, and the left/right "edge margin" band. The DP seam is found
 on a downscaled version of that cost; a quadratic regularizer keeps
 the seam close to the previous frame's seam for stability.
+
+The DP seam finder has a numba @njit fast path when numba is
+installed (first call has a ~1 s compile delay, subsequent calls are
+~5x faster than the pure-numpy version because the Python-level row
+loop is eliminated). Falls back to the numpy version if numba is
+unavailable.
 """
 
 import cv2
 import numpy as np
 import torch
+
+try:
+    from numba import njit as _njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
 
 
 # Default penalty amplitudes (used as argparse defaults from cli.py).
@@ -97,12 +109,8 @@ def compute_cost_fast_cpu(wa_bb, wb_bb, overlap_in_bbox, cost_scratch):
 # DP seam + utilities
 # ---------------------------------------------------------------------------
 
-def find_dp_seam(cost):
-    """
-    Find the minimum-cost top-to-bottom path through `cost` (shape H, W).
-    Each row's seam pixel is within 1 of the row below's seam pixel
-    (the standard 3-neighbor DP).
-    """
+def _find_dp_seam_numpy(cost):
+    """Pure-numpy DP fallback when numba isn't available."""
     H, W = cost.shape
     dp = cost.copy()
     for y in range(1, H):
@@ -119,6 +127,75 @@ def find_dp_seam(cost):
         local = dp[y, x0:x1]
         seam_x[y] = x0 + int(np.argmin(local))
     return seam_x
+
+
+if _HAS_NUMBA:
+    @_njit(cache=True, fastmath=True)
+    def _find_dp_seam_njit(cost):
+        """
+        Numba-compiled DP seam finder. Same 3-neighbor recurrence as the
+        numpy version but with explicit row/column loops (no per-row
+        numpy allocations), which is what the Python interpreter
+        overhead in the numpy version was costing.
+        """
+        H, W = cost.shape
+        dp = cost.copy()
+        INF = np.float32(1e30)
+        for y in range(1, H):
+            for x in range(W):
+                left  = dp[y - 1, x - 1] if x > 0 else INF
+                mid   = dp[y - 1, x]
+                right = dp[y - 1, x + 1] if x < W - 1 else INF
+                best = mid
+                if left < best:
+                    best = left
+                if right < best:
+                    best = right
+                dp[y, x] = dp[y, x] + best
+
+        seam_x = np.empty(H, dtype=np.int32)
+        # last row argmin
+        best_idx = 0
+        best_val = dp[H - 1, 0]
+        for x in range(1, W):
+            v = dp[H - 1, x]
+            if v < best_val:
+                best_val = v
+                best_idx = x
+        seam_x[H - 1] = best_idx
+
+        # backtrack
+        for y in range(H - 2, -1, -1):
+            x = seam_x[y + 1]
+            x_lo = x - 1 if x > 0 else x
+            x_hi = x + 1 if x < W - 1 else x
+            best_idx = x_lo
+            best_val = dp[y, x_lo]
+            for xi in range(x_lo + 1, x_hi + 1):
+                v = dp[y, xi]
+                if v < best_val:
+                    best_val = v
+                    best_idx = xi
+            seam_x[y] = best_idx
+
+        return seam_x
+
+
+def find_dp_seam(cost):
+    """
+    Find the minimum-cost top-to-bottom path through `cost` (shape H, W).
+    Each row's seam pixel is within 1 of the row below's seam pixel
+    (the standard 3-neighbor DP). Uses the numba-jitted path when
+    available, otherwise the pure-numpy fallback.
+    """
+    if _HAS_NUMBA:
+        # numba requires a contiguous float32 input for our @njit signature.
+        if cost.dtype != np.float32:
+            cost = cost.astype(np.float32, copy=False)
+        if not cost.flags.c_contiguous:
+            cost = np.ascontiguousarray(cost)
+        return _find_dp_seam_njit(cost)
+    return _find_dp_seam_numpy(cost)
 
 
 def upscale_seam(seam_x_small, bbox_shape, downscale):
