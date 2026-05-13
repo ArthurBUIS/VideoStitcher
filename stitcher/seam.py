@@ -47,7 +47,9 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
         + fg_penalty (default 5e7) where fg_mask AND NOT person_mask
         + person_penalty (default 1e8) where person_mask
 
-    Returns (updated cost_ema_t, cost_for_dp as a numpy float array).
+    Returns (updated cost_ema_t, cost_for_dp) — both GPU tensors. The
+    caller is expected to (optionally) apply the edge-margin penalty on
+    device, downsample, and transfer to CPU.
     """
     x0, y0, x1, y1 = overlap_bbox
     wa_bb = warped_a_t[0, :, y0:y1, x0:x1].float()
@@ -87,8 +89,11 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
                                   cost_for_dp + person_penalty,
                                   cost_for_dp)
 
-    cost_for_dp_cpu = cost_for_dp.cpu().numpy()
-    return cost_ema_t, cost_for_dp_cpu
+    # Return cost_for_dp as a GPU tensor; the caller decides when to
+    # downsample (cheap on GPU) and transfer to CPU. Keeping it on the
+    # device avoids transferring the full-res cost (a few MB at typical
+    # bbox sizes) when a 4x-downsampled version is all the DP needs.
+    return cost_ema_t, cost_for_dp
 
 
 def compute_cost_fast_cpu(wa_bb, wb_bb, overlap_in_bbox, cost_scratch):

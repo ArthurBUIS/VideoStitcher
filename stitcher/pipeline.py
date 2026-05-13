@@ -13,6 +13,7 @@ import time
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from stitcher.compositing import (
     composite_multiband_cpu,
@@ -470,10 +471,15 @@ def run(args):
             else:
                 t_after_mask = t3
 
+            ds = max(1, args.seam_downscale)
+
             if dev["cuda_available"]:
                 has_person = (person_mask_bbox_t.any().item()
                               if person_mask_bbox_t is not None else False)
-                cost_ema_t, cost_for_dp = compute_cost_and_ema_gpu(
+                # compute_cost_and_ema_gpu now returns a GPU tensor; we
+                # apply the edge-margin penalty and downsample on device
+                # so only the small post-downsample cost is transferred.
+                cost_ema_t, cost_for_dp_t = compute_cost_and_ema_gpu(
                     warped_a_t, warped_b_t, overlap_in_bbox_t,
                     cost_ema_t, ema_eff,
                     person_mask_bbox_t if has_person else None,
@@ -481,6 +487,19 @@ def run(args):
                     args.fg_penalty, args.person_penalty,
                     static["overlap_bbox"],
                 )
+                if args.seam_edge_margin > 0:
+                    m = min(args.seam_edge_margin,
+                            cost_for_dp_t.shape[1] // 2)
+                    cost_for_dp_t[:, :m] += args.edge_penalty
+                    cost_for_dp_t[:, -m:] += args.edge_penalty
+                if ds > 1:
+                    cost_small_t = F.avg_pool2d(
+                        cost_for_dp_t.unsqueeze(0).unsqueeze(0),
+                        kernel_size=ds, stride=ds,
+                    )[0, 0]
+                else:
+                    cost_small_t = cost_for_dp_t
+                cost_small = cost_small_t.cpu().numpy()
             else:
                 wa_bb = warped_a[y0:y1, x0:x1]
                 wb_bb = warped_b[y0:y1, x0:x1]
@@ -507,22 +526,19 @@ def run(args):
                     cost_for_dp[fg_only] += args.fg_penalty
                 if person_mask_bbox.any():
                     cost_for_dp[person_mask_bbox > 0] += args.person_penalty
-
-            add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
-                                    edge_penalty=args.edge_penalty)
+                add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
+                                        edge_penalty=args.edge_penalty)
+                if ds > 1:
+                    cost_small = cv2.resize(
+                        cost_for_dp,
+                        (cost_for_dp.shape[1] // ds, cost_for_dp.shape[0] // ds),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    cost_small = cost_for_dp.copy()
 
             t5 = time.perf_counter()
             t_cost += t5 - t_after_mask
-
-            ds = max(1, args.seam_downscale)
-            if ds > 1:
-                cost_small = cv2.resize(
-                    cost_for_dp,
-                    (cost_for_dp.shape[1] // ds, cost_for_dp.shape[0] // ds),
-                    interpolation=cv2.INTER_AREA,
-                )
-            else:
-                cost_small = cost_for_dp.copy()
 
             add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
 
