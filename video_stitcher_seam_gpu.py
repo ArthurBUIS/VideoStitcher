@@ -197,7 +197,7 @@ Multi-band blending:
     --blend_levels N            Laplacian pyramid depth. Higher = wider
                                 low-frequency blending (better exposure
                                 hiding) at the cost of more pyrDown /
-                                pyrUp per frame. Default: 5.
+                                pyrUp per frame. Default: 3.
 
 Usage
 -----
@@ -278,7 +278,7 @@ def main():
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
     parser.add_argument("--blend_width", type=int, default=80)
-    parser.add_argument("--blend_levels", type=int, default=5)
+    parser.add_argument("--blend_levels", type=int, default=3)
     parser.add_argument("--seam_lambda", type=float, default=8.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
     parser.add_argument("--person_penalty", type=float, default=PERSON_PENALTY,
