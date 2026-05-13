@@ -279,6 +279,7 @@ def run(args):
         torch_device = torch.device("cuda")
         valid_in_bbox_np = cv2.bitwise_or(static["mask_a_in_bbox"],
                                           static["mask_b_in_bbox"])
+        H_canvas, W_canvas = canvas_size[1], canvas_size[0]
         gpu_ctx = {
             "device": torch_device,
             "kernel2d": get_pyr_kernel_2d(torch_device),
@@ -288,6 +289,13 @@ def run(args):
             "only_b_in_bbox_t": torch.from_numpy(static["only_b_in_bbox"]).to(torch_device),
             "overlap_in_bbox_t": torch.from_numpy(static["overlap_in_bbox"]).to(torch_device),
             "valid_in_bbox_t": torch.from_numpy(valid_in_bbox_np).to(torch_device),
+            # Page-locked host buffer for the final GPU->CPU transfer of
+            # the composited frame; lets CUDA's DMA copy bypass an extra
+            # staging copy. Allocated once for the full canvas.
+            "pinned_output_t": torch.empty(
+                (H_canvas, W_canvas, 3),
+                dtype=torch.uint8, pin_memory=True,
+            ),
         }
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)

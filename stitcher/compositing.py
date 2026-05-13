@@ -232,8 +232,22 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
         valid_strip, blended_strip_t, cur,
     )
 
-    result_np = out_t.cpu().numpy()
-    np.copyto(out_buf, result_np)
+    # Transfer to a pinned-memory tensor with non_blocking=True. Pinned
+    # memory is page-locked, which lets CUDA do the DMA copy directly
+    # without the extra staging copy the default pageable-memory path
+    # would incur. The numpy view of the pinned tensor shares storage,
+    # so np.copyto into out_buf is a single host-side memcpy.
+    pinned = gpu_ctx.get("pinned_output_t")
+    if pinned is not None and pinned.shape == out_t.shape:
+        pinned.copy_(out_t, non_blocking=True)
+        # We still need a sync before reading on the CPU, but the copy
+        # itself runs on the DMA engine and may overlap with whatever
+        # compute we queued earlier that wasn't yet drained.
+        torch.cuda.synchronize()
+        np.copyto(out_buf, pinned.numpy())
+    else:
+        result_np = out_t.cpu().numpy()
+        np.copyto(out_buf, result_np)
     return out_buf
 
 
