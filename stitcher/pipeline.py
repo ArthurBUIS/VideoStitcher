@@ -83,7 +83,6 @@ import torch.nn.functional as F
 from stitcher.compositing import (
     composite_multiband_cpu,
     composite_multiband_gpu_async,
-    composite_multiband_gpu_resident,
     get_pyr_kernel_2d,
 )
 from stitcher.device import detect_device
@@ -122,7 +121,6 @@ from stitcher.warp import (
     build_grid_sample_tensor,
     compute_gain_compensation,
     dilate_gpu,
-    warp_gpu,
     warp_mask_gpu,
     warp_pair_gpu,
 )

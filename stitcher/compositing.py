@@ -148,12 +148,14 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
          clipped to the bbox.
       2. Hard-copy A on the overlap region left of the strip, B on the
          overlap region right. only_A / only_B regions are filled
-         canvas-wide first.
+         output-wide first.
       3. Multi-band only on the strip (typically 4-5x smaller than the
          full bbox in x).
 
-    Returns out_t as a (3, H_canvas, W_canvas) uint8 tensor on GPU. The
-    caller is responsible for any host transfer + synchronization.
+    Returns out_t as a (3, H_out, W_out) uint8 tensor on GPU. When
+    --autocrop is on, (H_out, W_out) is the autocrop dimensions; when
+    off it's the full canvas. The caller is responsible for any host
+    transfer + synchronisation.
     """
     device = gpu_ctx["device"]
     kernel2d = gpu_ctx["kernel2d"]
@@ -169,20 +171,18 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
     strip_w = x_strip_max - x_strip_min
 
     # Stay channel-first (C, H, W) for the whole composite to avoid two
-    # full-canvas .permute(1, 2, 0).contiguous() copies of the warped
-    # frames (~6 MB each, ~3 ms each). Pyramid math expects channel-first
-    # anyway; the layout swap only matters for the final cv2 output, so
-    # we permute once at the very end onto the (H, W, 3) pinned host
-    # buffer.
-    a_t = warped_a_t[0]   # (3, H_canvas, W_canvas) — view, no copy
+    # full-output .permute(1, 2, 0).contiguous() copies of the warped
+    # frames. Pyramid math expects channel-first anyway; the layout swap
+    # only matters for the final cv2 output, so we permute once at the
+    # very end onto the (H, W, 3) pinned host buffer.
+    a_t = warped_a_t[0]   # (3, H_out, W_out) — view, no copy
     b_t = warped_b_t[0]
 
-    H_canvas = a_t.shape[1]
-    W_canvas = a_t.shape[2]
-    out_t = torch.zeros((3, H_canvas, W_canvas), dtype=torch.uint8,
-                        device=device)
+    H_out = a_t.shape[1]
+    W_out = a_t.shape[2]
+    out_t = torch.zeros((3, H_out, W_out), dtype=torch.uint8, device=device)
 
-    # Step 1: hard-copy only_A and only_B canvas-wide. Masks are (H, W);
+    # Step 1: hard-copy only_A and only_B output-wide. Masks are (H, W);
     # unsqueeze(0) broadcasts across the 3-channel dim of the tensors.
     only_a_m = (gpu_ctx["only_a_u8_t"] > 0).unsqueeze(0)
     only_b_m = (gpu_ctx["only_b_u8_t"] > 0).unsqueeze(0)
@@ -257,41 +257,6 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
     )
 
     return out_t
-
-
-def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full,
-                                     blend_width, blend_levels, out_buf,
-                                     gpu_ctx):
-    """
-    Synchronous GPU multi-band Laplacian blend. Runs the pyramid + blend,
-    copies the result to a pinned host buffer, synchronizes the current
-    stream, then copies into out_buf. Returns out_buf.
-
-    The composite worker blocks for the duration of the GPU work — the
-    sync path used by the CPU debug overlays + crop branch and by older
-    callers.
-    """
-    out_t = _composite_to_gpu_tensor(
-        warped_a_t, warped_b_t, static, seam_x_full,
-        blend_width, blend_levels, gpu_ctx,
-    )
-    # One final permute+contiguous to (H, W, 3) for the pinned host
-    # buffer (cv2 / VideoWriter expect that layout). This replaces the
-    # two earlier full-canvas permutes; net save ~3 ms.
-    out_hwc = out_t.permute(1, 2, 0).contiguous()
-    pinned = gpu_ctx.get("pinned_output_t")
-    if pinned is not None and pinned.shape == out_hwc.shape:
-        pinned.copy_(out_hwc, non_blocking=True)
-        # Use current_stream().synchronize() (not torch.cuda.synchronize)
-        # so we only wait for THIS stream's queue to drain. The other
-        # stream's work continues. Matters for the tier-2 pipeline
-        # where compute runs on its own stream.
-        torch.cuda.current_stream().synchronize()
-        np.copyto(out_buf, pinned.numpy())
-    else:
-        result_np = out_hwc.cpu().numpy()
-        np.copyto(out_buf, result_np)
-    return out_buf
 
 
 def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
