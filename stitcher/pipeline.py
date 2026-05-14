@@ -281,6 +281,13 @@ def run(args):
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
 
+    # When --autocrop is on, push the crop translation through the
+    # homographies. Everything downstream (remap maps, static masks,
+    # overlap bbox, warp grids, warped frames, composite output, pinned
+    # buffers) is then built at the cropped size — the warp itself
+    # produces only the pixels that ship to disk, so the pixels outside
+    # the crop never get computed at all. `output_size` replaces
+    # `canvas_size` for every per-frame allocation.
     crop_rect = None
     if args.autocrop:
         crop_rect = find_autocrop_rect(
@@ -289,14 +296,21 @@ def run(args):
         cx, cy, cw, ch = crop_rect
         print(f"[info] Autocrop: x={cx} y={cy} size={cw}x{ch} "
               f"(from full canvas {canvas_size[0]}x{canvas_size[1]})")
+        T_crop = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]],
+                          dtype=np.float64)
+        H_a_to_canvas = T_crop @ H_a_to_canvas
+        H_b_to_canvas = T_crop @ H_b_to_canvas
+        output_size = (cw, ch)
+    else:
+        output_size = canvas_size
 
     print("[info] Precomputing remap maps + static geometry...")
-    map_ax, map_ay = build_remap(H_a_to_canvas, canvas_size)
-    map_bx, map_by = build_remap(H_b_to_canvas, canvas_size)
+    map_ax, map_ay = build_remap(H_a_to_canvas, output_size)
+    map_bx, map_by = build_remap(H_b_to_canvas, output_size)
     static = build_static_geometry(
         frame_a.shape, frame_b.shape,
         map_ax, map_ay, map_bx, map_by,
-        canvas_size,
+        output_size,
     )
     x0, y0, x1, y1 = static["overlap_bbox"]
     bbox_shape = (y1 - y0, x1 - x0)
@@ -346,7 +360,7 @@ def run(args):
         torch_device = torch.device("cuda")
         valid_in_bbox_np = cv2.bitwise_or(static["mask_a_in_bbox"],
                                           static["mask_b_in_bbox"])
-        H_canvas, W_canvas = canvas_size[1], canvas_size[0]
+        out_W, out_H = output_size
         gpu_ctx = {
             "device": torch_device,
             "kernel2d": get_pyr_kernel_2d(torch_device),
@@ -358,20 +372,11 @@ def run(args):
             "valid_in_bbox_t": torch.from_numpy(valid_in_bbox_np).to(torch_device),
         }
         # Ring of pinned host buffers for the async composite path. Each
-        # buffer holds one in-flight (H, W, 3) uint8 frame between
+        # buffer holds one in-flight (out_H, out_W, 3) uint8 frame between
         # composite_one (writer of the pinned copy) and the writer
         # thread (encoder). Sized to cover composite_in_q (4) + writer
         # queue (4) + one in flight in each worker, with headroom.
-        #
-        # When --autocrop is on, allocate the pinned buffers at the crop
-        # size instead of full canvas — composite_multiband_gpu_async
-        # slices out_t to the crop before the permute().contiguous() +
-        # DMA, so both the contiguous copy and the host transfer shrink
-        # by (crop / canvas) pixels.
-        if crop_rect is not None:
-            _, _, pinned_W, pinned_H = crop_rect
-        else:
-            pinned_H, pinned_W = H_canvas, W_canvas
+        pinned_H, pinned_W = out_H, out_W
         pinned_ring_size = 10
         free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
         pinned_ring = []  # keep references so they aren't GC'd
@@ -433,7 +438,7 @@ def run(args):
         print(f"[info] FG recompute every {fg_recompute_frames} frames "
               f"(~{args.fg_recompute_seconds}s).")
 
-    W, H = canvas_size
+    W, H = output_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
     # Person mask + EMA state now lives in the yolo_worker thread (see
@@ -452,7 +457,6 @@ def run(args):
     yolo_q = queue.Queue(maxsize=1)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    output_size = (crop_rect[2], crop_rect[3]) if crop_rect else canvas_size
     raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, output_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
@@ -674,36 +678,30 @@ def run(args):
                 payload["warped_a_t"], payload["warped_b_t"],
                 static, seam_x_full,
                 args.blend_width, args.blend_levels,
-                pinned, gpu_ctx, crop_rect=crop_rect,
+                pinned, gpu_ctx,
             )
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
 
             # Closure runs on the writer thread AFTER copy_event has
             # been synchronised; sees the pinned numpy view as `arr`.
-            # `arr` is already at the cropped size (composite did the
-            # slice on GPU before the DMA), so debug overlays use
-            # crop-relative bbox coords.
-            if crop_rect is not None:
-                cx, cy, _, _ = crop_rect
-                bx0, by0, bx1, by1 = static["overlap_bbox"]
-                debug_bbox = (bx0 - cx, by0 - cy, bx1 - cx, by1 - cy)
-            else:
-                debug_bbox = static["overlap_bbox"]
-
+            # static["overlap_bbox"] is already in output (crop) coords
+            # because the geometry was rebuilt at output_size up front.
             def post_sync_fn(arr,
                              seam_x_full=seam_x_full,
                              fg_for_debug=fg_for_debug,
-                             person_for_debug=person_for_debug,
-                             debug_bbox=debug_bbox):
+                             person_for_debug=person_for_debug):
                 if args.debug_mask:
                     if fg_for_debug is not None:
-                        draw_mask_overlay(arr, fg_for_debug, debug_bbox,
+                        draw_mask_overlay(arr, fg_for_debug,
+                                          static["overlap_bbox"],
                                           color=(0, 255, 255), alpha=0.25)
                     if person_for_debug is not None:
-                        draw_mask_overlay(arr, person_for_debug, debug_bbox)
+                        draw_mask_overlay(arr, person_for_debug,
+                                          static["overlap_bbox"])
                 if args.debug_seam:
-                    draw_seam_overlay(arr, seam_x_full, debug_bbox)
+                    draw_seam_overlay(arr, seam_x_full,
+                                      static["overlap_bbox"])
                 return arr
 
             return ("async", pinned, copy_event, post_sync_fn,
@@ -727,9 +725,6 @@ def run(args):
                                   static["overlap_bbox"])
         if args.debug_seam:
             draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
-        if crop_rect is not None:
-            cx, cy, cw, ch = crop_rect
-            stitched = stitched[cy:cy + ch, cx:cx + cw]
         return ("sync", stitched)
 
     # --- Pipelined execution with three worker threads -------------------
