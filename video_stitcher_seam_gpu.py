@@ -191,7 +191,7 @@ Gain compensation:
 
 Multi-band blending:
     --blend_width PX            Width in pixels of the soft mask ramp
-                                around the DP seam. Default: 80.
+                                around the DP seam. Default: 60.
                                 Constraint: seam_edge_margin >=
                                 blend_width / 2.
     --blend_levels N            Laplacian pyramid depth. Higher = wider
@@ -277,7 +277,7 @@ def main():
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
-    parser.add_argument("--blend_width", type=int, default=80)
+    parser.add_argument("--blend_width", type=int, default=60)
     parser.add_argument("--blend_levels", type=int, default=3)
     parser.add_argument("--seam_lambda", type=float, default=8.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
@@ -302,6 +302,15 @@ def main():
     parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
                         help="Seconds between FG recomputations "
                              "(0 = startup only).")
+    # Diagnostics --------------------------------------------------------
+    parser.add_argument("--profile", action="store_true",
+                        help="Print rolling per-stage timings (decode, "
+                             "compute, composite, yolo, queue waits) every "
+                             "--profile_interval seconds. End-of-run summary "
+                             "is always printed when --profile is set.")
+    parser.add_argument("--profile_interval", type=float, default=5.0,
+                        help="Seconds between rolling profile prints when "
+                             "--profile is set. Default: 5.0.")
     args = parser.parse_args()
     run(args)
 

@@ -7,10 +7,73 @@ entry point script (`video_stitcher_seam_gpu.py`) owns the argparse;
 this module owns the actual work.
 """
 
+import collections
+import contextlib
 import os
 import queue
 import threading
 import time
+
+# `with _nullcontext():` is a no-op context manager — used when CUDA isn't
+# available so we can keep one code path for both GPU + CPU workers.
+_nullcontext = contextlib.nullcontext
+
+
+class StageTimer:
+    """Single-writer / single-reader rolling timer for one pipeline stage.
+
+    Each StageTimer is mutated by exactly one thread (the worker that
+    owns it) and only read by the profile printer + the end-of-run
+    summary, so we don't bother with locks — the small chance of a
+    half-updated read is fine for diagnostic output.
+    """
+
+    def __init__(self, recent_len=200):
+        self.count = 0
+        self.total_ms = 0.0
+        self.recent = collections.deque(maxlen=recent_len)
+
+    def record(self, ms):
+        self.count += 1
+        self.total_ms += ms
+        self.recent.append(ms)
+
+    def summary(self):
+        if self.count == 0:
+            return "(no samples)"
+        avg_all = self.total_ms / self.count
+        if self.recent:
+            r_arr = list(self.recent)
+            r_avg = sum(r_arr) / len(r_arr)
+            r_max = max(r_arr)
+        else:
+            r_avg = avg_all
+            r_max = 0.0
+        return (f"n={self.count:>6d}  avg={avg_all:6.2f}ms  "
+                f"recent_avg={r_avg:6.2f}ms  recent_max={r_max:6.2f}ms")
+
+
+def _make_profile():
+    return {
+        "decode":             StageTimer(),  # main: prefetch_reader.read()
+        "main_put_wait":      StageTimer(),  # main: put → compute_in_q
+        "compute_get_wait":   StageTimer(),  # compute: get ← compute_in_q
+        "compute":            StageTimer(),  # compute: compute_one()
+        "compute_put_wait":   StageTimer(),  # compute: put → composite_in_q
+        "composite_get_wait": StageTimer(),  # composite: get ← composite_in_q
+        "composite":          StageTimer(),  # composite: composite_one()
+        "composite_write":    StageTimer(),  # composite: writer.write()
+        "yolo_get_wait":      StageTimer(),  # yolo: get ← yolo_q
+        "yolo":               StageTimer(),  # yolo: per-frame YOLO+post-proc
+    }
+
+
+def _print_profile(prof, header):
+    print()
+    print(f"=== {header} ===")
+    for name, t in prof.items():
+        print(f"  {name:<20s} {t.summary()}")
+    print()
 
 import cv2
 import numpy as np
@@ -19,7 +82,7 @@ import torch.nn.functional as F
 
 from stitcher.compositing import (
     composite_multiband_cpu,
-    composite_multiband_gpu_resident,
+    composite_multiband_gpu_async,
     get_pyr_kernel_2d,
 )
 from stitcher.device import detect_device
@@ -58,7 +121,6 @@ from stitcher.warp import (
     build_grid_sample_tensor,
     compute_gain_compensation,
     dilate_gpu,
-    warp_gpu,
     warp_mask_gpu,
     warp_pair_gpu,
 )
@@ -217,6 +279,13 @@ def run(args):
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
 
+    # When --autocrop is on, push the crop translation through the
+    # homographies. Everything downstream (remap maps, static masks,
+    # overlap bbox, warp grids, warped frames, composite output, pinned
+    # buffers) is then built at the cropped size — the warp itself
+    # produces only the pixels that ship to disk, so the pixels outside
+    # the crop never get computed at all. `output_size` replaces
+    # `canvas_size` for every per-frame allocation.
     crop_rect = None
     if args.autocrop:
         crop_rect = find_autocrop_rect(
@@ -225,14 +294,21 @@ def run(args):
         cx, cy, cw, ch = crop_rect
         print(f"[info] Autocrop: x={cx} y={cy} size={cw}x{ch} "
               f"(from full canvas {canvas_size[0]}x{canvas_size[1]})")
+        T_crop = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]],
+                          dtype=np.float64)
+        H_a_to_canvas = T_crop @ H_a_to_canvas
+        H_b_to_canvas = T_crop @ H_b_to_canvas
+        output_size = (cw, ch)
+    else:
+        output_size = canvas_size
 
     print("[info] Precomputing remap maps + static geometry...")
-    map_ax, map_ay = build_remap(H_a_to_canvas, canvas_size)
-    map_bx, map_by = build_remap(H_b_to_canvas, canvas_size)
+    map_ax, map_ay = build_remap(H_a_to_canvas, output_size)
+    map_bx, map_by = build_remap(H_b_to_canvas, output_size)
     static = build_static_geometry(
         frame_a.shape, frame_b.shape,
         map_ax, map_ay, map_bx, map_by,
-        canvas_size,
+        output_size,
     )
     x0, y0, x1, y1 = static["overlap_bbox"]
     bbox_shape = (y1 - y0, x1 - x0)
@@ -282,7 +358,7 @@ def run(args):
         torch_device = torch.device("cuda")
         valid_in_bbox_np = cv2.bitwise_or(static["mask_a_in_bbox"],
                                           static["mask_b_in_bbox"])
-        H_canvas, W_canvas = canvas_size[1], canvas_size[0]
+        out_W, out_H = output_size
         gpu_ctx = {
             "device": torch_device,
             "kernel2d": get_pyr_kernel_2d(torch_device),
@@ -292,20 +368,38 @@ def run(args):
             "only_b_in_bbox_t": torch.from_numpy(static["only_b_in_bbox"]).to(torch_device),
             "overlap_in_bbox_t": torch.from_numpy(static["overlap_in_bbox"]).to(torch_device),
             "valid_in_bbox_t": torch.from_numpy(valid_in_bbox_np).to(torch_device),
-            # Page-locked host buffer for the final GPU->CPU transfer of
-            # the composited frame; lets CUDA's DMA copy bypass an extra
-            # staging copy. Allocated once for the full canvas.
-            "pinned_output_t": torch.empty(
-                (H_canvas, W_canvas, 3),
-                dtype=torch.uint8, pin_memory=True,
-            ),
         }
+        # Ring of pinned host buffers for the async composite path. Each
+        # buffer holds one in-flight (out_H, out_W, 3) uint8 frame between
+        # composite_one (writer of the pinned copy) and the writer
+        # thread (encoder). Sized to cover composite_in_q (4) + writer
+        # queue (4) + one in flight in each worker, with headroom.
+        pinned_H, pinned_W = out_H, out_W
+        pinned_ring_size = 10
+        free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
+        pinned_ring = []  # keep references so they aren't GC'd
+        for _ in range(pinned_ring_size):
+            buf = torch.empty(
+                (pinned_H, pinned_W, 3),
+                dtype=torch.uint8, pin_memory=True,
+            )
+            pinned_ring.append(buf)
+            free_pinned_q.put(buf)
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
         # Stacked grid for the batched warp_pair_gpu call. Built once
         # since the grids are static for the whole run.
         grid_pair_t = torch.cat([grid_a_t, grid_b_t], dim=0)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
+        # Tier-2 pipeline parallelism: each worker thread runs its CUDA
+        # work on its own stream so the GPU can interleave kernels from
+        # consecutive frames (composite N + compute N+1) instead of
+        # serialising them on the default stream.
+        compute_stream = torch.cuda.Stream()
+        composite_stream = torch.cuda.Stream()
+        # YOLO worker also gets its own stream so the mask post-processing
+        # (warp + dilate + EMA) doesn't block the compute stream.
+        yolo_stream = torch.cuda.Stream()
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
@@ -342,23 +436,25 @@ def run(args):
         print(f"[info] FG recompute every {fg_recompute_frames} frames "
               f"(~{args.fg_recompute_seconds}s).")
 
-    W, H = canvas_size
+    W, H = output_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
-    person_mask_bbox = np.zeros(bbox_shape, dtype=np.uint8)
-    person_mask_bbox_t = None
-    if dev["cuda_available"]:
-        person_mask_bbox_t = torch.zeros(bbox_shape, dtype=torch.uint8,
-                                         device=gpu_ctx["device"])
-    # Float EMA buffers for person mask temporal smoothing. Filled on the
-    # first YOLO run; None means "no history yet".
-    person_mask_ema_t = None  # GPU path
-    person_mask_ema = None    # CPU path
+    # Person mask + EMA state now lives in the yolo_worker thread (see
+    # below). compute_one reads the latest published mask from
+    # mask_holder via mask_lock.
     cost_ema = None
     seam_prev_small = None
 
+    # Async YOLO handoff: the yolo_worker publishes mask snapshots into
+    # mask_holder under mask_lock; compute_one grabs the latest available.
+    # On the first few frames before the worker has run, the holder is
+    # None and compute_one proceeds with no person penalty (the seam is
+    # briefly unaware of people — acceptable for a few frames).
+    mask_lock = threading.Lock()
+    mask_holder = [None]
+    yolo_q = queue.Queue(maxsize=1)
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    output_size = (crop_rect[2], crop_rect[3]) if crop_rect else canvas_size
     raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, output_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
@@ -381,12 +477,13 @@ def run(args):
     # consecutive frames at the same time.
 
     def compute_one(frame_a, frame_b, frame_idx):
-        """Warp + (every yolo_every) YOLO + mask + cost + EMA + DP seam.
-        Updates inter-frame state in the enclosing scope. Returns a payload
-        dict consumed by composite_one."""
+        """Warp + cost + EMA + DP seam. YOLO runs async on its own
+        worker; we submit a request when it's time and read the latest
+        published person mask from mask_holder.
+
+        Updates inter-frame state in the enclosing scope. Returns a
+        payload dict consumed by composite_one."""
         nonlocal cost_ema_t, cost_ema
-        nonlocal person_mask_bbox_t, person_mask_bbox
-        nonlocal person_mask_ema_t, person_mask_ema
         nonlocal seam_prev_small
         nonlocal fg_mask_bbox_t, fg_mask_bbox
 
@@ -425,57 +522,34 @@ def run(args):
             warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
             warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
 
-        # YOLO person mask (every yolo_every frames). Stateful EMA on the
-        # binary mask between runs.
+        # Async YOLO: submit a request when it's time, then continue with
+        # whichever mask is currently published. The first few frames
+        # before YOLO has produced anything see latest_mask = None and
+        # run without a person penalty.
         if frame_idx % args.yolo_every == 0:
+            try:
+                yolo_q.put_nowait((frame_a, frame_b))
+            except queue.Full:
+                # YOLO worker is still processing the previous request;
+                # skip this submission and reuse the latest mask we have.
+                pass
+
+        with mask_lock:
+            latest_mask = mask_holder[0]
+
+        person_mask_bbox_t = None
+        person_mask_bbox = None
+        person_for_debug = None
+        if latest_mask is not None:
             if dev["cuda_available"]:
-                mask_a_src_t = person_segmenter.predict_classes_mask_gpu(
-                    frame_a, frame_a.shape[:2], person_class_ids,
-                )
-                mask_b_src_t = person_segmenter.predict_classes_mask_gpu(
-                    frame_b, frame_b.shape[:2], person_class_ids,
-                )
-                mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
-                mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
-                union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
-                union_t = dilate_gpu(union_t, args.mask_dilate)
-                raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
-                new_float = (raw_mask_t > 0).float()
-                if person_mask_ema_t is None:
-                    person_mask_ema_t = new_float
-                else:
-                    a = args.mask_ema
-                    person_mask_ema_t = (a * new_float
-                                         + (1.0 - a) * person_mask_ema_t)
-                person_mask_bbox_t = (
-                    (person_mask_ema_t > args.mask_ema_threshold)
-                    .to(torch.uint8) * 255
-                ).contiguous()
-                if args.debug_mask:
-                    person_mask_bbox = person_mask_bbox_t.cpu().numpy()
+                ev = latest_mask.get("ready_event")
+                if ev is not None:
+                    ev.wait()
+                person_mask_bbox_t = latest_mask["person_mask_bbox_t"]
             else:
-                mask_a_src = person_segmenter.predict_classes_mask(
-                    frame_a, person_class_ids,
-                )
-                mask_b_src = person_segmenter.predict_classes_mask(
-                    frame_b, person_class_ids,
-                )
-                mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
-                mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
-                union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
-                union = cv2.dilate(union, dilate_kernel)
-                raw_mask = union[y0:y1, x0:x1]
-                new_float = (raw_mask > 0).astype(np.float32)
-                if person_mask_ema is None:
-                    person_mask_ema = new_float
-                else:
-                    a = args.mask_ema
-                    person_mask_ema = (a * new_float
-                                       + (1.0 - a) * person_mask_ema)
-                person_mask_bbox = (
-                    (person_mask_ema > args.mask_ema_threshold)
-                    .astype(np.uint8) * 255
-                )
+                person_mask_bbox = latest_mask["person_mask_bbox"]
+            if args.debug_mask:
+                person_for_debug = latest_mask.get("person_mask_cpu")
 
         ds = max(1, args.seam_downscale)
 
@@ -519,13 +593,15 @@ def run(args):
                                 cost_ema, 1.0 - ema_eff,
                                 0, dst=cost_ema)
             cost_for_dp = cost_ema.copy()
+            has_person_cpu = (person_mask_bbox is not None
+                              and person_mask_bbox.any())
             if use_fg and fg_mask_bbox is not None:
-                if person_mask_bbox.any():
+                if has_person_cpu:
                     fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
                 else:
                     fg_only = fg_mask_bbox > 0
                 cost_for_dp[fg_only] += args.fg_penalty
-            if person_mask_bbox.any():
+            if has_person_cpu:
                 cost_for_dp[person_mask_bbox > 0] += args.person_penalty
             add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
                                     edge_penalty=args.edge_penalty)
@@ -545,7 +621,8 @@ def run(args):
 
         # Snapshot the FG mask for the debug overlay (composite stage may
         # run a frame later, so we capture the version that's current
-        # for THIS frame here).
+        # for THIS frame here). person_for_debug was already set above
+        # when we read mask_holder.
         fg_for_debug = None
         if args.debug_mask and use_fg:
             if fg_mask_bbox_t is not None:
@@ -553,7 +630,12 @@ def run(args):
             elif fg_mask_bbox is not None:
                 fg_for_debug = fg_mask_bbox
 
-        person_for_debug = person_mask_bbox if args.debug_mask else None
+        # Record an event on the current (compute) stream so the composite
+        # stage's stream can wait on it before reading our output tensors.
+        compute_done_event = None
+        if dev["cuda_available"]:
+            compute_done_event = torch.cuda.Event()
+            compute_done_event.record()
 
         return {
             "frame_idx": frame_idx,
@@ -564,25 +646,71 @@ def run(args):
             "seam_x_full": seam_x_full,
             "person_for_debug": person_for_debug,
             "fg_for_debug": fg_for_debug,
+            "compute_done_event": compute_done_event,
         }
 
     def composite_one(payload):
-        """Run the multi-band composite, debug overlays, autocrop, and
-        enqueue the final frame to the writer."""
+        """Run the multi-band composite + debug overlays + autocrop.
+
+        On GPU: returns ("async", pinned, event, post_sync_fn, free_cb)
+        — composite_worker hands this off to writer.write_async, which
+        synchronises on the event before encoding. composite_one itself
+        does NOT wait for the GPU.
+
+        On CPU: returns ("sync", stitched_ndarray) — the writer takes
+        the already-materialized frame.
+        """
+        # Wait for the compute stage's output tensors to be ready (their
+        # writes happened on compute_stream; we read them on
+        # composite_stream). Stream wait is the cheap, GPU-side
+        # synchronisation primitive — no host stall.
+        compute_event = payload.get("compute_done_event")
+        if compute_event is not None:
+            compute_event.wait()
         seam_x_full = payload["seam_x_full"]
         if gpu_ctx is not None:
-            stitched = composite_multiband_gpu_resident(
+            # Acquire a pinned slot (blocks if all are in flight — this
+            # is our backpressure mechanism between composite and writer).
+            pinned = free_pinned_q.get()
+            copy_event = composite_multiband_gpu_async(
                 payload["warped_a_t"], payload["warped_b_t"],
                 static, seam_x_full,
-                args.blend_width, args.blend_levels, out_buf,
-                gpu_ctx,
+                args.blend_width, args.blend_levels,
+                pinned, gpu_ctx,
             )
-        else:
-            stitched = composite_multiband_cpu(
-                payload["warped_a"], payload["warped_b"],
-                static, seam_x_full,
-                args.blend_width, args.blend_levels, out_buf,
-            )
+            fg_for_debug = payload["fg_for_debug"]
+            person_for_debug = payload["person_for_debug"]
+
+            # Closure runs on the writer thread AFTER copy_event has
+            # been synchronised; sees the pinned numpy view as `arr`.
+            # static["overlap_bbox"] is already in output (crop) coords
+            # because the geometry was rebuilt at output_size up front.
+            def post_sync_fn(arr,
+                             seam_x_full=seam_x_full,
+                             fg_for_debug=fg_for_debug,
+                             person_for_debug=person_for_debug):
+                if args.debug_mask:
+                    if fg_for_debug is not None:
+                        draw_mask_overlay(arr, fg_for_debug,
+                                          static["overlap_bbox"],
+                                          color=(0, 255, 255), alpha=0.25)
+                    if person_for_debug is not None:
+                        draw_mask_overlay(arr, person_for_debug,
+                                          static["overlap_bbox"])
+                if args.debug_seam:
+                    draw_seam_overlay(arr, seam_x_full,
+                                      static["overlap_bbox"])
+                return arr
+
+            return ("async", pinned, copy_event, post_sync_fn,
+                    lambda p=pinned: free_pinned_q.put(p))
+
+        # ---- CPU path: unchanged synchronous behaviour. -----------------
+        stitched = composite_multiband_cpu(
+            payload["warped_a"], payload["warped_b"],
+            static, seam_x_full,
+            args.blend_width, args.blend_levels, out_buf,
+        )
         if args.debug_mask:
             fg_for_debug = payload["fg_for_debug"]
             if fg_for_debug is not None:
@@ -595,39 +723,202 @@ def run(args):
                                   static["overlap_bbox"])
         if args.debug_seam:
             draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
-        if crop_rect is not None:
-            cx, cy, cw, ch = crop_rect
-            stitched = stitched[cy:cy + ch, cx:cx + cw]
-        return stitched
+        return ("sync", stitched)
 
-    # --- Pipelined execution with two worker threads ---------------------
+    # --- Pipelined execution with three worker threads -------------------
     SENTINEL = object()
     compute_in_q = queue.Queue(maxsize=4)
     composite_in_q = queue.Queue(maxsize=4)
     worker_error = [None]
 
-    def compute_worker():
+    # Optional per-stage timing. None when --profile is off (zero
+    # overhead: each timing site checks `if prof is not None`).
+    prof = _make_profile() if args.profile else None
+    prof_stop = threading.Event()
+
+    def yolo_worker():
+        """Pull (frame_a, frame_b) pairs off yolo_q, run batched YOLO
+        inference + mask warp/dilate/EMA/binarize, and publish the
+        resulting mask snapshot to mask_holder under mask_lock.
+
+        Owns the inter-call person-mask EMA state. compute_one only
+        ever reads the published mask — it never updates this state.
+        Running here on its own CUDA stream so the mask post-processing
+        kernels can overlap with the compute and composite streams."""
+        person_mask_ema_t = None  # GPU path
+        person_mask_ema = None    # CPU path
+
+        stream_ctx = (
+            torch.cuda.stream(yolo_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
         try:
-            while True:
-                item = compute_in_q.get()
-                if item is SENTINEL:
-                    composite_in_q.put(SENTINEL)
-                    return
-                fa, fb, idx = item
-                payload = compute_one(fa, fb, idx)
-                composite_in_q.put(payload)
+            with stream_ctx:
+                while True:
+                    t_get0 = time.perf_counter()
+                    item = yolo_q.get()
+                    if prof is not None:
+                        prof["yolo_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
+                    if item is SENTINEL:
+                        return
+                    frame_a_yolo, frame_b_yolo = item
+                    t_work0 = time.perf_counter()
+
+                    if dev["cuda_available"]:
+                        mask_a_src_t, mask_b_src_t = (
+                            person_segmenter.predict_classes_mask_pair_gpu(
+                                frame_a_yolo, frame_b_yolo,
+                                frame_a_yolo.shape[:2], frame_b_yolo.shape[:2],
+                                person_class_ids,
+                            )
+                        )
+                        mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
+                        mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
+                        union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
+                        union_t = dilate_gpu(union_t, args.mask_dilate)
+                        raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
+                        new_float = (raw_mask_t > 0).float()
+                        if person_mask_ema_t is None:
+                            person_mask_ema_t = new_float
+                        else:
+                            a = args.mask_ema
+                            person_mask_ema_t = (a * new_float
+                                                 + (1.0 - a) * person_mask_ema_t)
+                        person_mask_bbox_t = (
+                            (person_mask_ema_t > args.mask_ema_threshold)
+                            .to(torch.uint8) * 255
+                        ).contiguous()
+                        person_mask_cpu = (
+                            person_mask_bbox_t.cpu().numpy()
+                            if args.debug_mask else None
+                        )
+                        # Event the compute thread waits on before reading
+                        # person_mask_bbox_t (cross-stream sync, no host stall).
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "person_mask_bbox_t": person_mask_bbox_t,
+                            "person_mask_bbox": None,
+                            "person_mask_cpu": person_mask_cpu,
+                            "ready_event": ready_event,
+                        }
+                    else:
+                        mask_a_src, mask_b_src = (
+                            person_segmenter.predict_classes_mask_pair(
+                                frame_a_yolo, frame_b_yolo, person_class_ids,
+                            )
+                        )
+                        mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay,
+                                                  cv2.INTER_NEAREST)
+                        mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by,
+                                                  cv2.INTER_NEAREST)
+                        union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
+                        union = cv2.dilate(union, dilate_kernel)
+                        raw_mask = union[y0:y1, x0:x1]
+                        new_float = (raw_mask > 0).astype(np.float32)
+                        if person_mask_ema is None:
+                            person_mask_ema = new_float
+                        else:
+                            a = args.mask_ema
+                            person_mask_ema = (a * new_float
+                                               + (1.0 - a) * person_mask_ema)
+                        person_mask_bbox = (
+                            (person_mask_ema > args.mask_ema_threshold)
+                            .astype(np.uint8) * 255
+                        )
+                        new_holder = {
+                            "person_mask_bbox_t": None,
+                            "person_mask_bbox": person_mask_bbox,
+                            "person_mask_cpu": (
+                                person_mask_bbox if args.debug_mask else None
+                            ),
+                            "ready_event": None,
+                        }
+
+                    with mask_lock:
+                        mask_holder[0] = new_holder
+                    if prof is not None:
+                        prof["yolo"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
+        except Exception as e:
+            worker_error[0] = e
+
+    def compute_worker():
+        # Pin this thread's CUDA stream so every CUDA op in compute_one
+        # runs on compute_stream and can overlap with composite_stream.
+        stream_ctx = (
+            torch.cuda.stream(compute_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
+        try:
+            with stream_ctx:
+                while True:
+                    t_get0 = time.perf_counter()
+                    item = compute_in_q.get()
+                    if prof is not None:
+                        prof["compute_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
+                    if item is SENTINEL:
+                        composite_in_q.put(SENTINEL)
+                        return
+                    fa, fb, idx = item
+                    t_work0 = time.perf_counter()
+                    payload = compute_one(fa, fb, idx)
+                    if prof is not None:
+                        prof["compute"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
+                    t_put0 = time.perf_counter()
+                    composite_in_q.put(payload)
+                    if prof is not None:
+                        prof["compute_put_wait"].record(
+                            (time.perf_counter() - t_put0) * 1000
+                        )
         except Exception as e:
             worker_error[0] = e
             composite_in_q.put(SENTINEL)
 
     def composite_worker():
+        stream_ctx = (
+            torch.cuda.stream(composite_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
         try:
-            while True:
-                item = composite_in_q.get()
-                if item is SENTINEL:
-                    return
-                stitched = composite_one(item)
-                writer.write(stitched)
+            with stream_ctx:
+                while True:
+                    t_get0 = time.perf_counter()
+                    item = composite_in_q.get()
+                    if prof is not None:
+                        prof["composite_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
+                    if item is SENTINEL:
+                        return
+                    t_work0 = time.perf_counter()
+                    result = composite_one(item)
+                    if prof is not None:
+                        prof["composite"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
+                    t_write0 = time.perf_counter()
+                    if result[0] == "async":
+                        _, pinned, event, post_sync_fn, free_cb = result
+                        writer.write_async(pinned, event,
+                                           post_sync_fn, free_cb)
+                    else:
+                        _, stitched = result
+                        writer.write(stitched)
+                    if prof is not None:
+                        prof["composite_write"].record(
+                            (time.perf_counter() - t_write0) * 1000
+                        )
         except Exception as e:
             worker_error[0] = e
 
@@ -637,8 +928,24 @@ def run(args):
     composite_thread = threading.Thread(
         target=composite_worker, name="composite", daemon=True,
     )
+    yolo_thread = threading.Thread(
+        target=yolo_worker, name="yolo", daemon=True,
+    )
     compute_thread.start()
     composite_thread.start()
+    yolo_thread.start()
+
+    def profile_printer():
+        # Rolling print every args.profile_interval seconds until shutdown.
+        while not prof_stop.wait(args.profile_interval):
+            _print_profile(prof, "rolling profile")
+
+    profile_thread = None
+    if prof is not None:
+        profile_thread = threading.Thread(
+            target=profile_printer, name="profile_printer", daemon=True,
+        )
+        profile_thread.start()
 
     frame_idx = 0
     t_start = time.time()
@@ -648,10 +955,20 @@ def run(args):
                 fa, fb = pending_first_pair
                 pending_first_pair = None
             else:
+                t_dec0 = time.perf_counter()
                 ok, fa, fb = prefetch_reader.read()
+                if prof is not None:
+                    prof["decode"].record(
+                        (time.perf_counter() - t_dec0) * 1000
+                    )
                 if not ok:
                     break
+            t_put0 = time.perf_counter()
             compute_in_q.put((fa, fb, frame_idx))
+            if prof is not None:
+                prof["main_put_wait"].record(
+                    (time.perf_counter() - t_put0) * 1000
+                )
             frame_idx += 1
             if args.max_frames and frame_idx >= args.max_frames:
                 break
@@ -659,6 +976,11 @@ def run(args):
         compute_in_q.put(SENTINEL)
         compute_thread.join()
         composite_thread.join()
+        yolo_q.put(SENTINEL)
+        yolo_thread.join()
+        prof_stop.set()
+        if profile_thread is not None:
+            profile_thread.join()
         prefetch_reader.close()
         writer.close()
 
@@ -669,9 +991,12 @@ def run(args):
     print()
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
-          f"-- pipelined (compute + composite on separate threads)")
+          f"-- pipelined (compute + composite + yolo on separate threads)")
     print(sync_reader.summary_post())
     print(f"[info] Output written to {args.output}")
+
+    if prof is not None:
+        _print_profile(prof, "final profile (over entire run)")
 
     cap_a.release()
     cap_b.release()
