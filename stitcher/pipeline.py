@@ -7,6 +7,7 @@ entry point script (`video_stitcher_seam_gpu.py`) owns the argparse;
 this module owns the actual work.
 """
 
+import collections
 import contextlib
 import os
 import queue
@@ -16,6 +17,63 @@ import time
 # `with _nullcontext():` is a no-op context manager — used when CUDA isn't
 # available so we can keep one code path for both GPU + CPU workers.
 _nullcontext = contextlib.nullcontext
+
+
+class StageTimer:
+    """Single-writer / single-reader rolling timer for one pipeline stage.
+
+    Each StageTimer is mutated by exactly one thread (the worker that
+    owns it) and only read by the profile printer + the end-of-run
+    summary, so we don't bother with locks — the small chance of a
+    half-updated read is fine for diagnostic output.
+    """
+
+    def __init__(self, recent_len=200):
+        self.count = 0
+        self.total_ms = 0.0
+        self.recent = collections.deque(maxlen=recent_len)
+
+    def record(self, ms):
+        self.count += 1
+        self.total_ms += ms
+        self.recent.append(ms)
+
+    def summary(self):
+        if self.count == 0:
+            return "(no samples)"
+        avg_all = self.total_ms / self.count
+        if self.recent:
+            r_arr = list(self.recent)
+            r_avg = sum(r_arr) / len(r_arr)
+            r_max = max(r_arr)
+        else:
+            r_avg = avg_all
+            r_max = 0.0
+        return (f"n={self.count:>6d}  avg={avg_all:6.2f}ms  "
+                f"recent_avg={r_avg:6.2f}ms  recent_max={r_max:6.2f}ms")
+
+
+def _make_profile():
+    return {
+        "decode":             StageTimer(),  # main: prefetch_reader.read()
+        "main_put_wait":      StageTimer(),  # main: put → compute_in_q
+        "compute_get_wait":   StageTimer(),  # compute: get ← compute_in_q
+        "compute":            StageTimer(),  # compute: compute_one()
+        "compute_put_wait":   StageTimer(),  # compute: put → composite_in_q
+        "composite_get_wait": StageTimer(),  # composite: get ← composite_in_q
+        "composite":          StageTimer(),  # composite: composite_one()
+        "composite_write":    StageTimer(),  # composite: writer.write()
+        "yolo_get_wait":      StageTimer(),  # yolo: get ← yolo_q
+        "yolo":               StageTimer(),  # yolo: per-frame YOLO+post-proc
+    }
+
+
+def _print_profile(prof, header):
+    print()
+    print(f"=== {header} ===")
+    for name, t in prof.items():
+        print(f"  {name:<20s} {t.summary()}")
+    print()
 
 import cv2
 import numpy as np
@@ -617,6 +675,11 @@ def run(args):
     composite_in_q = queue.Queue(maxsize=4)
     worker_error = [None]
 
+    # Optional per-stage timing. None when --profile is off (zero
+    # overhead: each timing site checks `if prof is not None`).
+    prof = _make_profile() if args.profile else None
+    prof_stop = threading.Event()
+
     def yolo_worker():
         """Pull (frame_a, frame_b) pairs off yolo_q, run batched YOLO
         inference + mask warp/dilate/EMA/binarize, and publish the
@@ -637,10 +700,16 @@ def run(args):
         try:
             with stream_ctx:
                 while True:
+                    t_get0 = time.perf_counter()
                     item = yolo_q.get()
+                    if prof is not None:
+                        prof["yolo_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
                     if item is SENTINEL:
                         return
                     frame_a_yolo, frame_b_yolo = item
+                    t_work0 = time.perf_counter()
 
                     if dev["cuda_available"]:
                         mask_a_src_t, mask_b_src_t = (
@@ -715,6 +784,10 @@ def run(args):
 
                     with mask_lock:
                         mask_holder[0] = new_holder
+                    if prof is not None:
+                        prof["yolo"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
         except Exception as e:
             worker_error[0] = e
 
@@ -729,13 +802,28 @@ def run(args):
         try:
             with stream_ctx:
                 while True:
+                    t_get0 = time.perf_counter()
                     item = compute_in_q.get()
+                    if prof is not None:
+                        prof["compute_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
                     if item is SENTINEL:
                         composite_in_q.put(SENTINEL)
                         return
                     fa, fb, idx = item
+                    t_work0 = time.perf_counter()
                     payload = compute_one(fa, fb, idx)
+                    if prof is not None:
+                        prof["compute"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
+                    t_put0 = time.perf_counter()
                     composite_in_q.put(payload)
+                    if prof is not None:
+                        prof["compute_put_wait"].record(
+                            (time.perf_counter() - t_put0) * 1000
+                        )
         except Exception as e:
             worker_error[0] = e
             composite_in_q.put(SENTINEL)
@@ -749,11 +837,26 @@ def run(args):
         try:
             with stream_ctx:
                 while True:
+                    t_get0 = time.perf_counter()
                     item = composite_in_q.get()
+                    if prof is not None:
+                        prof["composite_get_wait"].record(
+                            (time.perf_counter() - t_get0) * 1000
+                        )
                     if item is SENTINEL:
                         return
+                    t_work0 = time.perf_counter()
                     stitched = composite_one(item)
+                    if prof is not None:
+                        prof["composite"].record(
+                            (time.perf_counter() - t_work0) * 1000
+                        )
+                    t_write0 = time.perf_counter()
                     writer.write(stitched)
+                    if prof is not None:
+                        prof["composite_write"].record(
+                            (time.perf_counter() - t_write0) * 1000
+                        )
         except Exception as e:
             worker_error[0] = e
 
@@ -770,6 +873,18 @@ def run(args):
     composite_thread.start()
     yolo_thread.start()
 
+    def profile_printer():
+        # Rolling print every args.profile_interval seconds until shutdown.
+        while not prof_stop.wait(args.profile_interval):
+            _print_profile(prof, "rolling profile")
+
+    profile_thread = None
+    if prof is not None:
+        profile_thread = threading.Thread(
+            target=profile_printer, name="profile_printer", daemon=True,
+        )
+        profile_thread.start()
+
     frame_idx = 0
     t_start = time.time()
     try:
@@ -778,10 +893,20 @@ def run(args):
                 fa, fb = pending_first_pair
                 pending_first_pair = None
             else:
+                t_dec0 = time.perf_counter()
                 ok, fa, fb = prefetch_reader.read()
+                if prof is not None:
+                    prof["decode"].record(
+                        (time.perf_counter() - t_dec0) * 1000
+                    )
                 if not ok:
                     break
+            t_put0 = time.perf_counter()
             compute_in_q.put((fa, fb, frame_idx))
+            if prof is not None:
+                prof["main_put_wait"].record(
+                    (time.perf_counter() - t_put0) * 1000
+                )
             frame_idx += 1
             if args.max_frames and frame_idx >= args.max_frames:
                 break
@@ -791,6 +916,9 @@ def run(args):
         composite_thread.join()
         yolo_q.put(SENTINEL)
         yolo_thread.join()
+        prof_stop.set()
+        if profile_thread is not None:
+            profile_thread.join()
         prefetch_reader.close()
         writer.close()
 
@@ -804,6 +932,9 @@ def run(args):
           f"-- pipelined (compute + composite + yolo on separate threads)")
     print(sync_reader.summary_post())
     print(f"[info] Output written to {args.output}")
+
+    if prof is not None:
+        _print_profile(prof, "final profile (over entire run)")
 
     cap_a.release()
     cap_b.release()

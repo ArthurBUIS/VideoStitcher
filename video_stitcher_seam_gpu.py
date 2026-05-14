@@ -302,6 +302,15 @@ def main():
     parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
                         help="Seconds between FG recomputations "
                              "(0 = startup only).")
+    # Diagnostics --------------------------------------------------------
+    parser.add_argument("--profile", action="store_true",
+                        help="Print rolling per-stage timings (decode, "
+                             "compute, composite, yolo, queue waits) every "
+                             "--profile_interval seconds. End-of-run summary "
+                             "is always printed when --profile is set.")
+    parser.add_argument("--profile_interval", type=float, default=5.0,
+                        help="Seconds between rolling profile prints when "
+                             "--profile is set. Default: 5.0.")
     args = parser.parse_args()
     run(args)
 
