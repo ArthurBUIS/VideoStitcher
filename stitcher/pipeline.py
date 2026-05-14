@@ -317,6 +317,9 @@ def run(args):
         # serialising them on the default stream.
         compute_stream = torch.cuda.Stream()
         composite_stream = torch.cuda.Stream()
+        # YOLO worker also gets its own stream so the mask post-processing
+        # (warp + dilate + EMA) doesn't block the compute stream.
+        yolo_stream = torch.cuda.Stream()
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
@@ -356,17 +359,20 @@ def run(args):
     W, H = canvas_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
-    person_mask_bbox = np.zeros(bbox_shape, dtype=np.uint8)
-    person_mask_bbox_t = None
-    if dev["cuda_available"]:
-        person_mask_bbox_t = torch.zeros(bbox_shape, dtype=torch.uint8,
-                                         device=gpu_ctx["device"])
-    # Float EMA buffers for person mask temporal smoothing. Filled on the
-    # first YOLO run; None means "no history yet".
-    person_mask_ema_t = None  # GPU path
-    person_mask_ema = None    # CPU path
+    # Person mask + EMA state now lives in the yolo_worker thread (see
+    # below). compute_one reads the latest published mask from
+    # mask_holder via mask_lock.
     cost_ema = None
     seam_prev_small = None
+
+    # Async YOLO handoff: the yolo_worker publishes mask snapshots into
+    # mask_holder under mask_lock; compute_one grabs the latest available.
+    # On the first few frames before the worker has run, the holder is
+    # None and compute_one proceeds with no person penalty (the seam is
+    # briefly unaware of people — acceptable for a few frames).
+    mask_lock = threading.Lock()
+    mask_holder = [None]
+    yolo_q = queue.Queue(maxsize=1)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     output_size = (crop_rect[2], crop_rect[3]) if crop_rect else canvas_size
@@ -392,12 +398,13 @@ def run(args):
     # consecutive frames at the same time.
 
     def compute_one(frame_a, frame_b, frame_idx):
-        """Warp + (every yolo_every) YOLO + mask + cost + EMA + DP seam.
-        Updates inter-frame state in the enclosing scope. Returns a payload
-        dict consumed by composite_one."""
+        """Warp + cost + EMA + DP seam. YOLO runs async on its own
+        worker; we submit a request when it's time and read the latest
+        published person mask from mask_holder.
+
+        Updates inter-frame state in the enclosing scope. Returns a
+        payload dict consumed by composite_one."""
         nonlocal cost_ema_t, cost_ema
-        nonlocal person_mask_bbox_t, person_mask_bbox
-        nonlocal person_mask_ema_t, person_mask_ema
         nonlocal seam_prev_small
         nonlocal fg_mask_bbox_t, fg_mask_bbox
 
@@ -436,59 +443,34 @@ def run(args):
             warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
             warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
 
-        # YOLO person mask (every yolo_every frames). Stateful EMA on the
-        # binary mask between runs.
+        # Async YOLO: submit a request when it's time, then continue with
+        # whichever mask is currently published. The first few frames
+        # before YOLO has produced anything see latest_mask = None and
+        # run without a person penalty.
         if frame_idx % args.yolo_every == 0:
+            try:
+                yolo_q.put_nowait((frame_a, frame_b))
+            except queue.Full:
+                # YOLO worker is still processing the previous request;
+                # skip this submission and reuse the latest mask we have.
+                pass
+
+        with mask_lock:
+            latest_mask = mask_holder[0]
+
+        person_mask_bbox_t = None
+        person_mask_bbox = None
+        person_for_debug = None
+        if latest_mask is not None:
             if dev["cuda_available"]:
-                # Batched YOLO call for both cameras (one model.predict
-                # over the stacked pair instead of two separate calls).
-                mask_a_src_t, mask_b_src_t = (
-                    person_segmenter.predict_classes_mask_pair_gpu(
-                        frame_a, frame_b,
-                        frame_a.shape[:2], frame_b.shape[:2],
-                        person_class_ids,
-                    )
-                )
-                mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
-                mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
-                union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
-                union_t = dilate_gpu(union_t, args.mask_dilate)
-                raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
-                new_float = (raw_mask_t > 0).float()
-                if person_mask_ema_t is None:
-                    person_mask_ema_t = new_float
-                else:
-                    a = args.mask_ema
-                    person_mask_ema_t = (a * new_float
-                                         + (1.0 - a) * person_mask_ema_t)
-                person_mask_bbox_t = (
-                    (person_mask_ema_t > args.mask_ema_threshold)
-                    .to(torch.uint8) * 255
-                ).contiguous()
-                if args.debug_mask:
-                    person_mask_bbox = person_mask_bbox_t.cpu().numpy()
+                ev = latest_mask.get("ready_event")
+                if ev is not None:
+                    ev.wait()
+                person_mask_bbox_t = latest_mask["person_mask_bbox_t"]
             else:
-                mask_a_src, mask_b_src = (
-                    person_segmenter.predict_classes_mask_pair(
-                        frame_a, frame_b, person_class_ids,
-                    )
-                )
-                mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
-                mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
-                union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
-                union = cv2.dilate(union, dilate_kernel)
-                raw_mask = union[y0:y1, x0:x1]
-                new_float = (raw_mask > 0).astype(np.float32)
-                if person_mask_ema is None:
-                    person_mask_ema = new_float
-                else:
-                    a = args.mask_ema
-                    person_mask_ema = (a * new_float
-                                       + (1.0 - a) * person_mask_ema)
-                person_mask_bbox = (
-                    (person_mask_ema > args.mask_ema_threshold)
-                    .astype(np.uint8) * 255
-                )
+                person_mask_bbox = latest_mask["person_mask_bbox"]
+            if args.debug_mask:
+                person_for_debug = latest_mask.get("person_mask_cpu")
 
         ds = max(1, args.seam_downscale)
 
@@ -532,13 +514,15 @@ def run(args):
                                 cost_ema, 1.0 - ema_eff,
                                 0, dst=cost_ema)
             cost_for_dp = cost_ema.copy()
+            has_person_cpu = (person_mask_bbox is not None
+                              and person_mask_bbox.any())
             if use_fg and fg_mask_bbox is not None:
-                if person_mask_bbox.any():
+                if has_person_cpu:
                     fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
                 else:
                     fg_only = fg_mask_bbox > 0
                 cost_for_dp[fg_only] += args.fg_penalty
-            if person_mask_bbox.any():
+            if has_person_cpu:
                 cost_for_dp[person_mask_bbox > 0] += args.person_penalty
             add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
                                     edge_penalty=args.edge_penalty)
@@ -558,15 +542,14 @@ def run(args):
 
         # Snapshot the FG mask for the debug overlay (composite stage may
         # run a frame later, so we capture the version that's current
-        # for THIS frame here).
+        # for THIS frame here). person_for_debug was already set above
+        # when we read mask_holder.
         fg_for_debug = None
         if args.debug_mask and use_fg:
             if fg_mask_bbox_t is not None:
                 fg_for_debug = fg_mask_bbox_t.cpu().numpy()
             elif fg_mask_bbox is not None:
                 fg_for_debug = fg_mask_bbox
-
-        person_for_debug = person_mask_bbox if args.debug_mask else None
 
         # Record an event on the current (compute) stream so the composite
         # stage's stream can wait on it before reading our output tensors.
@@ -628,11 +611,112 @@ def run(args):
             stitched = stitched[cy:cy + ch, cx:cx + cw]
         return stitched
 
-    # --- Pipelined execution with two worker threads ---------------------
+    # --- Pipelined execution with three worker threads -------------------
     SENTINEL = object()
     compute_in_q = queue.Queue(maxsize=4)
     composite_in_q = queue.Queue(maxsize=4)
     worker_error = [None]
+
+    def yolo_worker():
+        """Pull (frame_a, frame_b) pairs off yolo_q, run batched YOLO
+        inference + mask warp/dilate/EMA/binarize, and publish the
+        resulting mask snapshot to mask_holder under mask_lock.
+
+        Owns the inter-call person-mask EMA state. compute_one only
+        ever reads the published mask — it never updates this state.
+        Running here on its own CUDA stream so the mask post-processing
+        kernels can overlap with the compute and composite streams."""
+        person_mask_ema_t = None  # GPU path
+        person_mask_ema = None    # CPU path
+
+        stream_ctx = (
+            torch.cuda.stream(yolo_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
+        try:
+            with stream_ctx:
+                while True:
+                    item = yolo_q.get()
+                    if item is SENTINEL:
+                        return
+                    frame_a_yolo, frame_b_yolo = item
+
+                    if dev["cuda_available"]:
+                        mask_a_src_t, mask_b_src_t = (
+                            person_segmenter.predict_classes_mask_pair_gpu(
+                                frame_a_yolo, frame_b_yolo,
+                                frame_a_yolo.shape[:2], frame_b_yolo.shape[:2],
+                                person_class_ids,
+                            )
+                        )
+                        mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
+                        mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
+                        union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
+                        union_t = dilate_gpu(union_t, args.mask_dilate)
+                        raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
+                        new_float = (raw_mask_t > 0).float()
+                        if person_mask_ema_t is None:
+                            person_mask_ema_t = new_float
+                        else:
+                            a = args.mask_ema
+                            person_mask_ema_t = (a * new_float
+                                                 + (1.0 - a) * person_mask_ema_t)
+                        person_mask_bbox_t = (
+                            (person_mask_ema_t > args.mask_ema_threshold)
+                            .to(torch.uint8) * 255
+                        ).contiguous()
+                        person_mask_cpu = (
+                            person_mask_bbox_t.cpu().numpy()
+                            if args.debug_mask else None
+                        )
+                        # Event the compute thread waits on before reading
+                        # person_mask_bbox_t (cross-stream sync, no host stall).
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "person_mask_bbox_t": person_mask_bbox_t,
+                            "person_mask_bbox": None,
+                            "person_mask_cpu": person_mask_cpu,
+                            "ready_event": ready_event,
+                        }
+                    else:
+                        mask_a_src, mask_b_src = (
+                            person_segmenter.predict_classes_mask_pair(
+                                frame_a_yolo, frame_b_yolo, person_class_ids,
+                            )
+                        )
+                        mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay,
+                                                  cv2.INTER_NEAREST)
+                        mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by,
+                                                  cv2.INTER_NEAREST)
+                        union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
+                        union = cv2.dilate(union, dilate_kernel)
+                        raw_mask = union[y0:y1, x0:x1]
+                        new_float = (raw_mask > 0).astype(np.float32)
+                        if person_mask_ema is None:
+                            person_mask_ema = new_float
+                        else:
+                            a = args.mask_ema
+                            person_mask_ema = (a * new_float
+                                               + (1.0 - a) * person_mask_ema)
+                        person_mask_bbox = (
+                            (person_mask_ema > args.mask_ema_threshold)
+                            .astype(np.uint8) * 255
+                        )
+                        new_holder = {
+                            "person_mask_bbox_t": None,
+                            "person_mask_bbox": person_mask_bbox,
+                            "person_mask_cpu": (
+                                person_mask_bbox if args.debug_mask else None
+                            ),
+                            "ready_event": None,
+                        }
+
+                    with mask_lock:
+                        mask_holder[0] = new_holder
+        except Exception as e:
+            worker_error[0] = e
 
     def compute_worker():
         # Pin this thread's CUDA stream so every CUDA op in compute_one
@@ -679,8 +763,12 @@ def run(args):
     composite_thread = threading.Thread(
         target=composite_worker, name="composite", daemon=True,
     )
+    yolo_thread = threading.Thread(
+        target=yolo_worker, name="yolo", daemon=True,
+    )
     compute_thread.start()
     composite_thread.start()
+    yolo_thread.start()
 
     frame_idx = 0
     t_start = time.time()
@@ -701,6 +789,8 @@ def run(args):
         compute_in_q.put(SENTINEL)
         compute_thread.join()
         composite_thread.join()
+        yolo_q.put(SENTINEL)
+        yolo_thread.join()
         prefetch_reader.close()
         writer.close()
 
@@ -711,7 +801,7 @@ def run(args):
     print()
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
-          f"-- pipelined (compute + composite on separate threads)")
+          f"-- pipelined (compute + composite + yolo on separate threads)")
     print(sync_reader.summary_post())
     print(f"[info] Output written to {args.output}")
 
