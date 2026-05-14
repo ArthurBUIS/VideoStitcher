@@ -362,12 +362,22 @@ def run(args):
         # composite_one (writer of the pinned copy) and the writer
         # thread (encoder). Sized to cover composite_in_q (4) + writer
         # queue (4) + one in flight in each worker, with headroom.
+        #
+        # When --autocrop is on, allocate the pinned buffers at the crop
+        # size instead of full canvas — composite_multiband_gpu_async
+        # slices out_t to the crop before the permute().contiguous() +
+        # DMA, so both the contiguous copy and the host transfer shrink
+        # by (crop / canvas) pixels.
+        if crop_rect is not None:
+            _, _, pinned_W, pinned_H = crop_rect
+        else:
+            pinned_H, pinned_W = H_canvas, W_canvas
         pinned_ring_size = 10
         free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
         pinned_ring = []  # keep references so they aren't GC'd
         for _ in range(pinned_ring_size):
             buf = torch.empty(
-                (H_canvas, W_canvas, 3),
+                (pinned_H, pinned_W, 3),
                 dtype=torch.uint8, pin_memory=True,
             )
             pinned_ring.append(buf)
@@ -664,32 +674,36 @@ def run(args):
                 payload["warped_a_t"], payload["warped_b_t"],
                 static, seam_x_full,
                 args.blend_width, args.blend_levels,
-                pinned, gpu_ctx,
+                pinned, gpu_ctx, crop_rect=crop_rect,
             )
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
 
             # Closure runs on the writer thread AFTER copy_event has
             # been synchronised; sees the pinned numpy view as `arr`.
-            # Returns the array to encode (possibly a crop).
+            # `arr` is already at the cropped size (composite did the
+            # slice on GPU before the DMA), so debug overlays use
+            # crop-relative bbox coords.
+            if crop_rect is not None:
+                cx, cy, _, _ = crop_rect
+                bx0, by0, bx1, by1 = static["overlap_bbox"]
+                debug_bbox = (bx0 - cx, by0 - cy, bx1 - cx, by1 - cy)
+            else:
+                debug_bbox = static["overlap_bbox"]
+
             def post_sync_fn(arr,
                              seam_x_full=seam_x_full,
                              fg_for_debug=fg_for_debug,
-                             person_for_debug=person_for_debug):
+                             person_for_debug=person_for_debug,
+                             debug_bbox=debug_bbox):
                 if args.debug_mask:
                     if fg_for_debug is not None:
-                        draw_mask_overlay(arr, fg_for_debug,
-                                          static["overlap_bbox"],
+                        draw_mask_overlay(arr, fg_for_debug, debug_bbox,
                                           color=(0, 255, 255), alpha=0.25)
                     if person_for_debug is not None:
-                        draw_mask_overlay(arr, person_for_debug,
-                                          static["overlap_bbox"])
+                        draw_mask_overlay(arr, person_for_debug, debug_bbox)
                 if args.debug_seam:
-                    draw_seam_overlay(arr, seam_x_full,
-                                      static["overlap_bbox"])
-                if crop_rect is not None:
-                    cx, cy, cw, ch = crop_rect
-                    arr = arr[cy:cy + ch, cx:cx + cw]
+                    draw_seam_overlay(arr, seam_x_full, debug_bbox)
                 return arr
 
             return ("async", pinned, copy_event, post_sync_fn,

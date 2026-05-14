@@ -275,7 +275,7 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
 
 def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
                                    blend_width, blend_levels,
-                                   pinned_buf, gpu_ctx):
+                                   pinned_buf, gpu_ctx, crop_rect=None):
     """
     Asynchronous GPU composite.
 
@@ -284,6 +284,13 @@ def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
         pinned_buf instead of an out_buf scratch numpy array.
       - Does NOT synchronize before returning. Returns a torch.cuda.Event
         recorded after the pinned copy.
+
+    If crop_rect=(cx, cy, cw, ch) is given, only the cropped sub-rectangle
+    of the canvas is materialised in the pinned buffer; the final
+    permute().contiguous() copy + GPU->CPU DMA shrink by (crop / canvas)
+    pixels. The composite kernels still operate on the full canvas (the
+    only_A / only_B torch.wheres remain canvas-wide), so the savings
+    here are limited to the host transfer leg.
 
     The downstream consumer (writer thread) is responsible for waiting
     on the event before reading pinned_buf. This frees the composite
@@ -294,6 +301,9 @@ def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
         warped_a_t, warped_b_t, static, seam_x_full,
         blend_width, blend_levels, gpu_ctx,
     )
+    if crop_rect is not None:
+        cx, cy, cw, ch = crop_rect
+        out_t = out_t[:, cy:cy + ch, cx:cx + cw]
     out_hwc = out_t.permute(1, 2, 0).contiguous()
     pinned_buf.copy_(out_hwc, non_blocking=True)
     event = torch.cuda.Event()
