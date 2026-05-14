@@ -74,27 +74,41 @@ def _get_pyr_kernel_2d(device):
 
 
 def _pyr_down_torch(x, kernel2d):
-    C, H, W = x.shape
-    x_pad = F.pad(x[None, :, :, :], (2, 2, 2, 2), mode="replicate")
+    """
+    x: (N, C, H, W). Returns (N, C, H//2, W//2).
+
+    Per-channel Gaussian blur (5x5 binomial kernel, grouped conv) +
+    stride-2 downsample. Batch + channel layout means a single conv2d
+    handles every image and channel together.
+    """
+    _, C, _, _ = x.shape
+    x_pad = F.pad(x, (2, 2, 2, 2), mode="replicate")
     kern = kernel2d.expand(C, 1, 5, 5)
     blurred = F.conv2d(x_pad, kern, groups=C)
-    down = blurred[:, :, ::2, ::2]
-    return down[0]
+    return blurred[:, :, ::2, ::2]
 
 
 def _pyr_up_torch(x, target_hw, kernel2d):
-    C, Hs, Ws = x.shape
-    up = x.new_zeros((C, Hs * 2, Ws * 2))
-    up[:, ::2, ::2] = x
-    up_pad = F.pad(up[None, :, :, :], (2, 2, 2, 2), mode="replicate")
+    """
+    x: (N, C, Hs, Ws). Returns (N, C, target_h, target_w).
+
+    Zero-insert at every other location, Gaussian smooth (scaled by 4
+    to compensate for the zeros), then crop to the requested target
+    shape. Batched in (N, C, H, W) so one conv2d call handles every
+    image and channel.
+    """
+    N, C, Hs, Ws = x.shape
+    up = x.new_zeros((N, C, Hs * 2, Ws * 2))
+    up[:, :, ::2, ::2] = x
+    up_pad = F.pad(up, (2, 2, 2, 2), mode="replicate")
     kern = (kernel2d * 4.0).expand(C, 1, 5, 5)
     blurred = F.conv2d(up_pad, kern, groups=C)
     Th, Tw = target_hw
-    out = blurred[0, :, :Th, :Tw]
-    return out
+    return blurred[:, :, :Th, :Tw]
 
 
 def _build_gaussian_pyramid_torch(x, levels, kernel2d):
+    """x: (N, C, H, W) → list[(N, C, H_i, W_i)] of length levels+1."""
     gp = [x]
     for _ in range(levels):
         gp.append(_pyr_down_torch(gp[-1], kernel2d))
@@ -102,10 +116,11 @@ def _build_gaussian_pyramid_torch(x, levels, kernel2d):
 
 
 def _build_laplacian_pyramid_torch(x, levels, kernel2d):
+    """x: (N, C, H, W) → list of laplacian levels (length levels+1)."""
     gp = _build_gaussian_pyramid_torch(x, levels, kernel2d)
     lp = []
     for i in range(levels):
-        up = _pyr_up_torch(gp[i + 1], gp[i].shape[1:], kernel2d)
+        up = _pyr_up_torch(gp[i + 1], gp[i].shape[2:], kernel2d)
         lp.append(gp[i] - up)
     lp.append(gp[levels])
     return lp
@@ -114,7 +129,7 @@ def _build_laplacian_pyramid_torch(x, levels, kernel2d):
 def _reconstruct_from_laplacian_torch(lp, kernel2d):
     img = lp[-1]
     for level in reversed(lp[:-1]):
-        img = _pyr_up_torch(img, level.shape[1:], kernel2d)
+        img = _pyr_up_torch(img, level.shape[2:], kernel2d)
         img = img + level
     return img
 
@@ -209,24 +224,30 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
     )
     mask_strip_t = torch.from_numpy(mask_strip_np).to(device, non_blocking=True)
 
-    # Channel-first already: a_strip_filled is (3, H_bb, strip_w). No
-    # .permute(2, 0, 1) needed.
-    a_f = a_strip_filled.float()
-    b_f = b_strip_filled.float()
-    m_f = mask_strip_t.unsqueeze(0)
+    # Batch A and B together so each pyramid level is built with ONE
+    # conv2d kernel launch per pyrDown/pyrUp instead of two. ab_f has
+    # shape (2, 3, H_bb, strip_w); kernel halve per-level fused across
+    # both images. Mask stays (1, 1, H, W) since it has different
+    # channel count.
+    a_f = a_strip_filled.float().unsqueeze(0)            # (1, 3, H, W)
+    b_f = b_strip_filled.float().unsqueeze(0)            # (1, 3, H, W)
+    ab_f = torch.cat([a_f, b_f], dim=0)                  # (2, 3, H, W)
+    m_f = mask_strip_t.unsqueeze(0).unsqueeze(0)         # (1, 1, H, W)
 
     min_dim = min(H_bb, strip_w)
     max_levels = max(1, int(np.log2(min_dim)) - 2)
     levels = min(blend_levels, max_levels)
 
-    lp_a = _build_laplacian_pyramid_torch(a_f, levels, kernel2d)
-    lp_b = _build_laplacian_pyramid_torch(b_f, levels, kernel2d)
+    lp_ab = _build_laplacian_pyramid_torch(ab_f, levels, kernel2d)
     gp_m = _build_gaussian_pyramid_torch(m_f, levels, kernel2d)
 
-    blended_lp = [la * gm + lb * (1.0 - gm)
-                  for la, lb, gm in zip(lp_a, lp_b, gp_m)]
+    # torch.lerp(start, end, weight) = start + weight * (end - start)
+    # so lerp(B, A, gm) = B + gm*(A - B) = A*gm + B*(1-gm). One fused
+    # op per level instead of two muls + one add.
+    blended_lp = [torch.lerp(lp_ab[i][1:2], lp_ab[i][0:1], gp_m[i])
+                  for i in range(len(lp_ab))]
     recon = _reconstruct_from_laplacian_torch(blended_lp, kernel2d).clamp(0, 255)
-    blended_strip_t = recon.to(torch.uint8).contiguous()  # (3, H_bb, strip_w)
+    blended_strip_t = recon[0].to(torch.uint8).contiguous()  # (3, H_bb, strip_w)
 
     valid_strip = (gpu_ctx["valid_in_bbox_t"][:, x_strip_min:x_strip_max]
                    > 0).unsqueeze(0)
