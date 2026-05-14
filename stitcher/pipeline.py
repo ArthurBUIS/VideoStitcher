@@ -82,6 +82,7 @@ import torch.nn.functional as F
 
 from stitcher.compositing import (
     composite_multiband_cpu,
+    composite_multiband_gpu_async,
     composite_multiband_gpu_resident,
     get_pyr_kernel_2d,
 )
@@ -355,14 +356,22 @@ def run(args):
             "only_b_in_bbox_t": torch.from_numpy(static["only_b_in_bbox"]).to(torch_device),
             "overlap_in_bbox_t": torch.from_numpy(static["overlap_in_bbox"]).to(torch_device),
             "valid_in_bbox_t": torch.from_numpy(valid_in_bbox_np).to(torch_device),
-            # Page-locked host buffer for the final GPU->CPU transfer of
-            # the composited frame; lets CUDA's DMA copy bypass an extra
-            # staging copy. Allocated once for the full canvas.
-            "pinned_output_t": torch.empty(
+        }
+        # Ring of pinned host buffers for the async composite path. Each
+        # buffer holds one in-flight (H, W, 3) uint8 frame between
+        # composite_one (writer of the pinned copy) and the writer
+        # thread (encoder). Sized to cover composite_in_q (4) + writer
+        # queue (4) + one in flight in each worker, with headroom.
+        pinned_ring_size = 10
+        free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
+        pinned_ring = []  # keep references so they aren't GC'd
+        for _ in range(pinned_ring_size):
+            buf = torch.empty(
                 (H_canvas, W_canvas, 3),
                 dtype=torch.uint8, pin_memory=True,
-            ),
-        }
+            )
+            pinned_ring.append(buf)
+            free_pinned_q.put(buf)
         grid_a_t = build_grid_sample_tensor(map_ax, map_ay, frame_a.shape, torch_device)
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
         # Stacked grid for the batched warp_pair_gpu call. Built once
@@ -629,8 +638,16 @@ def run(args):
         }
 
     def composite_one(payload):
-        """Run the multi-band composite, debug overlays, autocrop, and
-        enqueue the final frame to the writer."""
+        """Run the multi-band composite + debug overlays + autocrop.
+
+        On GPU: returns ("async", pinned, event, post_sync_fn, free_cb)
+        — composite_worker hands this off to writer.write_async, which
+        synchronises on the event before encoding. composite_one itself
+        does NOT wait for the GPU.
+
+        On CPU: returns ("sync", stitched_ndarray) — the writer takes
+        the already-materialized frame.
+        """
         # Wait for the compute stage's output tensors to be ready (their
         # writes happened on compute_stream; we read them on
         # composite_stream). Stream wait is the cheap, GPU-side
@@ -640,18 +657,50 @@ def run(args):
             compute_event.wait()
         seam_x_full = payload["seam_x_full"]
         if gpu_ctx is not None:
-            stitched = composite_multiband_gpu_resident(
+            # Acquire a pinned slot (blocks if all are in flight — this
+            # is our backpressure mechanism between composite and writer).
+            pinned = free_pinned_q.get()
+            copy_event = composite_multiband_gpu_async(
                 payload["warped_a_t"], payload["warped_b_t"],
                 static, seam_x_full,
-                args.blend_width, args.blend_levels, out_buf,
-                gpu_ctx,
+                args.blend_width, args.blend_levels,
+                pinned, gpu_ctx,
             )
-        else:
-            stitched = composite_multiband_cpu(
-                payload["warped_a"], payload["warped_b"],
-                static, seam_x_full,
-                args.blend_width, args.blend_levels, out_buf,
-            )
+            fg_for_debug = payload["fg_for_debug"]
+            person_for_debug = payload["person_for_debug"]
+
+            # Closure runs on the writer thread AFTER copy_event has
+            # been synchronised; sees the pinned numpy view as `arr`.
+            # Returns the array to encode (possibly a crop).
+            def post_sync_fn(arr,
+                             seam_x_full=seam_x_full,
+                             fg_for_debug=fg_for_debug,
+                             person_for_debug=person_for_debug):
+                if args.debug_mask:
+                    if fg_for_debug is not None:
+                        draw_mask_overlay(arr, fg_for_debug,
+                                          static["overlap_bbox"],
+                                          color=(0, 255, 255), alpha=0.25)
+                    if person_for_debug is not None:
+                        draw_mask_overlay(arr, person_for_debug,
+                                          static["overlap_bbox"])
+                if args.debug_seam:
+                    draw_seam_overlay(arr, seam_x_full,
+                                      static["overlap_bbox"])
+                if crop_rect is not None:
+                    cx, cy, cw, ch = crop_rect
+                    arr = arr[cy:cy + ch, cx:cx + cw]
+                return arr
+
+            return ("async", pinned, copy_event, post_sync_fn,
+                    lambda p=pinned: free_pinned_q.put(p))
+
+        # ---- CPU path: unchanged synchronous behaviour. -----------------
+        stitched = composite_multiband_cpu(
+            payload["warped_a"], payload["warped_b"],
+            static, seam_x_full,
+            args.blend_width, args.blend_levels, out_buf,
+        )
         if args.debug_mask:
             fg_for_debug = payload["fg_for_debug"]
             if fg_for_debug is not None:
@@ -667,7 +716,7 @@ def run(args):
         if crop_rect is not None:
             cx, cy, cw, ch = crop_rect
             stitched = stitched[cy:cy + ch, cx:cx + cw]
-        return stitched
+        return ("sync", stitched)
 
     # --- Pipelined execution with three worker threads -------------------
     SENTINEL = object()
@@ -846,13 +895,19 @@ def run(args):
                     if item is SENTINEL:
                         return
                     t_work0 = time.perf_counter()
-                    stitched = composite_one(item)
+                    result = composite_one(item)
                     if prof is not None:
                         prof["composite"].record(
                             (time.perf_counter() - t_work0) * 1000
                         )
                     t_write0 = time.perf_counter()
-                    writer.write(stitched)
+                    if result[0] == "async":
+                        _, pinned, event, post_sync_fn, free_cb = result
+                        writer.write_async(pinned, event,
+                                           post_sync_fn, free_cb)
+                    else:
+                        _, stitched = result
+                        writer.write(stitched)
                     if prof is not None:
                         prof["composite_write"].record(
                             (time.perf_counter() - t_write0) * 1000

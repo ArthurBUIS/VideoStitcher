@@ -119,11 +119,10 @@ def _reconstruct_from_laplacian_torch(lp, kernel2d):
     return img
 
 
-def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full,
-                                     blend_width, blend_levels, out_buf,
-                                     gpu_ctx):
+def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
+                              blend_width, blend_levels, gpu_ctx):
     """
-    GPU multi-band Laplacian blend, restricted to a strip around the seam.
+    Shared multi-band Laplacian blend on GPU.
 
     The multi-band blend only affects pixels within ±blend_width of the
     seam — outside that strip the soft mask is hard 0 or 1 and the
@@ -138,8 +137,8 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
       3. Multi-band only on the strip (typically 4-5x smaller than the
          full bbox in x).
 
-    Fully GPU-resident until the final cpu().numpy() that copies the
-    output frame back to host memory.
+    Returns out_t as a (3, H_canvas, W_canvas) uint8 tensor on GPU. The
+    caller is responsible for any host transfer + synchronization.
     """
     device = gpu_ctx["device"]
     kernel2d = gpu_ctx["kernel2d"]
@@ -236,6 +235,25 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
         valid_strip, blended_strip_t, cur,
     )
 
+    return out_t
+
+
+def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full,
+                                     blend_width, blend_levels, out_buf,
+                                     gpu_ctx):
+    """
+    Synchronous GPU multi-band Laplacian blend. Runs the pyramid + blend,
+    copies the result to a pinned host buffer, synchronizes the current
+    stream, then copies into out_buf. Returns out_buf.
+
+    The composite worker blocks for the duration of the GPU work — the
+    sync path used by the CPU debug overlays + crop branch and by older
+    callers.
+    """
+    out_t = _composite_to_gpu_tensor(
+        warped_a_t, warped_b_t, static, seam_x_full,
+        blend_width, blend_levels, gpu_ctx,
+    )
     # One final permute+contiguous to (H, W, 3) for the pinned host
     # buffer (cv2 / VideoWriter expect that layout). This replaces the
     # two earlier full-canvas permutes; net save ~3 ms.
@@ -253,6 +271,34 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
         result_np = out_hwc.cpu().numpy()
         np.copyto(out_buf, result_np)
     return out_buf
+
+
+def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
+                                   blend_width, blend_levels,
+                                   pinned_buf, gpu_ctx):
+    """
+    Asynchronous GPU composite.
+
+    Like composite_multiband_gpu_resident, but:
+      - Writes the final (H, W, 3) uint8 frame into the provided
+        pinned_buf instead of an out_buf scratch numpy array.
+      - Does NOT synchronize before returning. Returns a torch.cuda.Event
+        recorded after the pinned copy.
+
+    The downstream consumer (writer thread) is responsible for waiting
+    on the event before reading pinned_buf. This frees the composite
+    worker to immediately launch the next frame's kernels, keeping the
+    GPU's stream queue fuller and overlapping with the writer's encode.
+    """
+    out_t = _composite_to_gpu_tensor(
+        warped_a_t, warped_b_t, static, seam_x_full,
+        blend_width, blend_levels, gpu_ctx,
+    )
+    out_hwc = out_t.permute(1, 2, 0).contiguous()
+    pinned_buf.copy_(out_hwc, non_blocking=True)
+    event = torch.cuda.Event()
+    event.record()
+    return event
 
 
 # ---------------------------------------------------------------------------

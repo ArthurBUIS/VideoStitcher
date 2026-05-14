@@ -87,11 +87,35 @@ class PrefetchingFrameReader:
             raise self.exception
 
 
+class _AsyncWriteItem:
+    """Carries a pending GPU→CPU pinned buffer + cuda Event + post-sync
+    transform to the writer thread. See ThreadedVideoWriter.write_async."""
+
+    __slots__ = ("pinned", "event", "post_sync_fn", "free_cb")
+
+    def __init__(self, pinned, event, post_sync_fn, free_cb):
+        self.pinned = pinned
+        self.event = event
+        self.post_sync_fn = post_sync_fn
+        self.free_cb = free_cb
+
+
 class ThreadedVideoWriter:
     """
     Wrap cv2.VideoWriter on a background thread so encode/disk-write
     doesn't block the per-frame pipeline. Frames are copied into a
     bounded queue; the worker thread drains it.
+
+    Supports two modes:
+      - write(frame_bgr): synchronous handoff. The caller has already
+        materialized the BGR frame on the host. The writer thread
+        merely encodes.
+      - write_async(pinned, event, post_sync_fn, free_cb): async handoff.
+        The frame is still on the GPU at submission time; the writer
+        thread waits on `event`, applies `post_sync_fn` to the pinned
+        host view, encodes, then calls `free_cb` to release the pinned
+        slot. This lets the composite worker move on to the next
+        frame's kernel launches without waiting for the GPU.
     """
 
     _SENTINEL = object()
@@ -109,12 +133,27 @@ class ThreadedVideoWriter:
                 item = self.q.get()
                 if item is self._SENTINEL:
                     break
-                self.writer.write(item)
+                if isinstance(item, _AsyncWriteItem):
+                    # Wait for the GPU pyramid + pinned copy to finish.
+                    item.event.synchronize()
+                    arr = item.pinned.numpy()
+                    if item.post_sync_fn is not None:
+                        arr = item.post_sync_fn(arr)
+                    self.writer.write(arr)
+                    if item.free_cb is not None:
+                        item.free_cb()
+                else:
+                    self.writer.write(item)
         except Exception as e:
             self.exception = e
 
     def write(self, frame_bgr):
         self.q.put(frame_bgr.copy())
+        if self.exception is not None:
+            raise self.exception
+
+    def write_async(self, pinned, event, post_sync_fn=None, free_cb=None):
+        self.q.put(_AsyncWriteItem(pinned, event, post_sync_fn, free_cb))
         if self.exception is not None:
             raise self.exception
 
