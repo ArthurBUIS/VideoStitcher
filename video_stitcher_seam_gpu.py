@@ -136,10 +136,13 @@ Static foreground (segmentation-based):
     --fg_dilate PX              Dilation radius for the FG mask, in
                                 pixels. Default: 10.
     --fg_recompute_seconds F    Seconds between FG mask recomputations.
-                                0 = compute once at startup and never
-                                again. Increase if the scene has
-                                furniture that gets rearranged during
-                                the recording. Default: 0.
+                                0 disables periodic recompute (FG mask
+                                stays at the startup version forever).
+                                Default: 10.0 — at typical 25 fps this
+                                runs the FG segmenter every ~250 frames,
+                                cheap enough to catch furniture being
+                                rearranged or new objects being placed
+                                without paying YOLO's cost every frame.
 
 Motion detection (baseline subtraction):
     For fixed cameras, the "moved object" signal is built from a
@@ -345,9 +348,10 @@ def main():
                         help="FG mask dilation radius in px (default 10).")
     parser.add_argument("--fg_penalty", type=float, default=5e7,
                         help="Cost penalty for FG pixels (default 5e7).")
-    parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
-                        help="Seconds between FG recomputations "
-                             "(0 = startup only).")
+    parser.add_argument("--fg_recompute_seconds", type=float, default=10.0,
+                        help="Seconds between FG recomputations. "
+                             "0 disables periodic recompute (startup "
+                             "only). Default: 10.0.")
     # Motion detection (baseline subtraction) -----------------------------
     # On by default. Use --no_motion to disable; use --no_motion_renorm to
     # skip the per-frame brightness renormalization.
