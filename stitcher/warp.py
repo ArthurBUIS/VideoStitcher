@@ -74,12 +74,19 @@ def warp_pair_gpu(frame_a_bgr_cpu, frame_b_bgr_cpu,
                   gain_a_t=None, gain_b_t=None,
                   non_blocking=True):
     """
-    Batched two-frame warp. Uploads A and B, stacks them into a
-    (2, 3, H_src, W_src) tensor, runs a SINGLE grid_sample against the
-    precomputed (2, H_canvas, W_canvas, 2) grid stack. Saves the
+    Two-frame warp. When the two source frames share a shape (the
+    typical case), uploads A and B, stacks them into a (2, 3, H_src,
+    W_src) tensor, and runs a SINGLE grid_sample against the
+    precomputed (2, H_dst, W_dst, 2) grid stack — saves the
     kernel-launch + scheduling overhead vs two separate warp_gpu calls.
 
-    Returns (warped_a_t, warped_b_t), each (1, 3, H_canvas, W_canvas)
+    When the two source frames have DIFFERENT shapes (e.g. cameras
+    recording at different resolutions), falls back to two separate
+    grid_sample calls — slightly slower but correct. The destination
+    shape (H_dst, W_dst) is identical either way since both grids
+    target the same output canvas.
+
+    Returns (warped_a_t, warped_b_t), each (1, 3, H_dst, W_dst)
     uint8 — same shapes as warp_gpu returns, so downstream code is
     unchanged.
     """
@@ -91,15 +98,32 @@ def warp_pair_gpu(frame_a_bgr_cpu, frame_b_bgr_cpu,
         ta = (ta * gain_a_t).clamp(0, 255)
     if gain_b_t is not None:
         tb = (tb * gain_b_t).clamp(0, 255)
-    t = torch.cat([ta, tb], dim=0)
-    warped = F.grid_sample(
-        t, grid_pair_t,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-    warped = warped.clamp(0, 255).to(torch.uint8)
-    return warped[0:1], warped[1:2]
+    if ta.shape[2:] == tb.shape[2:]:
+        # Fast path: same source shape, single grid_sample on a batch
+        # tensor of size 2.
+        t = torch.cat([ta, tb], dim=0)
+        warped = F.grid_sample(
+            t, grid_pair_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        warped = warped.clamp(0, 255).to(torch.uint8)
+        return warped[0:1], warped[1:2]
+    # Fallback: different source shapes -> two grid_samples, one per
+    # camera. We pull each camera's grid out of grid_pair_t along the
+    # batch dim (grid_pair_t was built as cat([grid_a_t, grid_b_t], 0)).
+    grid_a_t = grid_pair_t[0:1]
+    grid_b_t = grid_pair_t[1:2]
+    warped_a = F.grid_sample(
+        ta, grid_a_t,
+        mode="bilinear", padding_mode="zeros", align_corners=True,
+    ).clamp(0, 255).to(torch.uint8)
+    warped_b = F.grid_sample(
+        tb, grid_b_t,
+        mode="bilinear", padding_mode="zeros", align_corners=True,
+    ).clamp(0, 255).to(torch.uint8)
+    return warped_a, warped_b
 
 
 def warp_gpu(frame_bgr_cpu, grid_t, device, gain_t=None, non_blocking=True):
