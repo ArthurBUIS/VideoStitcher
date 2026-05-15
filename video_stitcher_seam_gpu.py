@@ -103,7 +103,7 @@ same type):
 Person mask:
     --yolo_every N              Run the person model once every N frames;
                                 reuse the cached mask in between. Lower =
-                                fresher mask but slower. Default: 5.
+                                fresher mask but slower. Default: 8.
     --mask_dilate PX            Dilation radius applied to the unioned
                                 person mask, in pixels. Absorbs the
                                 parallax offset between A and B's view of
@@ -159,15 +159,17 @@ Motion detection (baseline subtraction):
                       drift (which IS chrominance). Threshold range
                       ~0-200; ~10-20 is a good start.
 
-    --motion                    Enable motion detection (opt-in for
-                                now; default off).
+    --no_motion                 Disable motion detection. On by default;
+                                the seam avoids anything different from
+                                the empty-room baseline.
     --motion_method M           pixel (default), edges, or chrominance.
-    --motion_renorm             Rescale each frame's mean (per BGR
-                                channel, measured inside the overlap)
+    --no_motion_renorm          Disable per-frame brightness
+                                renormalization (on by default).
+                                Renorm rescales each frame's mean (per
+                                BGR channel, measured inside the overlap)
                                 to match the baseline's mean, before
-                                diffing. Cancels global brightness/
-                                colour drift from camera AE. Orthogonal:
-                                composes with any --motion_method.
+                                diffing. Cancels global brightness /
+                                colour drift from camera AE.
     --motion_baseline_a PATH    Path to camera A's empty-room baseline
                                 image. Must match the camera's video
                                 resolution. If both --motion_baseline_a
@@ -178,7 +180,7 @@ Motion detection (baseline subtraction):
     --motion_threshold T        Threshold above which a pixel is
                                 flagged. Scale depends on
                                 --motion_method (see above).
-                                Default: 30.
+                                Default: 200 (tuned for pixel + renorm).
     --motion_dilate PX          Dilation radius for the motion mask.
                                 Default: 10.
     --motion_penalty F          Cost penalty added to motion-mask
@@ -278,7 +280,7 @@ def main():
     parser.add_argument("--autocrop", action="store_true",
                         help="Crop output to the largest axis-aligned "
                              "rectangle inside the stitched canvas.")
-    parser.add_argument("--yolo_every", type=int, default=5)
+    parser.add_argument("--yolo_every", type=int, default=8)
     parser.add_argument("--mask_dilate", type=int, default=15)
     parser.add_argument("--mask_ema", type=float, default=1.0,
                         help="EMA factor in [0, 1] for the person mask. "
@@ -347,11 +349,14 @@ def main():
                         help="Seconds between FG recomputations "
                              "(0 = startup only).")
     # Motion detection (baseline subtraction) -----------------------------
-    parser.add_argument("--motion", action="store_true",
-                        help="Enable baseline-subtraction motion detection: "
-                             "anything different from the empty-room "
-                             "baseline gets a cost-map penalty (parallel "
-                             "to fg_penalty, gated by person priority).")
+    # On by default. Use --no_motion to disable; use --no_motion_renorm to
+    # skip the per-frame brightness renormalization.
+    parser.add_argument("--no_motion", action="store_true",
+                        help="Disable baseline-subtraction motion detection. "
+                             "Motion adds a cost-map penalty on anything "
+                             "different from the empty-room baseline "
+                             "(parallel to fg_penalty, gated by person "
+                             "priority). On by default.")
     parser.add_argument("--motion_method",
                         choices=["pixel", "edges", "chrominance"],
                         default="pixel",
@@ -362,14 +367,16 @@ def main():
                              "'chrominance' diffs LAB A,B channels (robust "
                              "to brightness drift, NOT to white-balance). "
                              "Default: pixel. Threshold scales differ; "
-                             "try ~50 for edges, ~10 for chrominance, ~30 "
-                             "for pixel.")
-    parser.add_argument("--motion_renorm", action="store_true",
-                        help="Per-frame rescale of warped current frames "
-                             "so their mean BGR over the overlap matches "
-                             "the baseline's, before diffing. Cancels "
-                             "global brightness/colour drift from camera "
-                             "auto-exposure. Composes with any "
+                             "try ~50 for edges, ~10 for chrominance, ~200 "
+                             "for pixel (+ renorm).")
+    parser.add_argument("--no_motion_renorm", action="store_true",
+                        help="Disable the per-frame brightness "
+                             "renormalization. Renormalization rescales "
+                             "warped current frames so their mean BGR "
+                             "over the overlap matches the baseline's, "
+                             "before diffing — cancels global brightness "
+                             "/ colour drift from camera auto-exposure. "
+                             "On by default; composes with any "
                              "--motion_method.")
     parser.add_argument("--motion_baseline_a", default=None,
                         help="Path to the camera-A baseline image (empty "
@@ -379,10 +386,14 @@ def main():
                         help="Path to the camera-B baseline image (empty "
                              "room). Must be provided together with "
                              "--motion_baseline_a.")
-    parser.add_argument("--motion_threshold", type=float, default=30,
-                        help="Per-pixel sum-of-|BGR diff| threshold above "
-                             "which a pixel is flagged as 'different from "
-                             "baseline'. Range 0-765. Default: 30.")
+    parser.add_argument("--motion_threshold", type=float, default=200,
+                        help="Per-pixel diff threshold above which a "
+                             "pixel is flagged as 'different from "
+                             "baseline'. Units depend on --motion_method "
+                             "(sum-of-|BGR diff| in 0-765 for pixel, "
+                             "Sobel-magnitude diff for edges, "
+                             "LAB-AB diff for chrominance). Default: 200 "
+                             "(tuned for pixel + renorm).")
     parser.add_argument("--motion_dilate", type=int, default=10,
                         help="Dilation radius for the motion mask in px. "
                              "Default: 10.")

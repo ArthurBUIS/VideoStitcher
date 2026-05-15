@@ -461,6 +461,11 @@ def run(args):
               f"(~{args.fg_recompute_seconds}s).")
 
     # --- Motion detection (baseline subtraction) --------------------------
+    # --motion and --motion_renorm are now ON by default; the CLI flags
+    # are inverted as --no_motion / --no_motion_renorm. Map back here so
+    # the rest of the code keeps reading the positive predicate.
+    args.motion = not bool(getattr(args, "no_motion", False))
+    args.motion_renorm = not bool(getattr(args, "no_motion_renorm", False))
     use_motion = bool(args.motion)
     motion_dilate_kernel = None
     # All motion-side baselines are stored already cropped to the
