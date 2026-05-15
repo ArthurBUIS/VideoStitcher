@@ -38,14 +38,19 @@ EDGE_PENALTY = 1e6
 def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
                              cost_ema_t, ema_alpha, person_mask_bbox_t,
                              fg_mask_bbox_t, fg_penalty, person_penalty,
-                             overlap_bbox):
+                             overlap_bbox,
+                             motion_mask_bbox_t=None, motion_penalty=0.0):
     """
     GPU cost + EMA + penalty injection.
 
     Penalty hierarchy (additive on cost_ema):
         photometric (0 - 1e5)
-        + fg_penalty (default 5e7) where fg_mask AND NOT person_mask
-        + person_penalty (default 1e8) where person_mask
+        + fg_penalty     where fg_mask     AND NOT person_mask
+        + motion_penalty where motion_mask AND NOT person_mask
+        + person_penalty where person_mask
+
+    motion_mask_bbox_t / motion_penalty default to inactive; pass them
+    only when --motion is enabled.
 
     Returns (updated cost_ema_t, cost_for_dp) — both GPU tensors. The
     caller is expected to (optionally) apply the edge-margin penalty on
@@ -73,21 +78,26 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
 
     cost_for_dp = cost_ema_t.clone()
 
-    # FG penalty first (lower priority), person second (higher).
-    # A pixel that's both gets the sum, but person (1e8) >> fg (5e7) so
-    # the effect is the same as taking the max.
+    # Apply lower-priority penalties first; person last (highest priority).
+    person_mask_bool = (person_mask_bbox_t > 0
+                        if person_mask_bbox_t is not None else None)
+
     if fg_mask_bbox_t is not None:
-        if person_mask_bbox_t is not None:
-            fg_only = fg_mask_bbox_t & (~person_mask_bbox_t)
-        else:
-            fg_only = fg_mask_bbox_t
-        cost_for_dp = torch.where(fg_only > 0,
-                                  cost_for_dp + fg_penalty,
-                                  cost_for_dp)
-    if person_mask_bbox_t is not None:
-        cost_for_dp = torch.where(person_mask_bbox_t > 0,
-                                  cost_for_dp + person_penalty,
-                                  cost_for_dp)
+        fg_bool = fg_mask_bbox_t > 0
+        fg_only = fg_bool & ~person_mask_bool if person_mask_bool is not None else fg_bool
+        cost_for_dp = torch.where(fg_only,
+                                  cost_for_dp + fg_penalty, cost_for_dp)
+
+    if motion_mask_bbox_t is not None:
+        motion_bool = motion_mask_bbox_t > 0
+        motion_only = (motion_bool & ~person_mask_bool
+                       if person_mask_bool is not None else motion_bool)
+        cost_for_dp = torch.where(motion_only,
+                                  cost_for_dp + motion_penalty, cost_for_dp)
+
+    if person_mask_bool is not None:
+        cost_for_dp = torch.where(person_mask_bool,
+                                  cost_for_dp + person_penalty, cost_for_dp)
 
     # Return cost_for_dp as a GPU tensor; the caller decides when to
     # downsample (cheap on GPU) and transfer to CPU. Keeping it on the

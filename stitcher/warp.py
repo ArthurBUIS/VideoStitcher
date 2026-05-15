@@ -143,10 +143,20 @@ def warp_mask_gpu(mask_t, grid_t):
 
 
 def dilate_gpu(mask_u8_t, radius):
-    """Binary dilation via max_pool2d. radius<=0 returns the mask unchanged."""
+    """
+    Binary dilation via max_pool2d. radius<=0 returns the mask unchanged.
+
+    Square-kernel dilation is separable: dilating horizontally then
+    vertically yields the same result as a single 2D pass, with work
+    proportional to 2*k instead of k*k. For typical radius=10 (kernel
+    21x21 = 441 vs 2*21 = 42 ops per pixel) that's a ~10x speed-up,
+    which materially helps the motion mask path where the same dilate
+    runs every frame on the bbox.
+    """
     if radius <= 0:
         return mask_u8_t
     k = 2 * radius + 1
     m = mask_u8_t.float().unsqueeze(0).unsqueeze(0)
-    dilated = F.max_pool2d(m, kernel_size=k, stride=1, padding=radius)
-    return dilated[0, 0].to(torch.uint8)
+    m = F.max_pool2d(m, kernel_size=(1, k), stride=1, padding=(0, radius))
+    m = F.max_pool2d(m, kernel_size=(k, 1), stride=1, padding=(radius, 0))
+    return m[0, 0].to(torch.uint8)

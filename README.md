@@ -21,6 +21,10 @@ implementation when it isn't.
   choice of YOLOv8 (fast, fixed COCO classes) or YOLOE (open-vocabulary,
   text-prompted; slower but more accurate). Tasks pick independently
   via `--person_model` and `--fg_model`.
+- **Motion detection via baseline subtraction** (opt-in via `--motion`):
+  flags anything different from a pre-recorded empty-room baseline,
+  catches "moved chair" / "object dropped" cases that pure semantic
+  segmentation misses.
 - **Multi-band Laplacian blending** around the seam for invisible
   transitions on the background.
 - **FPS-desync correction**: if the two input streams have different
