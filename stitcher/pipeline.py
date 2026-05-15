@@ -416,14 +416,22 @@ def run(args):
         # work on its own stream so the GPU can interleave kernels from
         # consecutive frames (composite N + compute N+1) instead of
         # serialising them on the default stream.
-        compute_stream = torch.cuda.Stream()
-        composite_stream = torch.cuda.Stream()
-        # YOLO worker also gets its own stream so the mask post-processing
-        # (warp + dilate + EMA) doesn't block the compute stream.
-        yolo_stream = torch.cuda.Stream()
-        # Motion worker (baseline subtraction) gets its own stream too;
-        # see motion_worker below.
-        motion_stream = torch.cuda.Stream()
+        # Stream priorities: in PyTorch CUDA, priority -1 is HIGH and 0
+        # is the (low) default. We mark the three critical-path streams
+        # (compute, composite, yolo) as high and leave motion at the
+        # default. That way when motion + YOLO have kernels queued on
+        # the GPU at the same time, the scheduler runs YOLO first
+        # instead of interleaving them at kernel granularity (which was
+        # tripling YOLO's effective inference time when motion fires
+        # every frame).
+        compute_stream = torch.cuda.Stream(priority=-1)
+        composite_stream = torch.cuda.Stream(priority=-1)
+        yolo_stream = torch.cuda.Stream(priority=-1)
+        # Motion worker is the only "background" stream — it can yield
+        # to anything else that has queued work, since the motion mask
+        # only needs to be ready a frame later for the next cost
+        # computation, not immediately.
+        motion_stream = torch.cuda.Stream(priority=0)
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
