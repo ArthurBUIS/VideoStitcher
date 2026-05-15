@@ -119,6 +119,78 @@ def crop_to_bbox_cpu(warped, overlap_bbox):
 
 
 # ---------------------------------------------------------------------------
+# Half-resolution helpers (motion mask runs at half the bbox res — see
+# pipeline.motion_worker). All per-frame diff / threshold / dilate work
+# moves from (H_bb, W_bb) to (H_bb/2, W_bb/2), which is ~4x cheaper.
+# Final motion mask is nearest-upsampled back to full bbox before the
+# AND with overlap_in_bbox_t. Block granularity in the cost map is 2px,
+# easily absorbed by motion_dilate's halo and seam_lambda's smoothing.
+# ---------------------------------------------------------------------------
+
+MOTION_DOWNSCALE = 2
+
+
+def downsample_image_half_gpu(image_bb_t):
+    """image_bb_t: (3, H_bb, W_bb) uint8 BGR. Returns (3, H/2, W/2)
+    uint8 via 2x2 avg_pool (box downsample)."""
+    out = F.avg_pool2d(
+        image_bb_t.float().unsqueeze(0),
+        kernel_size=MOTION_DOWNSCALE, stride=MOTION_DOWNSCALE,
+    )
+    return out[0].to(torch.uint8)
+
+
+def downsample_mask_half_gpu(mask_bb_t):
+    """mask_bb_t: (H_bb, W_bb) uint8 binary. Returns (H/2, W/2) uint8
+    via max_pool — conservative (any-set-in-2x2-block sets output)."""
+    out = F.max_pool2d(
+        mask_bb_t.float().unsqueeze(0).unsqueeze(0),
+        kernel_size=MOTION_DOWNSCALE, stride=MOTION_DOWNSCALE,
+    )
+    return out[0, 0].to(torch.uint8)
+
+
+def upsample_mask_to_bbox_gpu(mask_half_t, target_hw):
+    """Nearest-neighbor upsample of a half-res binary mask back to full
+    bbox. Returns (H_bb, W_bb) uint8."""
+    out = F.interpolate(
+        mask_half_t.unsqueeze(0).unsqueeze(0).float(),
+        size=target_hw, mode="nearest",
+    )
+    return out[0, 0].to(torch.uint8)
+
+
+def downsample_image_half_cpu(image_bb):
+    """image_bb: (H_bb, W_bb, 3) uint8. Returns (H/2, W/2, 3)."""
+    return cv2.resize(
+        image_bb,
+        (image_bb.shape[1] // MOTION_DOWNSCALE,
+         image_bb.shape[0] // MOTION_DOWNSCALE),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def downsample_mask_half_cpu(mask_bb):
+    """mask_bb: (H_bb, W_bb) uint8 binary. Returns (H/2, W/2)."""
+    # cv2 doesn't have a max-pool resize; INTER_NEAREST + dilate before
+    # would be exact but unnecessarily expensive. Use a max-pool via
+    # numpy: reshape into 2x2 blocks, take the max.
+    h, w = mask_bb.shape
+    h2 = (h // MOTION_DOWNSCALE) * MOTION_DOWNSCALE
+    w2 = (w // MOTION_DOWNSCALE) * MOTION_DOWNSCALE
+    mb = mask_bb[:h2, :w2]
+    return mb.reshape(h2 // MOTION_DOWNSCALE, MOTION_DOWNSCALE,
+                      w2 // MOTION_DOWNSCALE, MOTION_DOWNSCALE) \
+             .max(axis=(1, 3))
+
+
+def upsample_mask_to_bbox_cpu(mask_half, target_hw):
+    """Nearest upsample of half-res mask back to full bbox."""
+    th, tw = target_hw
+    return cv2.resize(mask_half, (tw, th), interpolation=cv2.INTER_NEAREST)
+
+
+# ---------------------------------------------------------------------------
 # Pixel-diff motion mask
 # ---------------------------------------------------------------------------
 

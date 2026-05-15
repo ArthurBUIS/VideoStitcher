@@ -110,6 +110,10 @@ from stitcher.motion import (
     compute_motion_mask_gpu_edges,
     crop_to_bbox_cpu,
     crop_to_bbox_gpu,
+    downsample_image_half_cpu,
+    downsample_image_half_gpu,
+    downsample_mask_half_cpu,
+    downsample_mask_half_gpu,
     grab_baseline_from_videos,
     load_baseline_images,
     precompute_baseline_ab_cpu,
@@ -118,6 +122,8 @@ from stitcher.motion import (
     renormalize_to_baseline_gpu,
     sobel_magnitude_cpu_bb,
     sobel_magnitude_gpu_bb,
+    upsample_mask_to_bbox_cpu,
+    upsample_mask_to_bbox_gpu,
     validate_baseline_shape,
 )
 from stitcher.seam import (
@@ -528,10 +534,10 @@ def run(args):
         )
 
         if dev["cuda_available"]:
-            # Warp both baselines through grid_pair_t (built at
-            # output_size) and immediately crop to the overlap bbox. The
-            # full-output warped baseline is discarded — every downstream
-            # per-frame helper works on bbox tensors.
+            # Warp both baselines through grid_pair_t, crop to the
+            # overlap bbox, then downsample bbox -> half-res. The
+            # per-frame motion diff runs at half-res to cut work ~4x;
+            # see motion_worker for the rest of the half-res path.
             full_baseline_a_t, full_baseline_b_t = warp_pair_gpu(
                 baseline_frame_a, baseline_frame_b,
                 grid_pair_t, gpu_ctx["device"],
@@ -541,6 +547,11 @@ def run(args):
                                                static["overlap_bbox"])
             baseline_b_bb_t = crop_to_bbox_gpu(full_baseline_b_t,
                                                static["overlap_bbox"])
+            # Half-res baselines + overlap mask (all per-frame work
+            # operates on these).
+            baseline_a_bb_t = downsample_image_half_gpu(baseline_a_bb_t)
+            baseline_b_bb_t = downsample_image_half_gpu(baseline_b_bb_t)
+            overlap_in_bbox_motion_t = downsample_mask_half_gpu(overlap_in_bbox_t)
             if args.motion_method == "edges":
                 baseline_grad_a_bb_t = sobel_magnitude_gpu_bb(baseline_a_bb_t)
                 baseline_grad_b_bb_t = sobel_magnitude_gpu_bb(baseline_b_bb_t)
@@ -549,10 +560,10 @@ def run(args):
                 baseline_ab_b_bb_t = precompute_baseline_ab_gpu(baseline_b_bb_t)
             if args.motion_renorm:
                 baseline_mean_a_t = compute_mean_in_overlap_gpu(
-                    baseline_a_bb_t, overlap_in_bbox_t,
+                    baseline_a_bb_t, overlap_in_bbox_motion_t,
                 )
                 baseline_mean_b_t = compute_mean_in_overlap_gpu(
-                    baseline_b_bb_t, overlap_in_bbox_t,
+                    baseline_b_bb_t, overlap_in_bbox_motion_t,
                 )
             del full_baseline_a_t, full_baseline_b_t
         else:
@@ -567,6 +578,12 @@ def run(args):
                                              static["overlap_bbox"])
             baseline_b_bb = crop_to_bbox_cpu(full_baseline_b,
                                              static["overlap_bbox"])
+            # Half-res baselines + overlap mask for the CPU motion path.
+            baseline_a_bb = downsample_image_half_cpu(baseline_a_bb)
+            baseline_b_bb = downsample_image_half_cpu(baseline_b_bb)
+            overlap_in_bbox_motion = downsample_mask_half_cpu(
+                static["overlap_in_bbox"]
+            )
             if args.motion_method == "edges":
                 baseline_grad_a_bb = sobel_magnitude_cpu_bb(baseline_a_bb)
                 baseline_grad_b_bb = sobel_magnitude_cpu_bb(baseline_b_bb)
@@ -575,15 +592,16 @@ def run(args):
                 baseline_ab_b_bb = precompute_baseline_ab_cpu(baseline_b_bb)
             if args.motion_renorm:
                 baseline_mean_a = compute_mean_in_overlap_cpu(
-                    baseline_a_bb, static["overlap_in_bbox"],
+                    baseline_a_bb, overlap_in_bbox_motion,
                 )
                 baseline_mean_b = compute_mean_in_overlap_cpu(
-                    baseline_b_bb, static["overlap_in_bbox"],
+                    baseline_b_bb, overlap_in_bbox_motion,
                 )
         print(f"[info] Motion: method={args.motion_method} "
               f"renorm={args.motion_renorm} "
               f"threshold={args.motion_threshold} "
-              f"dilate={args.motion_dilate} penalty={args.motion_penalty:g}")
+              f"dilate={args.motion_dilate} penalty={args.motion_penalty:g}  "
+              f"(running at 1/{2}-res inside the bbox)")
 
     W, H = output_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
@@ -1097,6 +1115,11 @@ def run(args):
                     if item is SENTINEL:
                         return
 
+                    # Dilate radius is halved on the half-res grid so the
+                    # mask grows to the same effective px on the final
+                    # bbox after nearest upsample (10px -> 5px @ half-res
+                    # -> 10px footprint after 2x nearest upsample).
+                    half_dilate_radius = max(1, args.motion_dilate // 2)
                     if dev["cuda_available"]:
                         wa_full_t, wb_full_t, warp_event = item
                         if warp_event is not None:
@@ -1105,34 +1128,43 @@ def run(args):
                                                    static["overlap_bbox"])
                         wb_bb_t = crop_to_bbox_gpu(wb_full_t,
                                                    static["overlap_bbox"])
+                        # Drop to half-res for the diff + dilate.
+                        wa_bb_t = downsample_image_half_gpu(wa_bb_t)
+                        wb_bb_t = downsample_image_half_gpu(wb_bb_t)
                         if args.motion_renorm:
                             wa_bb_t = renormalize_to_baseline_gpu(
-                                wa_bb_t, baseline_mean_a_t, overlap_in_bbox_t,
+                                wa_bb_t, baseline_mean_a_t,
+                                overlap_in_bbox_motion_t,
                             )
                             wb_bb_t = renormalize_to_baseline_gpu(
-                                wb_bb_t, baseline_mean_b_t, overlap_in_bbox_t,
+                                wb_bb_t, baseline_mean_b_t,
+                                overlap_in_bbox_motion_t,
                             )
                         if args.motion_method == "edges":
-                            motion_bb_t = compute_motion_mask_gpu_edges(
+                            motion_half_t = compute_motion_mask_gpu_edges(
                                 wa_bb_t, wb_bb_t,
                                 baseline_grad_a_bb_t, baseline_grad_b_bb_t,
-                                args.motion_threshold, args.motion_dilate,
-                                overlap_in_bbox_t,
+                                args.motion_threshold, half_dilate_radius,
+                                overlap_in_bbox_motion_t,
                             )
                         elif args.motion_method == "chrominance":
-                            motion_bb_t = compute_motion_mask_gpu_chrominance(
+                            motion_half_t = compute_motion_mask_gpu_chrominance(
                                 wa_bb_t, wb_bb_t,
                                 baseline_ab_a_bb_t, baseline_ab_b_bb_t,
-                                args.motion_threshold, args.motion_dilate,
-                                overlap_in_bbox_t,
+                                args.motion_threshold, half_dilate_radius,
+                                overlap_in_bbox_motion_t,
                             )
                         else:  # "pixel"
-                            motion_bb_t = compute_motion_mask_gpu(
+                            motion_half_t = compute_motion_mask_gpu(
                                 wa_bb_t, wb_bb_t,
                                 baseline_a_bb_t, baseline_b_bb_t,
-                                args.motion_threshold, args.motion_dilate,
-                                overlap_in_bbox_t,
+                                args.motion_threshold, half_dilate_radius,
+                                overlap_in_bbox_motion_t,
                             )
+                        # Back up to full bbox res via nearest upsample.
+                        motion_bb_t = upsample_mask_to_bbox_gpu(
+                            motion_half_t, overlap_in_bbox_t.shape,
+                        )
                         motion_cpu = (motion_bb_t.cpu().numpy()
                                       if args.debug_mask else None)
                         ready_event = torch.cuda.Event()
@@ -1149,36 +1181,50 @@ def run(args):
                                                  static["overlap_bbox"])
                         wb_bb = crop_to_bbox_cpu(wb_full,
                                                  static["overlap_bbox"])
+                        wa_bb = downsample_image_half_cpu(wa_bb)
+                        wb_bb = downsample_image_half_cpu(wb_bb)
                         if args.motion_renorm:
                             wa_bb = renormalize_to_baseline_cpu(
                                 wa_bb, baseline_mean_a,
-                                static["overlap_in_bbox"],
+                                overlap_in_bbox_motion,
                             )
                             wb_bb = renormalize_to_baseline_cpu(
                                 wb_bb, baseline_mean_b,
-                                static["overlap_in_bbox"],
+                                overlap_in_bbox_motion,
                             )
+                        # Build a half-res dilate kernel for the CPU path.
+                        if args.motion_dilate > 0:
+                            half_motion_dilate_kernel = cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (2 * half_dilate_radius + 1,
+                                 2 * half_dilate_radius + 1),
+                            )
+                        else:
+                            half_motion_dilate_kernel = None
                         if args.motion_method == "edges":
-                            motion_bb = compute_motion_mask_cpu_edges(
+                            motion_half = compute_motion_mask_cpu_edges(
                                 wa_bb, wb_bb,
                                 baseline_grad_a_bb, baseline_grad_b_bb,
-                                args.motion_threshold, motion_dilate_kernel,
-                                static["overlap_in_bbox"],
+                                args.motion_threshold, half_motion_dilate_kernel,
+                                overlap_in_bbox_motion,
                             )
                         elif args.motion_method == "chrominance":
-                            motion_bb = compute_motion_mask_cpu_chrominance(
+                            motion_half = compute_motion_mask_cpu_chrominance(
                                 wa_bb, wb_bb,
                                 baseline_ab_a_bb, baseline_ab_b_bb,
-                                args.motion_threshold, motion_dilate_kernel,
-                                static["overlap_in_bbox"],
+                                args.motion_threshold, half_motion_dilate_kernel,
+                                overlap_in_bbox_motion,
                             )
                         else:  # "pixel"
-                            motion_bb = compute_motion_mask_cpu(
+                            motion_half = compute_motion_mask_cpu(
                                 wa_bb, wb_bb,
                                 baseline_a_bb, baseline_b_bb,
-                                args.motion_threshold, motion_dilate_kernel,
-                                static["overlap_in_bbox"],
+                                args.motion_threshold, half_motion_dilate_kernel,
+                                overlap_in_bbox_motion,
                             )
+                        motion_bb = upsample_mask_to_bbox_cpu(
+                            motion_half, static["overlap_in_bbox"].shape,
+                        )
                         new_holder = {
                             "motion_mask_bbox_t": None,
                             "motion_mask_bbox": motion_bb,
