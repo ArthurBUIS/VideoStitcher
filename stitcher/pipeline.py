@@ -108,14 +108,16 @@ from stitcher.motion import (
     compute_motion_mask_gpu,
     compute_motion_mask_gpu_chrominance,
     compute_motion_mask_gpu_edges,
+    crop_to_bbox_cpu,
+    crop_to_bbox_gpu,
     grab_baseline_from_videos,
     load_baseline_images,
     precompute_baseline_ab_cpu,
     precompute_baseline_ab_gpu,
     renormalize_to_baseline_cpu,
     renormalize_to_baseline_gpu,
-    sobel_magnitude_cpu,
-    sobel_magnitude_gpu,
+    sobel_magnitude_cpu_bb,
+    sobel_magnitude_gpu_bb,
     validate_baseline_shape,
 )
 from stitcher.seam import (
@@ -419,6 +421,9 @@ def run(args):
         # YOLO worker also gets its own stream so the mask post-processing
         # (warp + dilate + EMA) doesn't block the compute stream.
         yolo_stream = torch.cuda.Stream()
+        # Motion worker (baseline subtraction) gets its own stream too;
+        # see motion_worker below.
+        motion_stream = torch.cuda.Stream()
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
 
     # --- Static foreground mask (segmentation-based) -----------------------
@@ -458,22 +463,26 @@ def run(args):
     # --- Motion detection (baseline subtraction) --------------------------
     use_motion = bool(args.motion)
     motion_dilate_kernel = None
-    baseline_warped_a_t = None   # GPU pixel-method baseline
-    baseline_warped_b_t = None
-    baseline_warped_a = None     # CPU pixel-method baseline
-    baseline_warped_b = None
-    baseline_grad_a_t = None     # GPU edge-method baseline (precomputed)
-    baseline_grad_b_t = None
-    baseline_grad_a = None       # CPU edge-method baseline (precomputed)
-    baseline_grad_b = None
-    baseline_mean_a_t = None     # GPU renorm baseline mean BGR
+    # All motion-side baselines are stored already cropped to the
+    # overlap bbox — the per-frame mask helpers operate on bbox-cropped
+    # tensors (see stitcher.motion), so cropping once at startup
+    # eliminates a slice per frame on the hot path.
+    baseline_a_bb_t = None       # GPU pixel-method baseline (3, H_bb, W_bb)
+    baseline_b_bb_t = None
+    baseline_a_bb = None         # CPU pixel-method baseline (H_bb, W_bb, 3)
+    baseline_b_bb = None
+    baseline_grad_a_bb_t = None  # GPU edge-method baseline (H_bb, W_bb) float
+    baseline_grad_b_bb_t = None
+    baseline_grad_a_bb = None    # CPU edge-method baseline (H_bb, W_bb) float
+    baseline_grad_b_bb = None
+    baseline_mean_a_t = None     # GPU renorm baseline mean BGR (3,)
     baseline_mean_b_t = None
-    baseline_mean_a = None       # CPU renorm baseline mean BGR
+    baseline_mean_a = None       # CPU renorm baseline mean BGR (3,)
     baseline_mean_b = None
-    baseline_ab_a_t = None       # GPU chrominance baseline (LAB AB)
-    baseline_ab_b_t = None
-    baseline_ab_a = None         # CPU chrominance baseline (LAB AB)
-    baseline_ab_b = None
+    baseline_ab_a_bb_t = None    # GPU chrominance baseline (2, H_bb, W_bb)
+    baseline_ab_b_bb_t = None
+    baseline_ab_a_bb = None      # CPU chrominance baseline (H_bb, W_bb, 2)
+    baseline_ab_b_bb = None
     if use_motion:
         paths_a = args.motion_baseline_a
         paths_b = args.motion_baseline_b
@@ -506,50 +515,57 @@ def run(args):
         )
 
         if dev["cuda_available"]:
-            # Batched warp through grid_pair_t (built at output_size, so
-            # the warped baselines share the per-frame warped shape).
-            baseline_warped_a_t, baseline_warped_b_t = warp_pair_gpu(
+            # Warp both baselines through grid_pair_t (built at
+            # output_size) and immediately crop to the overlap bbox. The
+            # full-output warped baseline is discarded — every downstream
+            # per-frame helper works on bbox tensors.
+            full_baseline_a_t, full_baseline_b_t = warp_pair_gpu(
                 baseline_frame_a, baseline_frame_b,
                 grid_pair_t, gpu_ctx["device"],
                 gain_a_t=gain_a_t, gain_b_t=gain_b_t,
             )
+            baseline_a_bb_t = crop_to_bbox_gpu(full_baseline_a_t,
+                                               static["overlap_bbox"])
+            baseline_b_bb_t = crop_to_bbox_gpu(full_baseline_b_t,
+                                               static["overlap_bbox"])
             if args.motion_method == "edges":
-                baseline_grad_a_t = sobel_magnitude_gpu(baseline_warped_a_t)
-                baseline_grad_b_t = sobel_magnitude_gpu(baseline_warped_b_t)
+                baseline_grad_a_bb_t = sobel_magnitude_gpu_bb(baseline_a_bb_t)
+                baseline_grad_b_bb_t = sobel_magnitude_gpu_bb(baseline_b_bb_t)
             elif args.motion_method == "chrominance":
-                baseline_ab_a_t = precompute_baseline_ab_gpu(baseline_warped_a_t)
-                baseline_ab_b_t = precompute_baseline_ab_gpu(baseline_warped_b_t)
+                baseline_ab_a_bb_t = precompute_baseline_ab_gpu(baseline_a_bb_t)
+                baseline_ab_b_bb_t = precompute_baseline_ab_gpu(baseline_b_bb_t)
             if args.motion_renorm:
                 baseline_mean_a_t = compute_mean_in_overlap_gpu(
-                    baseline_warped_a_t, static["overlap_bbox"],
-                    overlap_in_bbox_t,
+                    baseline_a_bb_t, overlap_in_bbox_t,
                 )
                 baseline_mean_b_t = compute_mean_in_overlap_gpu(
-                    baseline_warped_b_t, static["overlap_bbox"],
-                    overlap_in_bbox_t,
+                    baseline_b_bb_t, overlap_in_bbox_t,
                 )
+            del full_baseline_a_t, full_baseline_b_t
         else:
             if lut_a is not None:
                 baseline_frame_a = apply_gain_lut(baseline_frame_a, lut_a)
                 baseline_frame_b = apply_gain_lut(baseline_frame_b, lut_b)
-            baseline_warped_a = cv2.remap(baseline_frame_a, map_ax, map_ay,
-                                          cv2.INTER_LINEAR)
-            baseline_warped_b = cv2.remap(baseline_frame_b, map_bx, map_by,
-                                          cv2.INTER_LINEAR)
+            full_baseline_a = cv2.remap(baseline_frame_a, map_ax, map_ay,
+                                        cv2.INTER_LINEAR)
+            full_baseline_b = cv2.remap(baseline_frame_b, map_bx, map_by,
+                                        cv2.INTER_LINEAR)
+            baseline_a_bb = crop_to_bbox_cpu(full_baseline_a,
+                                             static["overlap_bbox"])
+            baseline_b_bb = crop_to_bbox_cpu(full_baseline_b,
+                                             static["overlap_bbox"])
             if args.motion_method == "edges":
-                baseline_grad_a = sobel_magnitude_cpu(baseline_warped_a)
-                baseline_grad_b = sobel_magnitude_cpu(baseline_warped_b)
+                baseline_grad_a_bb = sobel_magnitude_cpu_bb(baseline_a_bb)
+                baseline_grad_b_bb = sobel_magnitude_cpu_bb(baseline_b_bb)
             elif args.motion_method == "chrominance":
-                baseline_ab_a = precompute_baseline_ab_cpu(baseline_warped_a)
-                baseline_ab_b = precompute_baseline_ab_cpu(baseline_warped_b)
+                baseline_ab_a_bb = precompute_baseline_ab_cpu(baseline_a_bb)
+                baseline_ab_b_bb = precompute_baseline_ab_cpu(baseline_b_bb)
             if args.motion_renorm:
                 baseline_mean_a = compute_mean_in_overlap_cpu(
-                    baseline_warped_a, static["overlap_bbox"],
-                    static["overlap_in_bbox"],
+                    baseline_a_bb, static["overlap_in_bbox"],
                 )
                 baseline_mean_b = compute_mean_in_overlap_cpu(
-                    baseline_warped_b, static["overlap_bbox"],
-                    static["overlap_in_bbox"],
+                    baseline_b_bb, static["overlap_in_bbox"],
                 )
         print(f"[info] Motion: method={args.motion_method} "
               f"renorm={args.motion_renorm} "
@@ -573,6 +589,16 @@ def run(args):
     mask_lock = threading.Lock()
     mask_holder = [None]
     yolo_q = queue.Queue(maxsize=1)
+
+    # Async motion handoff: the motion_worker (only spawned when
+    # --motion is set) takes warped tensors + an event recorded at end
+    # of warp on compute_stream, computes the bbox motion mask on its
+    # own stream, and publishes the result here. compute_one reads the
+    # latest published mask; it is from the PREVIOUS frame (1-frame
+    # lag), which at 25+ fps is invisible compared to dilate_radius.
+    motion_mask_lock = threading.Lock()
+    motion_mask_holder = [None]
+    motion_q = queue.Queue(maxsize=1)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, output_size)
@@ -642,6 +668,25 @@ def run(args):
             warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
             warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
 
+        # Async motion: submit this frame's warped tensors to the motion
+        # worker (best-effort — if its queue is full, the worker is
+        # still busy with the previous request and we just keep using
+        # the last published mask). For GPU we also hand it an event
+        # recorded right after warp so the worker's stream can wait on
+        # it without a host stall.
+        if use_motion:
+            try:
+                if dev["cuda_available"]:
+                    warp_done_event = torch.cuda.Event()
+                    warp_done_event.record()
+                    motion_q.put_nowait(
+                        (warped_a_t, warped_b_t, warp_done_event)
+                    )
+                else:
+                    motion_q.put_nowait((warped_a, warped_b))
+            except queue.Full:
+                pass
+
         # Async YOLO: submit a request when it's time, then continue with
         # whichever mask is currently published. The first few frames
         # before YOLO has produced anything see latest_mask = None and
@@ -671,84 +716,27 @@ def run(args):
             if args.debug_mask:
                 person_for_debug = latest_mask.get("person_mask_cpu")
 
-        # Motion mask (baseline subtraction). Recomputed every frame;
-        # reuses the already-warped current frames, so the marginal cost
-        # is just the diff + threshold + dilate. Method picks between
-        # pixel diff (raw |current - baseline|) and edge diff
-        # (Sobel-magnitude diff, robust to brightness drift).
-        # --motion_renorm rescales current frames' mean to match the
-        # baseline before diffing, cancelling global brightness drift.
+        # Motion mask comes from the async motion_worker. Read the most
+        # recent published mask (it's from frame N-1 by construction);
+        # for the first frame or two before the worker has anything to
+        # publish, the holder is None and the seam runs without a
+        # motion penalty — same warm-up pattern as the YOLO mask.
         motion_mask_bbox_t = None
         motion_mask_bbox = None
+        motion_for_debug = None
         if use_motion:
-            if dev["cuda_available"]:
-                wa_motion_t = warped_a_t
-                wb_motion_t = warped_b_t
-                if args.motion_renorm:
-                    wa_motion_t = renormalize_to_baseline_gpu(
-                        warped_a_t, baseline_mean_a_t,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-                    wb_motion_t = renormalize_to_baseline_gpu(
-                        warped_b_t, baseline_mean_b_t,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-                if args.motion_method == "edges":
-                    motion_mask_bbox_t = compute_motion_mask_gpu_edges(
-                        wa_motion_t, wb_motion_t,
-                        baseline_grad_a_t, baseline_grad_b_t,
-                        args.motion_threshold, args.motion_dilate,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-                elif args.motion_method == "chrominance":
-                    motion_mask_bbox_t = compute_motion_mask_gpu_chrominance(
-                        wa_motion_t, wb_motion_t,
-                        baseline_ab_a_t, baseline_ab_b_t,
-                        args.motion_threshold, args.motion_dilate,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-                else:  # "pixel"
-                    motion_mask_bbox_t = compute_motion_mask_gpu(
-                        wa_motion_t, wb_motion_t,
-                        baseline_warped_a_t, baseline_warped_b_t,
-                        args.motion_threshold, args.motion_dilate,
-                        static["overlap_bbox"], overlap_in_bbox_t,
-                    )
-            else:
-                wa_motion = warped_a
-                wb_motion = warped_b
-                if args.motion_renorm:
-                    wa_motion = renormalize_to_baseline_cpu(
-                        warped_a, baseline_mean_a,
-                        static["overlap_bbox"],
-                        static["overlap_in_bbox"],
-                    )
-                    wb_motion = renormalize_to_baseline_cpu(
-                        warped_b, baseline_mean_b,
-                        static["overlap_bbox"],
-                        static["overlap_in_bbox"],
-                    )
-                if args.motion_method == "edges":
-                    motion_mask_bbox = compute_motion_mask_cpu_edges(
-                        wa_motion, wb_motion,
-                        baseline_grad_a, baseline_grad_b,
-                        args.motion_threshold, motion_dilate_kernel,
-                        static["overlap_bbox"], static["overlap_in_bbox"],
-                    )
-                elif args.motion_method == "chrominance":
-                    motion_mask_bbox = compute_motion_mask_cpu_chrominance(
-                        wa_motion, wb_motion,
-                        baseline_ab_a, baseline_ab_b,
-                        args.motion_threshold, motion_dilate_kernel,
-                        static["overlap_bbox"], static["overlap_in_bbox"],
-                    )
-                else:  # "pixel"
-                    motion_mask_bbox = compute_motion_mask_cpu(
-                        wa_motion, wb_motion,
-                        baseline_warped_a, baseline_warped_b,
-                        args.motion_threshold, motion_dilate_kernel,
-                        static["overlap_bbox"], static["overlap_in_bbox"],
-                    )
+            with motion_mask_lock:
+                latest_motion = motion_mask_holder[0]
+            if latest_motion is not None:
+                if dev["cuda_available"]:
+                    ev = latest_motion.get("ready_event")
+                    if ev is not None:
+                        ev.wait()
+                    motion_mask_bbox_t = latest_motion["motion_mask_bbox_t"]
+                else:
+                    motion_mask_bbox = latest_motion["motion_mask_bbox"]
+                if args.debug_mask:
+                    motion_for_debug = latest_motion.get("motion_mask_cpu")
 
         ds = max(1, args.seam_downscale)
 
@@ -826,23 +814,17 @@ def run(args):
         seam_prev_small = seam_x_small.copy()
         seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
 
-        # Snapshot the FG / motion masks for the debug overlay (composite
-        # stage may run a frame later, so we capture the version that's
-        # current for THIS frame here). person_for_debug was already set
-        # above when we read mask_holder.
+        # Snapshot the FG mask for the debug overlay (composite stage
+        # may run a frame later, so we capture the version that's
+        # current for THIS frame here). person_for_debug and
+        # motion_for_debug were already set above when we read their
+        # respective holders.
         fg_for_debug = None
-        motion_for_debug = None
-        if args.debug_mask:
-            if use_fg:
-                if fg_mask_bbox_t is not None:
-                    fg_for_debug = fg_mask_bbox_t.cpu().numpy()
-                elif fg_mask_bbox is not None:
-                    fg_for_debug = fg_mask_bbox
-            if use_motion:
-                if motion_mask_bbox_t is not None:
-                    motion_for_debug = motion_mask_bbox_t.cpu().numpy()
-                elif motion_mask_bbox is not None:
-                    motion_for_debug = motion_mask_bbox
+        if args.debug_mask and use_fg:
+            if fg_mask_bbox_t is not None:
+                fg_for_debug = fg_mask_bbox_t.cpu().numpy()
+            elif fg_mask_bbox is not None:
+                fg_for_debug = fg_mask_bbox
 
         # Record an event on the current (compute) stream so the composite
         # stage's stream can wait on it before reading our output tensors.
@@ -1075,6 +1057,129 @@ def run(args):
         except Exception as e:
             worker_error[0] = e
 
+    def motion_worker():
+        """Pull (warped_a_t, warped_b_t, warp_done_event) off motion_q,
+        compute the bbox-cropped motion mask on motion_stream, and
+        publish to motion_mask_holder.
+
+        Running here on its own CUDA stream so the diff / threshold /
+        dilate kernels can interleave with the compute and composite
+        streams, and so the host time spent in compute_one for the
+        motion path drops to a queue-put + a holder-read.
+
+        The published mask is from the previous frame (compute_one
+        submits frame N's warped tensors but reads what was published
+        for frame N-1); at 25+ fps the one-frame lag is well below the
+        motion_dilate radius that already absorbs sub-pixel jitter.
+        """
+        stream_ctx = (
+            torch.cuda.stream(motion_stream)
+            if dev["cuda_available"]
+            else _nullcontext()
+        )
+        try:
+            with stream_ctx:
+                while True:
+                    item = motion_q.get()
+                    if item is SENTINEL:
+                        return
+
+                    if dev["cuda_available"]:
+                        wa_full_t, wb_full_t, warp_event = item
+                        if warp_event is not None:
+                            warp_event.wait()
+                        wa_bb_t = crop_to_bbox_gpu(wa_full_t,
+                                                   static["overlap_bbox"])
+                        wb_bb_t = crop_to_bbox_gpu(wb_full_t,
+                                                   static["overlap_bbox"])
+                        if args.motion_renorm:
+                            wa_bb_t = renormalize_to_baseline_gpu(
+                                wa_bb_t, baseline_mean_a_t, overlap_in_bbox_t,
+                            )
+                            wb_bb_t = renormalize_to_baseline_gpu(
+                                wb_bb_t, baseline_mean_b_t, overlap_in_bbox_t,
+                            )
+                        if args.motion_method == "edges":
+                            motion_bb_t = compute_motion_mask_gpu_edges(
+                                wa_bb_t, wb_bb_t,
+                                baseline_grad_a_bb_t, baseline_grad_b_bb_t,
+                                args.motion_threshold, args.motion_dilate,
+                                overlap_in_bbox_t,
+                            )
+                        elif args.motion_method == "chrominance":
+                            motion_bb_t = compute_motion_mask_gpu_chrominance(
+                                wa_bb_t, wb_bb_t,
+                                baseline_ab_a_bb_t, baseline_ab_b_bb_t,
+                                args.motion_threshold, args.motion_dilate,
+                                overlap_in_bbox_t,
+                            )
+                        else:  # "pixel"
+                            motion_bb_t = compute_motion_mask_gpu(
+                                wa_bb_t, wb_bb_t,
+                                baseline_a_bb_t, baseline_b_bb_t,
+                                args.motion_threshold, args.motion_dilate,
+                                overlap_in_bbox_t,
+                            )
+                        motion_cpu = (motion_bb_t.cpu().numpy()
+                                      if args.debug_mask else None)
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "motion_mask_bbox_t": motion_bb_t,
+                            "motion_mask_bbox": None,
+                            "motion_mask_cpu": motion_cpu,
+                            "ready_event": ready_event,
+                        }
+                    else:
+                        wa_full, wb_full = item
+                        wa_bb = crop_to_bbox_cpu(wa_full,
+                                                 static["overlap_bbox"])
+                        wb_bb = crop_to_bbox_cpu(wb_full,
+                                                 static["overlap_bbox"])
+                        if args.motion_renorm:
+                            wa_bb = renormalize_to_baseline_cpu(
+                                wa_bb, baseline_mean_a,
+                                static["overlap_in_bbox"],
+                            )
+                            wb_bb = renormalize_to_baseline_cpu(
+                                wb_bb, baseline_mean_b,
+                                static["overlap_in_bbox"],
+                            )
+                        if args.motion_method == "edges":
+                            motion_bb = compute_motion_mask_cpu_edges(
+                                wa_bb, wb_bb,
+                                baseline_grad_a_bb, baseline_grad_b_bb,
+                                args.motion_threshold, motion_dilate_kernel,
+                                static["overlap_in_bbox"],
+                            )
+                        elif args.motion_method == "chrominance":
+                            motion_bb = compute_motion_mask_cpu_chrominance(
+                                wa_bb, wb_bb,
+                                baseline_ab_a_bb, baseline_ab_b_bb,
+                                args.motion_threshold, motion_dilate_kernel,
+                                static["overlap_in_bbox"],
+                            )
+                        else:  # "pixel"
+                            motion_bb = compute_motion_mask_cpu(
+                                wa_bb, wb_bb,
+                                baseline_a_bb, baseline_b_bb,
+                                args.motion_threshold, motion_dilate_kernel,
+                                static["overlap_in_bbox"],
+                            )
+                        new_holder = {
+                            "motion_mask_bbox_t": None,
+                            "motion_mask_bbox": motion_bb,
+                            "motion_mask_cpu": (
+                                motion_bb if args.debug_mask else None
+                            ),
+                            "ready_event": None,
+                        }
+
+                    with motion_mask_lock:
+                        motion_mask_holder[0] = new_holder
+        except Exception as e:
+            worker_error[0] = e
+
     def compute_worker():
         # Pin this thread's CUDA stream so every CUDA op in compute_one
         # runs on compute_stream and can overlap with composite_stream.
@@ -1159,9 +1264,19 @@ def run(args):
     yolo_thread = threading.Thread(
         target=yolo_worker, name="yolo", daemon=True,
     )
+    # Motion worker is only spawned when --motion is set; otherwise the
+    # thread, its stream, and the queue are all idle so there's no
+    # point paying for them.
+    motion_thread = None
+    if use_motion:
+        motion_thread = threading.Thread(
+            target=motion_worker, name="motion", daemon=True,
+        )
     compute_thread.start()
     composite_thread.start()
     yolo_thread.start()
+    if motion_thread is not None:
+        motion_thread.start()
 
     def profile_printer():
         # Rolling print every args.profile_interval seconds until shutdown.
@@ -1206,6 +1321,9 @@ def run(args):
         composite_thread.join()
         yolo_q.put(SENTINEL)
         yolo_thread.join()
+        if motion_thread is not None:
+            motion_q.put(SENTINEL)
+            motion_thread.join()
         prof_stop.set()
         if profile_thread is not None:
             profile_thread.join()

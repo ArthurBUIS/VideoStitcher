@@ -3,18 +3,30 @@ Motion detection via baseline subtraction.
 
 For fixed cameras, the "is something different from the empty room"
 signal is built from a per-camera diff against a baseline frame,
-OR'd, thresholded, dilated. Two diff strategies:
+OR'd, thresholded, dilated. Three diff strategies:
 
-    * pixel : raw |current - baseline| on BGR. Cheap but sensitive
-              to camera auto-exposure / auto-white-balance drift.
-    * edges : |Sobel(current) - Sobel(baseline)| on grayscale.
-              Robust to drift since edges depend on relative
-              contrasts within a neighborhood, not absolute pixel
-              values.
+    * pixel       : raw |current - baseline| on BGR. Cheap but sensitive
+                    to camera auto-exposure / auto-white-balance drift.
+    * edges       : |Sobel(current) - Sobel(baseline)| on grayscale.
+                    Robust to drift since edges depend on relative
+                    contrasts within a 3x3 neighborhood, not absolute
+                    pixel values.
+    * chrominance : |LAB_AB(current) - LAB_AB(baseline)|, dropping the
+                    L (lightness) channel. Robust to brightness drift,
+                    not to true white-balance drift.
 
 The motion mask is fed into the cost map as an additive penalty,
 parallel to fg_mask, gated only by the person mask (so motion never
 overrides person priority).
+
+Performance note: every per-frame helper here operates on
+bbox-cropped tensors (the overlap bbox is the only region whose
+motion mask the seam actually consumes). Baselines + baseline
+gradients + baseline LAB-AB are pre-cropped to the bbox once at
+startup; per frame the warped tensors are sliced to the bbox by the
+caller (pipeline.compute_one) before being handed to any of these
+functions. On the GPU side this cuts the diff/threshold/dilate work
+from `output_H x output_W` down to `H_bbox x W_bbox`.
 
 Baseline acquisition:
     * If both --motion_baseline_a and --motion_baseline_b are given,
@@ -87,137 +99,147 @@ def validate_baseline_shape(frame_a, frame_b, baseline_a, baseline_b):
         )
 
 
-def compute_motion_mask_gpu(warped_a_t, warped_b_t,
-                            baseline_a_t, baseline_b_t,
-                            threshold, dilate_radius,
-                            overlap_bbox, overlap_in_bbox_t):
-    """
-    GPU motion mask. For each camera, compute the per-pixel sum-of-|BGR diff|
-    against its baseline; OR the two binary masks; dilate; crop to bbox;
-    AND with overlap shape.
+# ---------------------------------------------------------------------------
+# Bbox slicing helpers (pre-crop baselines once at startup; pipeline
+# slices warped frames per call before invoking the mask helpers below).
+# ---------------------------------------------------------------------------
 
-    warped_*_t and baseline_*_t: (1, 3, H, W) uint8 tensors on the same device.
-    threshold: scalar; sum-of-|BGR diff| above which a pixel is "moved".
+def crop_to_bbox_gpu(warped_t, overlap_bbox):
+    """warped_t: (1, 3, H, W). Returns (3, H_bb, W_bb) contiguous view-copy
+    over the overlap bbox. Channel-first because that's what the diff
+    helpers expect."""
+    x0, y0, x1, y1 = overlap_bbox
+    return warped_t[0, :, y0:y1, x0:x1].contiguous()
+
+
+def crop_to_bbox_cpu(warped, overlap_bbox):
+    """warped: (H, W, 3). Returns the bbox slice (no copy)."""
+    x0, y0, x1, y1 = overlap_bbox
+    return warped[y0:y1, x0:x1]
+
+
+# ---------------------------------------------------------------------------
+# Pixel-diff motion mask
+# ---------------------------------------------------------------------------
+
+def compute_motion_mask_gpu(wa_bb_t, wb_bb_t,
+                            ba_bb_t, bb_bb_t,
+                            threshold, dilate_radius,
+                            overlap_in_bbox_t):
+    """
+    GPU motion mask on bbox-cropped tensors. For each camera, compute
+    the per-pixel sum-of-|BGR diff| against its baseline; OR the two
+    binary masks; dilate; AND with the overlap shape.
+
+    Inputs: (3, H_bb, W_bb) uint8 tensors for the current warped + the
+    baseline-warped frames, all already cropped to the overlap bbox.
     Returns: (H_bb, W_bb) uint8 tensor (0 or 255).
     """
-    diff_a = (warped_a_t.float() - baseline_a_t.float()).abs().sum(dim=1)  # (1, H, W)
-    diff_b = (warped_b_t.float() - baseline_b_t.float()).abs().sum(dim=1)
-    motion = ((diff_a > threshold) | (diff_b > threshold))[0]  # (H, W) bool
+    diff_a = (wa_bb_t.float() - ba_bb_t.float()).abs().sum(dim=0)   # (H, W)
+    diff_b = (wb_bb_t.float() - bb_bb_t.float()).abs().sum(dim=0)
+    motion = (diff_a > threshold) | (diff_b > threshold)
     motion_u8 = motion.to(torch.uint8) * 255
     motion_u8 = dilate_gpu(motion_u8, dilate_radius)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox_t = motion_u8[y0:y1, x0:x1].contiguous()
-    motion_bbox_t = torch.where(overlap_in_bbox_t > 0,
-                                motion_bbox_t,
-                                torch.zeros_like(motion_bbox_t))
-    return motion_bbox_t
+    motion_u8 = torch.where(overlap_in_bbox_t > 0,
+                            motion_u8,
+                            torch.zeros_like(motion_u8))
+    return motion_u8
 
 
-def compute_motion_mask_cpu(warped_a, warped_b,
-                            baseline_a, baseline_b,
+def compute_motion_mask_cpu(wa_bb, wb_bb,
+                            ba_bb, bb_bb,
                             threshold, dilate_kernel,
-                            overlap_bbox, overlap_in_bbox):
+                            overlap_in_bbox):
     """
-    CPU motion mask, same logic via cv2.absdiff + numpy sum + threshold +
-    cv2.dilate.
-
-    Inputs: HxWx3 uint8 BGR numpy arrays (warped + gain-applied to match
-    the current-frame pipeline).
-    Returns: (H_bb, W_bb) uint8 numpy array (0 or 255).
+    CPU motion mask on bbox-cropped frames, same logic as the GPU path
+    via cv2.absdiff + numpy + cv2.dilate.
     """
-    diff_a = cv2.absdiff(warped_a, baseline_a)
-    diff_b = cv2.absdiff(warped_b, baseline_b)
+    diff_a = cv2.absdiff(wa_bb, ba_bb)
+    diff_b = cv2.absdiff(wb_bb, bb_bb)
     total_a = diff_a.astype(np.int32).sum(axis=2)
     total_b = diff_b.astype(np.int32).sum(axis=2)
     motion = ((total_a > threshold) | (total_b > threshold)).astype(np.uint8) * 255
     if dilate_kernel is not None:
         motion = cv2.dilate(motion, dilate_kernel)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox = motion[y0:y1, x0:x1].copy()
-    return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+    return cv2.bitwise_and(motion, overlap_in_bbox)
 
 
 # ---------------------------------------------------------------------------
 # Edge-based diff (Sobel gradient magnitude)
 # ---------------------------------------------------------------------------
 
-def _bgr_to_gray_gpu(frame_t):
-    """frame_t: (1, 3, H, W) uint8 BGR. Returns (1, 1, H, W) float gray
-    using the standard BGR weights (0.114, 0.587, 0.299)."""
-    return (0.114 * frame_t[:, 0:1].float()
-            + 0.587 * frame_t[:, 1:2].float()
-            + 0.299 * frame_t[:, 2:3].float())
+def _bgr_to_gray_gpu_bb(frame_bb_t):
+    """frame_bb_t: (3, H, W) uint8 BGR. Returns (1, 1, H, W) float gray."""
+    return (0.114 * frame_bb_t[0:1].float()
+            + 0.587 * frame_bb_t[1:2].float()
+            + 0.299 * frame_bb_t[2:3].float()).unsqueeze(0)
 
 
-def sobel_magnitude_gpu(frame_t):
+def sobel_magnitude_gpu_bb(frame_bb_t):
     """
-    Sobel L1 gradient magnitude (|Gx| + |Gy|) of a BGR frame on GPU.
+    Sobel L1 gradient magnitude (|Gx| + |Gy|) on a bbox-cropped BGR
+    frame on GPU.
 
-    frame_t: (1, 3, H, W) uint8.
-    Returns: (1, H, W) float32 tensor on the same device.
+    frame_bb_t: (3, H, W) uint8.
+    Returns: (H, W) float32 tensor.
     """
-    gray = _bgr_to_gray_gpu(frame_t)
+    gray = _bgr_to_gray_gpu_bb(frame_bb_t)
     device = gray.device
     kx = _SOBEL_X.to(device).view(1, 1, 3, 3)
     ky = _SOBEL_Y.to(device).view(1, 1, 3, 3)
     gx = F.conv2d(gray, kx, padding=1)
     gy = F.conv2d(gray, ky, padding=1)
-    return (gx.abs() + gy.abs())[0]  # (1, H, W)
+    return (gx.abs() + gy.abs())[0, 0]   # (H, W)
 
 
-def sobel_magnitude_cpu(frame_bgr):
-    """Sobel L1 gradient magnitude on CPU. Returns (H, W) float32."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+def sobel_magnitude_cpu_bb(frame_bb):
+    """Sobel L1 gradient magnitude on a bbox-cropped CPU BGR frame.
+    Returns (H, W) float32."""
+    gray = cv2.cvtColor(frame_bb, cv2.COLOR_BGR2GRAY)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     return np.abs(gx) + np.abs(gy)
 
 
-def compute_motion_mask_gpu_edges(warped_a_t, warped_b_t,
-                                  baseline_grad_a_t, baseline_grad_b_t,
+def compute_motion_mask_gpu_edges(wa_bb_t, wb_bb_t,
+                                  baseline_grad_a_bb_t, baseline_grad_b_bb_t,
                                   threshold, dilate_radius,
-                                  overlap_bbox, overlap_in_bbox_t):
+                                  overlap_in_bbox_t):
     """
-    Edge-based motion mask (GPU). |Sobel(current) - Sobel(baseline)|
-    thresholded per camera, OR'd, dilated, cropped to overlap bbox.
+    Edge-based motion mask (GPU) on bbox-cropped tensors.
+    |Sobel(current) - Sobel(baseline)| thresholded per camera, OR'd,
+    dilated, AND'd with the overlap shape.
 
-    Robust to brightness/color drift because edge magnitude only
-    depends on relative contrasts within a 3x3 neighborhood.
-
-    baseline_grad_*_t : precomputed (1, H, W) float Sobel magnitudes
-                        of the baseline frames (see sobel_magnitude_gpu).
+    baseline_grad_*_bb_t : precomputed (H_bb, W_bb) Sobel magnitudes of
+                          the bbox-cropped baseline frames (see
+                          sobel_magnitude_gpu_bb).
     """
-    grad_a = sobel_magnitude_gpu(warped_a_t)
-    grad_b = sobel_magnitude_gpu(warped_b_t)
-    diff_a = (grad_a - baseline_grad_a_t).abs()
-    diff_b = (grad_b - baseline_grad_b_t).abs()
-    motion = ((diff_a > threshold) | (diff_b > threshold))[0]   # (H, W)
+    grad_a = sobel_magnitude_gpu_bb(wa_bb_t)
+    grad_b = sobel_magnitude_gpu_bb(wb_bb_t)
+    diff_a = (grad_a - baseline_grad_a_bb_t).abs()
+    diff_b = (grad_b - baseline_grad_b_bb_t).abs()
+    motion = (diff_a > threshold) | (diff_b > threshold)
     motion_u8 = motion.to(torch.uint8) * 255
     motion_u8 = dilate_gpu(motion_u8, dilate_radius)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox_t = motion_u8[y0:y1, x0:x1].contiguous()
-    motion_bbox_t = torch.where(overlap_in_bbox_t > 0,
-                                motion_bbox_t,
-                                torch.zeros_like(motion_bbox_t))
-    return motion_bbox_t
+    motion_u8 = torch.where(overlap_in_bbox_t > 0,
+                            motion_u8,
+                            torch.zeros_like(motion_u8))
+    return motion_u8
 
 
-def compute_motion_mask_cpu_edges(warped_a, warped_b,
-                                  baseline_grad_a, baseline_grad_b,
+def compute_motion_mask_cpu_edges(wa_bb, wb_bb,
+                                  baseline_grad_a_bb, baseline_grad_b_bb,
                                   threshold, dilate_kernel,
-                                  overlap_bbox, overlap_in_bbox):
-    """CPU variant of compute_motion_mask_gpu_edges. baseline_grad_*
-    are precomputed (H, W) float32 Sobel magnitudes."""
-    grad_a = sobel_magnitude_cpu(warped_a)
-    grad_b = sobel_magnitude_cpu(warped_b)
-    diff_a = np.abs(grad_a - baseline_grad_a)
-    diff_b = np.abs(grad_b - baseline_grad_b)
+                                  overlap_in_bbox):
+    """CPU variant of compute_motion_mask_gpu_edges, bbox-cropped."""
+    grad_a = sobel_magnitude_cpu_bb(wa_bb)
+    grad_b = sobel_magnitude_cpu_bb(wb_bb)
+    diff_a = np.abs(grad_a - baseline_grad_a_bb)
+    diff_b = np.abs(grad_b - baseline_grad_b_bb)
     motion = ((diff_a > threshold) | (diff_b > threshold)).astype(np.uint8) * 255
     if dilate_kernel is not None:
         motion = cv2.dilate(motion, dilate_kernel)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox = motion[y0:y1, x0:x1].copy()
-    return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+    return cv2.bitwise_and(motion, overlap_in_bbox)
 
 
 # ---------------------------------------------------------------------------
@@ -231,45 +253,41 @@ def compute_motion_mask_cpu_edges(warped_a, warped_b,
 # baseline's, before the diff. Cancels global brightness/colour drift
 # but not spatial lighting changes. Compose with any motion_method.
 
-def compute_mean_in_overlap_gpu(warped_t, overlap_bbox, overlap_in_bbox_t):
-    """warped_t: (1, 3, H, W) uint8. Returns (3,) float tensor of mean BGR
-    over pixels where overlap_in_bbox_t > 0."""
-    x0, y0, x1, y1 = overlap_bbox
-    bb = warped_t[0, :, y0:y1, x0:x1].float()                # (3, H_bb, W_bb)
+def compute_mean_in_overlap_gpu(warped_bb_t, overlap_in_bbox_t):
+    """warped_bb_t: (3, H_bb, W_bb) uint8. Returns (3,) float tensor of
+    mean BGR over pixels where overlap_in_bbox_t > 0."""
+    bb = warped_bb_t.float()                                 # (3, H_bb, W_bb)
     mask = (overlap_in_bbox_t > 0).float()                   # (H_bb, W_bb)
     n = mask.sum().clamp(min=1.0)
     sums = (bb * mask.unsqueeze(0)).sum(dim=(1, 2))          # (3,)
     return sums / n
 
 
-def compute_mean_in_overlap_cpu(warped, overlap_bbox, overlap_in_bbox):
+def compute_mean_in_overlap_cpu(warped_bb, overlap_in_bbox):
     """CPU variant; uses cv2.mean for speed."""
-    x0, y0, x1, y1 = overlap_bbox
-    bb = warped[y0:y1, x0:x1]
-    return np.array(cv2.mean(bb, mask=overlap_in_bbox)[:3], dtype=np.float32)
+    return np.array(cv2.mean(warped_bb, mask=overlap_in_bbox)[:3],
+                    dtype=np.float32)
 
 
-def renormalize_to_baseline_gpu(warped_t, baseline_mean_t,
-                                overlap_bbox, overlap_in_bbox_t):
+def renormalize_to_baseline_gpu(warped_bb_t, baseline_mean_t,
+                                overlap_in_bbox_t):
     """
-    Per-channel rescale of warped_t so its mean over the overlap matches
-    baseline_mean_t. Returns a new (1, 3, H, W) uint8 tensor.
+    Per-channel rescale of the bbox-cropped warped frame so its mean
+    over the overlap matches baseline_mean_t. Returns a new
+    (3, H_bb, W_bb) uint8 tensor.
     """
     current_mean = compute_mean_in_overlap_gpu(
-        warped_t, overlap_bbox, overlap_in_bbox_t,
+        warped_bb_t, overlap_in_bbox_t,
     )
-    scale = (baseline_mean_t / current_mean.clamp(min=1.0)).view(1, 3, 1, 1)
-    return (warped_t.float() * scale).clamp(0, 255).to(torch.uint8)
+    scale = (baseline_mean_t / current_mean.clamp(min=1.0)).view(3, 1, 1)
+    return (warped_bb_t.float() * scale).clamp(0, 255).to(torch.uint8)
 
 
-def renormalize_to_baseline_cpu(warped, baseline_mean,
-                                overlap_bbox, overlap_in_bbox):
+def renormalize_to_baseline_cpu(warped_bb, baseline_mean, overlap_in_bbox):
     """CPU variant of renormalize_to_baseline_gpu."""
-    current_mean = compute_mean_in_overlap_cpu(
-        warped, overlap_bbox, overlap_in_bbox,
-    )
+    current_mean = compute_mean_in_overlap_cpu(warped_bb, overlap_in_bbox)
     scale = baseline_mean / np.maximum(current_mean, 1.0)
-    return np.clip(warped.astype(np.float32) * scale,
+    return np.clip(warped_bb.astype(np.float32) * scale,
                    0, 255).astype(np.uint8)
 
 
@@ -282,18 +300,18 @@ def renormalize_to_baseline_cpu(warped, baseline_mean,
 # Weaker than the edge method for cameras with white-balance drift,
 # since WB itself is a chrominance shift.
 
-def _bgr_to_ab_gpu(frame_t):
+def _bgr_to_ab_gpu_bb(frame_bb_t):
     """
-    BGR uint8 (1, 3, H, W) -> LAB A,B channels float (1, 2, H, W).
+    BGR uint8 (3, H, W) -> LAB A,B channels float (2, H, W).
 
     No direct cv2-style LAB conversion in PyTorch, so we approximate via
     BGR -> sRGB -> XYZ -> LAB on the GPU. Uses the standard D65 white.
     Slightly heavier than the pixel diff but still cheap.
     """
-    bgr = frame_t.float() / 255.0
-    b = bgr[:, 0:1]
-    g = bgr[:, 1:2]
-    r = bgr[:, 2:3]
+    bgr = frame_bb_t.float() / 255.0
+    b = bgr[0:1]
+    g = bgr[1:2]
+    r = bgr[2:3]
 
     # sRGB gamma (cheap linear approximation: skip the 2.4 power for
     # speed, since we only need to be consistent between current and
@@ -323,61 +341,56 @@ def _bgr_to_ab_gpu(frame_t):
     A = 500.0 * (_f(X) - fy)
     B = 200.0 * (fy - _f(Z))
 
-    return torch.cat([A, B], dim=1)  # (1, 2, H, W)
+    return torch.cat([A, B], dim=0)   # (2, H, W)
 
 
-def _bgr_to_ab_cpu(frame_bgr):
+def _bgr_to_ab_cpu_bb(frame_bb):
     """CPU variant: cv2.cvtColor BGR->LAB, return only A, B channels."""
-    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    return lab[:, :, 1:3]    # (H, W, 2)
+    lab = cv2.cvtColor(frame_bb, cv2.COLOR_BGR2LAB).astype(np.float32)
+    return lab[:, :, 1:3]
 
 
-def compute_motion_mask_gpu_chrominance(warped_a_t, warped_b_t,
-                                        baseline_ab_a_t, baseline_ab_b_t,
+def compute_motion_mask_gpu_chrominance(wa_bb_t, wb_bb_t,
+                                        baseline_ab_a_bb_t, baseline_ab_b_bb_t,
                                         threshold, dilate_radius,
-                                        overlap_bbox, overlap_in_bbox_t):
+                                        overlap_in_bbox_t):
     """
-    Chrominance-based motion mask (GPU). |LAB_AB(current) - LAB_AB(baseline)|
-    summed across the two chroma channels, thresholded per camera, OR'd,
-    dilated.
+    Chrominance-based motion mask (GPU) on bbox-cropped tensors.
 
-    baseline_ab_*_t : precomputed (1, 2, H, W) float A,B tensors.
+    baseline_ab_*_bb_t : precomputed (2, H_bb, W_bb) A,B tensors.
     """
-    ab_a = _bgr_to_ab_gpu(warped_a_t)            # (1, 2, H, W)
-    ab_b = _bgr_to_ab_gpu(warped_b_t)
-    diff_a = (ab_a - baseline_ab_a_t).abs().sum(dim=1)   # (1, H, W)
-    diff_b = (ab_b - baseline_ab_b_t).abs().sum(dim=1)
-    motion = ((diff_a > threshold) | (diff_b > threshold))[0]
+    ab_a = _bgr_to_ab_gpu_bb(wa_bb_t)
+    ab_b = _bgr_to_ab_gpu_bb(wb_bb_t)
+    diff_a = (ab_a - baseline_ab_a_bb_t).abs().sum(dim=0)   # (H, W)
+    diff_b = (ab_b - baseline_ab_b_bb_t).abs().sum(dim=0)
+    motion = (diff_a > threshold) | (diff_b > threshold)
     motion_u8 = motion.to(torch.uint8) * 255
     motion_u8 = dilate_gpu(motion_u8, dilate_radius)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox_t = motion_u8[y0:y1, x0:x1].contiguous()
-    motion_bbox_t = torch.where(overlap_in_bbox_t > 0,
-                                motion_bbox_t,
-                                torch.zeros_like(motion_bbox_t))
-    return motion_bbox_t
+    motion_u8 = torch.where(overlap_in_bbox_t > 0,
+                            motion_u8,
+                            torch.zeros_like(motion_u8))
+    return motion_u8
 
 
-def compute_motion_mask_cpu_chrominance(warped_a, warped_b,
-                                        baseline_ab_a, baseline_ab_b,
+def compute_motion_mask_cpu_chrominance(wa_bb, wb_bb,
+                                        baseline_ab_a_bb, baseline_ab_b_bb,
                                         threshold, dilate_kernel,
-                                        overlap_bbox, overlap_in_bbox):
+                                        overlap_in_bbox):
     """CPU variant of compute_motion_mask_gpu_chrominance."""
-    ab_a = _bgr_to_ab_cpu(warped_a)
-    ab_b = _bgr_to_ab_cpu(warped_b)
-    diff_a = np.abs(ab_a - baseline_ab_a).sum(axis=2)
-    diff_b = np.abs(ab_b - baseline_ab_b).sum(axis=2)
+    ab_a = _bgr_to_ab_cpu_bb(wa_bb)
+    ab_b = _bgr_to_ab_cpu_bb(wb_bb)
+    diff_a = np.abs(ab_a - baseline_ab_a_bb).sum(axis=2)
+    diff_b = np.abs(ab_b - baseline_ab_b_bb).sum(axis=2)
     motion = ((diff_a > threshold) | (diff_b > threshold)).astype(np.uint8) * 255
     if dilate_kernel is not None:
         motion = cv2.dilate(motion, dilate_kernel)
-    x0, y0, x1, y1 = overlap_bbox
-    motion_bbox = motion[y0:y1, x0:x1].copy()
-    return cv2.bitwise_and(motion_bbox, overlap_in_bbox)
+    return cv2.bitwise_and(motion, overlap_in_bbox)
 
 
-def precompute_baseline_ab_gpu(baseline_warped_t):
-    return _bgr_to_ab_gpu(baseline_warped_t)
+def precompute_baseline_ab_gpu(baseline_bb_t):
+    """baseline_bb_t: (3, H_bb, W_bb) uint8 -> (2, H_bb, W_bb) float."""
+    return _bgr_to_ab_gpu_bb(baseline_bb_t)
 
 
-def precompute_baseline_ab_cpu(baseline_warped):
-    return _bgr_to_ab_cpu(baseline_warped)
+def precompute_baseline_ab_cpu(baseline_bb):
+    return _bgr_to_ab_cpu_bb(baseline_bb)
