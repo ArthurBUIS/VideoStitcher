@@ -194,13 +194,12 @@ Motion detection (baseline subtraction):
                                 frame:
                                   baseline = a * current + (1-a) * baseline
                                 with the update GATED to pixels where
-                                no person AND no motion is detected.
-                                0 disables rolling (the original
-                                fixed-baseline behaviour). Default:
-                                0.01 (time constant ~100 frames =~4s at
-                                25 fps). Smaller = slower drift, larger
-                                = faster adaptation but more risk of
-                                absorbing transient objects.
+                                no person is detected. 0 disables
+                                rolling (the original fixed-baseline
+                                behaviour). Default: 0.01 (time
+                                constant ~100 frames =~4s at 25 fps).
+                                Smaller = slower drift, larger = faster
+                                adaptation.
 
 Cost-map behavior:
     --cost_ema A                EMA factor in [0, 1] for the photometric
@@ -421,9 +420,9 @@ def main():
                         help="Per-frame rolling exponential update on "
                              "the motion baselines: "
                              "baseline = a*current + (1-a)*baseline, "
-                             "gated by NOT person AND NOT motion. 0 "
-                             "disables rolling. Default: 0.01 (time "
-                             "constant ~100 frames ~ 4s at 25 fps).")
+                             "gated by NOT person. 0 disables rolling. "
+                             "Default: 0.01 (time constant ~100 frames "
+                             "~ 4s at 25 fps).")
     # Diagnostics --------------------------------------------------------
     parser.add_argument("--profile", action="store_true",
                         help="Print rolling per-stage timings (decode, "

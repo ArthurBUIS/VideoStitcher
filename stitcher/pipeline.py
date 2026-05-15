@@ -1193,8 +1193,18 @@ def run(args):
                                 person_half = downsample_mask_half_gpu(person_full_t)
                             else:
                                 person_half = torch.zeros_like(motion_half_t)
-                            update_mask_h = ((person_half == 0)
-                                             & (motion_half_t == 0))
+                            # Gate the rolling update by the person mask
+                            # ONLY (not the motion mask). Motion-gating
+                            # creates a deadlock when the baseline was
+                            # taken from a frame that contained content
+                            # that later disappears: motion keeps firing
+                            # at that location forever, which would
+                            # block the very baseline update needed to
+                            # clear it.  The per-frame alpha is small
+                            # enough (1%) that a single-frame visit by
+                            # a transient object doesn't leave a
+                            # noticeable tint in the baseline.
+                            update_mask_h = (person_half == 0)
                             update_3 = update_mask_h.unsqueeze(0)
                             # Float lerp on the float baseline. No cast
                             # or clamp needed (both inputs are 0-255 so
@@ -1328,8 +1338,9 @@ def run(args):
                                 person_half = downsample_mask_half_cpu(person_full)
                             else:
                                 person_half = np.zeros_like(motion_half)
-                            update_mask = ((person_half == 0)
-                                           & (motion_half == 0))
+                            # See the GPU branch above for the rationale
+                            # for gating by person ONLY (not motion).
+                            update_mask = (person_half == 0)
                             um3 = update_mask[..., None]
                             # Float lerp; baseline is already float32 so
                             # the sub-1 per-frame deltas survive.
