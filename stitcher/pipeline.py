@@ -548,9 +548,12 @@ def run(args):
             baseline_b_bb_t = crop_to_bbox_gpu(full_baseline_b_t,
                                                static["overlap_bbox"])
             # Half-res baselines + overlap mask (all per-frame work
-            # operates on these).
-            baseline_a_bb_t = downsample_image_half_gpu(baseline_a_bb_t)
-            baseline_b_bb_t = downsample_image_half_gpu(baseline_b_bb_t)
+            # operates on these). Baselines are stored as float32 so
+            # the rolling exponential update (small per-frame deltas
+            # like alpha*(current - baseline)) doesn't get truncated
+            # to zero by a uint8 cast each frame.
+            baseline_a_bb_t = downsample_image_half_gpu(baseline_a_bb_t).float()
+            baseline_b_bb_t = downsample_image_half_gpu(baseline_b_bb_t).float()
             overlap_in_bbox_motion_t = downsample_mask_half_gpu(overlap_in_bbox_t)
             if args.motion_method == "edges":
                 baseline_grad_a_bb_t = sobel_magnitude_gpu_bb(baseline_a_bb_t)
@@ -579,8 +582,9 @@ def run(args):
             baseline_b_bb = crop_to_bbox_cpu(full_baseline_b,
                                              static["overlap_bbox"])
             # Half-res baselines + overlap mask for the CPU motion path.
-            baseline_a_bb = downsample_image_half_cpu(baseline_a_bb)
-            baseline_b_bb = downsample_image_half_cpu(baseline_b_bb)
+            # Float32 baseline (see GPU branch above for rationale).
+            baseline_a_bb = downsample_image_half_cpu(baseline_a_bb).astype(np.float32)
+            baseline_b_bb = downsample_image_half_cpu(baseline_b_bb).astype(np.float32)
             overlap_in_bbox_motion = downsample_mask_half_cpu(
                 static["overlap_in_bbox"]
             )
@@ -1124,43 +1128,128 @@ def run(args):
                         wa_full_t, wb_full_t, warp_event = item
                         if warp_event is not None:
                             warp_event.wait()
-                        wa_bb_t = crop_to_bbox_gpu(wa_full_t,
-                                                   static["overlap_bbox"])
-                        wb_bb_t = crop_to_bbox_gpu(wb_full_t,
-                                                   static["overlap_bbox"])
-                        # Drop to half-res for the diff + dilate.
-                        wa_bb_t = downsample_image_half_gpu(wa_bb_t)
-                        wb_bb_t = downsample_image_half_gpu(wb_bb_t)
+                        # Crop bbox + drop to half-res. wa/b_half_raw are
+                        # the un-renormalized current frames at half res;
+                        # we hang onto them for the rolling-baseline
+                        # update at the bottom (the rolled baseline must
+                        # track the actual camera output, not the
+                        # renormalized version).
+                        wa_half_raw = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wa_full_t, static["overlap_bbox"])
+                        )
+                        wb_half_raw = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wb_full_t, static["overlap_bbox"])
+                        )
                         if args.motion_renorm:
-                            wa_bb_t = renormalize_to_baseline_gpu(
-                                wa_bb_t, baseline_mean_a_t,
+                            wa_half_motion = renormalize_to_baseline_gpu(
+                                wa_half_raw, baseline_mean_a_t,
                                 overlap_in_bbox_motion_t,
                             )
-                            wb_bb_t = renormalize_to_baseline_gpu(
-                                wb_bb_t, baseline_mean_b_t,
+                            wb_half_motion = renormalize_to_baseline_gpu(
+                                wb_half_raw, baseline_mean_b_t,
                                 overlap_in_bbox_motion_t,
                             )
+                        else:
+                            wa_half_motion = wa_half_raw
+                            wb_half_motion = wb_half_raw
                         if args.motion_method == "edges":
                             motion_half_t = compute_motion_mask_gpu_edges(
-                                wa_bb_t, wb_bb_t,
+                                wa_half_motion, wb_half_motion,
                                 baseline_grad_a_bb_t, baseline_grad_b_bb_t,
                                 args.motion_threshold, half_dilate_radius,
                                 overlap_in_bbox_motion_t,
                             )
                         elif args.motion_method == "chrominance":
                             motion_half_t = compute_motion_mask_gpu_chrominance(
-                                wa_bb_t, wb_bb_t,
+                                wa_half_motion, wb_half_motion,
                                 baseline_ab_a_bb_t, baseline_ab_b_bb_t,
                                 args.motion_threshold, half_dilate_radius,
                                 overlap_in_bbox_motion_t,
                             )
                         else:  # "pixel"
                             motion_half_t = compute_motion_mask_gpu(
-                                wa_bb_t, wb_bb_t,
+                                wa_half_motion, wb_half_motion,
                                 baseline_a_bb_t, baseline_b_bb_t,
                                 args.motion_threshold, half_dilate_radius,
                                 overlap_in_bbox_motion_t,
                             )
+
+                        # Rolling-baseline update (gated by no-person AND
+                        # no-motion). Each frame nudges baseline_*_bb_t a
+                        # little bit toward the current scene, but only
+                        # at pixels where nothing is happening — so a
+                        # person standing still doesn't get absorbed and
+                        # a moving object's trail doesn't burn in.
+                        alpha = float(args.baseline_update_alpha)
+                        if alpha > 0.0:
+                            with mask_lock:
+                                latest_person = mask_holder[0]
+                            person_full_t = None
+                            if latest_person is not None:
+                                person_full_t = latest_person.get(
+                                    "person_mask_bbox_t"
+                                )
+                            if person_full_t is not None:
+                                person_half = downsample_mask_half_gpu(person_full_t)
+                            else:
+                                person_half = torch.zeros_like(motion_half_t)
+                            # Gate the rolling update by the person mask
+                            # ONLY (not the motion mask). Motion-gating
+                            # creates a deadlock when the baseline was
+                            # taken from a frame that contained content
+                            # that later disappears: motion keeps firing
+                            # at that location forever, which would
+                            # block the very baseline update needed to
+                            # clear it.  The per-frame alpha is small
+                            # enough (1%) that a single-frame visit by
+                            # a transient object doesn't leave a
+                            # noticeable tint in the baseline.
+                            update_mask_h = (person_half == 0)
+                            update_3 = update_mask_h.unsqueeze(0)
+                            # Float lerp on the float baseline. No cast
+                            # or clamp needed (both inputs are 0-255 so
+                            # the result stays in range), and crucially
+                            # we don't lose the per-frame sub-1 update
+                            # that a uint8 cast would truncate to zero.
+                            new_a = (alpha * wa_half_raw.float()
+                                     + (1.0 - alpha) * baseline_a_bb_t)
+                            new_b = (alpha * wb_half_raw.float()
+                                     + (1.0 - alpha) * baseline_b_bb_t)
+                            baseline_a_bb_t.copy_(
+                                torch.where(update_3, new_a, baseline_a_bb_t)
+                            )
+                            baseline_b_bb_t.copy_(
+                                torch.where(update_3, new_b, baseline_b_bb_t)
+                            )
+                            # Refresh derived tensors so renorm + the
+                            # method-specific diff use the rolled
+                            # baseline next frame.
+                            if args.motion_renorm:
+                                baseline_mean_a_t.copy_(
+                                    compute_mean_in_overlap_gpu(
+                                        baseline_a_bb_t, overlap_in_bbox_motion_t,
+                                    )
+                                )
+                                baseline_mean_b_t.copy_(
+                                    compute_mean_in_overlap_gpu(
+                                        baseline_b_bb_t, overlap_in_bbox_motion_t,
+                                    )
+                                )
+                            if args.motion_method == "edges":
+                                baseline_grad_a_bb_t.copy_(
+                                    sobel_magnitude_gpu_bb(baseline_a_bb_t)
+                                )
+                                baseline_grad_b_bb_t.copy_(
+                                    sobel_magnitude_gpu_bb(baseline_b_bb_t)
+                                )
+                            elif args.motion_method == "chrominance":
+                                baseline_ab_a_bb_t.copy_(
+                                    precompute_baseline_ab_gpu(baseline_a_bb_t)
+                                )
+                                baseline_ab_b_bb_t.copy_(
+                                    precompute_baseline_ab_gpu(baseline_b_bb_t)
+                                )
+
                         # Back up to full bbox res via nearest upsample.
                         motion_bb_t = upsample_mask_to_bbox_gpu(
                             motion_half_t, overlap_in_bbox_t.shape,
@@ -1177,21 +1266,24 @@ def run(args):
                         }
                     else:
                         wa_full, wb_full = item
-                        wa_bb = crop_to_bbox_cpu(wa_full,
-                                                 static["overlap_bbox"])
-                        wb_bb = crop_to_bbox_cpu(wb_full,
-                                                 static["overlap_bbox"])
-                        wa_bb = downsample_image_half_cpu(wa_bb)
-                        wb_bb = downsample_image_half_cpu(wb_bb)
+                        wa_half_raw = downsample_image_half_cpu(
+                            crop_to_bbox_cpu(wa_full, static["overlap_bbox"])
+                        )
+                        wb_half_raw = downsample_image_half_cpu(
+                            crop_to_bbox_cpu(wb_full, static["overlap_bbox"])
+                        )
                         if args.motion_renorm:
-                            wa_bb = renormalize_to_baseline_cpu(
-                                wa_bb, baseline_mean_a,
+                            wa_half_motion = renormalize_to_baseline_cpu(
+                                wa_half_raw, baseline_mean_a,
                                 overlap_in_bbox_motion,
                             )
-                            wb_bb = renormalize_to_baseline_cpu(
-                                wb_bb, baseline_mean_b,
+                            wb_half_motion = renormalize_to_baseline_cpu(
+                                wb_half_raw, baseline_mean_b,
                                 overlap_in_bbox_motion,
                             )
+                        else:
+                            wa_half_motion = wa_half_raw
+                            wb_half_motion = wb_half_raw
                         # Build a half-res dilate kernel for the CPU path.
                         if args.motion_dilate > 0:
                             half_motion_dilate_kernel = cv2.getStructuringElement(
@@ -1203,25 +1295,81 @@ def run(args):
                             half_motion_dilate_kernel = None
                         if args.motion_method == "edges":
                             motion_half = compute_motion_mask_cpu_edges(
-                                wa_bb, wb_bb,
+                                wa_half_motion, wb_half_motion,
                                 baseline_grad_a_bb, baseline_grad_b_bb,
                                 args.motion_threshold, half_motion_dilate_kernel,
                                 overlap_in_bbox_motion,
                             )
                         elif args.motion_method == "chrominance":
                             motion_half = compute_motion_mask_cpu_chrominance(
-                                wa_bb, wb_bb,
+                                wa_half_motion, wb_half_motion,
                                 baseline_ab_a_bb, baseline_ab_b_bb,
                                 args.motion_threshold, half_motion_dilate_kernel,
                                 overlap_in_bbox_motion,
                             )
                         else:  # "pixel"
+                            # cv2.absdiff inside compute_motion_mask_cpu
+                            # needs same-dtype inputs; baseline is float32
+                            # so the current frame is uint8 -> cast baseline
+                            # to uint8 just for the diff (the float storage
+                            # is what the rolling update needs).
                             motion_half = compute_motion_mask_cpu(
-                                wa_bb, wb_bb,
-                                baseline_a_bb, baseline_b_bb,
+                                wa_half_motion, wb_half_motion,
+                                baseline_a_bb.astype(np.uint8),
+                                baseline_b_bb.astype(np.uint8),
                                 args.motion_threshold, half_motion_dilate_kernel,
                                 overlap_in_bbox_motion,
                             )
+
+                        # Rolling-baseline update — CPU mirror of the GPU
+                        # path above. See that block for the rationale
+                        # (gated by no-person AND no-motion; uses the
+                        # un-renormalized current frame).
+                        alpha = float(args.baseline_update_alpha)
+                        if alpha > 0.0:
+                            with mask_lock:
+                                latest_person = mask_holder[0]
+                            person_full = None
+                            if latest_person is not None:
+                                person_full = latest_person.get(
+                                    "person_mask_bbox"
+                                )
+                            if person_full is not None:
+                                person_half = downsample_mask_half_cpu(person_full)
+                            else:
+                                person_half = np.zeros_like(motion_half)
+                            # See the GPU branch above for the rationale
+                            # for gating by person ONLY (not motion).
+                            update_mask = (person_half == 0)
+                            um3 = update_mask[..., None]
+                            # Float lerp; baseline is already float32 so
+                            # the sub-1 per-frame deltas survive.
+                            new_a = (alpha * wa_half_raw.astype(np.float32)
+                                     + (1.0 - alpha) * baseline_a_bb)
+                            new_b = (alpha * wb_half_raw.astype(np.float32)
+                                     + (1.0 - alpha) * baseline_b_bb)
+                            np.copyto(baseline_a_bb,
+                                      np.where(um3, new_a, baseline_a_bb))
+                            np.copyto(baseline_b_bb,
+                                      np.where(um3, new_b, baseline_b_bb))
+                            if args.motion_renorm:
+                                baseline_mean_a[:] = compute_mean_in_overlap_cpu(
+                                    baseline_a_bb, overlap_in_bbox_motion,
+                                )
+                                baseline_mean_b[:] = compute_mean_in_overlap_cpu(
+                                    baseline_b_bb, overlap_in_bbox_motion,
+                                )
+                            if args.motion_method == "edges":
+                                np.copyto(baseline_grad_a_bb,
+                                          sobel_magnitude_cpu_bb(baseline_a_bb))
+                                np.copyto(baseline_grad_b_bb,
+                                          sobel_magnitude_cpu_bb(baseline_b_bb))
+                            elif args.motion_method == "chrominance":
+                                np.copyto(baseline_ab_a_bb,
+                                          precompute_baseline_ab_cpu(baseline_a_bb))
+                                np.copyto(baseline_ab_b_bb,
+                                          precompute_baseline_ab_cpu(baseline_b_bb))
+
                         motion_bb = upsample_mask_to_bbox_cpu(
                             motion_half, static["overlap_in_bbox"].shape,
                         )
