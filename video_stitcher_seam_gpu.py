@@ -189,6 +189,18 @@ Motion detection (baseline subtraction):
     --motion_penalty F          Cost penalty added to motion-mask
                                 pixels (AND NOT person). Default: 5e7,
                                 same priority level as fg_penalty.
+    --baseline_update_alpha A   Per-pixel rolling exponential update
+                                applied to the motion baselines every
+                                frame:
+                                  baseline = a * current + (1-a) * baseline
+                                with the update GATED to pixels where
+                                no person AND no motion is detected.
+                                0 disables rolling (the original
+                                fixed-baseline behaviour). Default:
+                                0.01 (time constant ~100 frames =~4s at
+                                25 fps). Smaller = slower drift, larger
+                                = faster adaptation but more risk of
+                                absorbing transient objects.
 
 Cost-map behavior:
     --cost_ema A                EMA factor in [0, 1] for the photometric
@@ -405,6 +417,13 @@ def main():
                         help="Cost penalty added to motion-mask pixels "
                              "(AND NOT person). Default: 5e7 (same as "
                              "fg_penalty).")
+    parser.add_argument("--baseline_update_alpha", type=float, default=0.01,
+                        help="Per-frame rolling exponential update on "
+                             "the motion baselines: "
+                             "baseline = a*current + (1-a)*baseline, "
+                             "gated by NOT person AND NOT motion. 0 "
+                             "disables rolling. Default: 0.01 (time "
+                             "constant ~100 frames ~ 4s at 25 fps).")
     # Diagnostics --------------------------------------------------------
     parser.add_argument("--profile", action="store_true",
                         help="Print rolling per-stage timings (decode, "
