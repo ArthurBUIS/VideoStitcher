@@ -100,6 +100,16 @@ same type):
                                 chair couch bed "dining table" tv laptop
                                 book "potted plant" backpack.
 
+                                Special value `auto`: read frame 0 of
+                                each camera, ask a local VLM
+                                (Qwen2.5-VL via Ollama by default) to
+                                propose room-specific classes, and use
+                                those. Equivalent to running
+                                tools/suggest_fg_classes.py and feeding
+                                its output back into this flag, but
+                                done in-process. Requires `pip install
+                                ollama` and the model pulled locally.
+
 Person mask:
     --yolo_every N              Run the person model once every N frames;
                                 reuse the cached mask in between. Lower =
@@ -278,9 +288,49 @@ rectangle quickly.
 
 import argparse
 
+from stitcher.auto_fg import AUTO_SENTINELS
 from stitcher.pipeline import run
 from stitcher.seam import EDGE_PENALTY, PERSON_PENALTY
 from stitcher.segmentation import DEFAULT_FG_CLASS_IDS
+
+
+def _maybe_auto_discover_fg_classes(args):
+    """If --yoloe_fg_classes was set to the `auto` sentinel, query the
+    local VLM for room-specific classes and replace args.yoloe_fg_classes
+    in place. No-op when the user passed an explicit class list.
+
+    Imports cv2 + stitcher.auto_fg lazily so the rest of the pipeline
+    doesn't pay for them when auto-discovery isn't requested.
+    """
+    yfc = args.yoloe_fg_classes
+    if not (isinstance(yfc, list) and len(yfc) == 1
+            and yfc[0].lower() in AUTO_SENTINELS):
+        return
+
+    import cv2
+
+    from stitcher.auto_fg import suggest_fg_classes
+
+    def _grab_frame_zero(path):
+        cap = cv2.VideoCapture(path)
+        try:
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if not ok or frame is None:
+            raise RuntimeError(
+                f"--yoloe_fg_classes auto: could not read frame 0 from {path}"
+            )
+        return frame
+
+    print("[info] --yoloe_fg_classes auto: reading frame 0 from each video...")
+    frame_a = _grab_frame_zero(args.video_a)
+    frame_b = _grab_frame_zero(args.video_b)
+    print("[info] querying local VLM for room-specific FG classes "
+          "(can take a few seconds on first call)...")
+    classes = suggest_fg_classes(frame_a, frame_b)
+    print(f"[info] VLM suggested {len(classes)} classes: {classes}")
+    args.yoloe_fg_classes = classes
 
 
 def main():
@@ -333,7 +383,11 @@ def main():
                         help="Text prompts for static FG classes when "
                              "--fg_model is yoloe. Default: chair couch "
                              "bed 'dining table' tv laptop book "
-                             "'potted plant' backpack.")
+                             "'potted plant' backpack. Pass `auto` (a "
+                             "single value) to discover room-specific "
+                             "classes via a local VLM (Qwen2.5-VL through "
+                             "Ollama by default); requires `pip install "
+                             "ollama` and the model pulled locally.")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
@@ -433,6 +487,7 @@ def main():
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
+    _maybe_auto_discover_fg_classes(args)
     run(args)
 
 
