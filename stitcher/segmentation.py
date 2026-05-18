@@ -110,13 +110,37 @@ class PersonSegmenter:
                                       target_hw_a, target_hw_b,
                                       class_ids=(PERSON_CLASS_ID,)):
         """
-        Batched two-frame inference. Calls model.predict with both frames
-        in one go (ultralytics batches over the list) and returns
-        (mask_a, mask_b) as (H, W) uint8 GPU tensors at each target size.
-
-        Saves the per-call overhead (kernel-launch + pre/post-processing)
-        of the second predict() vs invoking predict_classes_mask_gpu twice.
+        Two-frame inference. When both frames share a shape (the common
+        case) we run ONE model.predict over the list and let ultralytics
+        batch them — saves a chunk of per-call overhead. When shapes
+        differ, ultralytics has to letterbox both frames to a common
+        batched shape, and the model masks come back at the model's
+        grid resolution (e.g. 160x160 for a 640 input) covering that
+        letterboxed extent including padding. F.interpolate'ing those
+        masks back to each camera's NATIVE shape then stretches the
+        padded area together with the valid area, distorting the mask
+        (visible as a "flattened" person mask in the debug overlay).
+        Fall back to two separate predict() calls in that case — each
+        frame gets its own letterboxing and the masks line up with
+        their native shapes.
         """
+        if frame_a_bgr.shape == frame_b_bgr.shape:
+            return self._predict_classes_mask_pair_batched_gpu(
+                frame_a_bgr, frame_b_bgr, target_hw_a, target_hw_b, class_ids,
+            )
+        mask_a = self.predict_classes_mask_gpu(
+            frame_a_bgr, target_hw_a, class_ids,
+        )
+        mask_b = self.predict_classes_mask_gpu(
+            frame_b_bgr, target_hw_b, class_ids,
+        )
+        return mask_a, mask_b
+
+    def _predict_classes_mask_pair_batched_gpu(self, frame_a_bgr, frame_b_bgr,
+                                               target_hw_a, target_hw_b,
+                                               class_ids):
+        """Fast path used when both frames have the same shape — see
+        predict_classes_mask_pair_gpu for the dispatch rationale."""
         results = self.model.predict(
             [frame_a_bgr, frame_b_bgr], classes=list(class_ids),
             verbose=False, retina_masks=False,
@@ -143,7 +167,18 @@ class PersonSegmenter:
 
     def predict_classes_mask_pair(self, frame_a_bgr, frame_b_bgr,
                                   class_ids=(PERSON_CLASS_ID,)):
-        """CPU/numpy variant of predict_classes_mask_pair_gpu."""
+        """CPU/numpy variant of predict_classes_mask_pair_gpu — same
+        same-shape-batched / mismatched-fallback dispatch."""
+        if frame_a_bgr.shape == frame_b_bgr.shape:
+            return self._predict_classes_mask_pair_batched(
+                frame_a_bgr, frame_b_bgr, class_ids,
+            )
+        mask_a = self.predict_classes_mask(frame_a_bgr, class_ids)
+        mask_b = self.predict_classes_mask(frame_b_bgr, class_ids)
+        return mask_a, mask_b
+
+    def _predict_classes_mask_pair_batched(self, frame_a_bgr, frame_b_bgr,
+                                           class_ids):
         results = self.model.predict(
             [frame_a_bgr, frame_b_bgr], classes=list(class_ids),
             verbose=False, retina_masks=False,
