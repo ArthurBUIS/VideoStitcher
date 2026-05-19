@@ -80,6 +80,44 @@ class PersonSegmenter:
         merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
         return cv2.resize(merged_small, (W, H), interpolation=cv2.INTER_NEAREST)
 
+    def predict_classes_boxes(self, frame_bgr,
+                              class_ids=(PERSON_CLASS_ID,)):
+        """
+        Run inference and return per-class bounding boxes (no mask
+        post-processing). Used by the depth-aware auto-FG discovery
+        flow: it asks the depth helper "where is each YOLOE-detected
+        class located in the frame?".
+
+        Returns: dict keyed by class_id (int) -> list of
+        (x1, y1, x2, y2, conf) tuples in input-frame pixel coords.
+        Classes with no detections get an empty list.
+
+        Note on class_ids semantics: same as the mask helpers --
+        COCO indices when the model is YOLOv8, indices into the
+        text_classes list when the model is YOLOE.
+        """
+        results = self.model.predict(
+            frame_bgr, classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = {int(cid): [] for cid in class_ids}
+        if not results:
+            return out
+        r = results[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return out
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        cls = r.boxes.cls.cpu().numpy().astype(int)
+        conf = r.boxes.conf.cpu().numpy()
+        for i in range(len(cls)):
+            cid = int(cls[i])
+            if cid in out:
+                out[cid].append((float(xyxy[i, 0]), float(xyxy[i, 1]),
+                                 float(xyxy[i, 2]), float(xyxy[i, 3]),
+                                 float(conf[i])))
+        return out
+
     def predict_classes_mask_gpu(self, frame_bgr, target_hw,
                                  class_ids=(PERSON_CLASS_ID,)):
         """
