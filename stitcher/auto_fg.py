@@ -40,11 +40,15 @@ AUTO_SENTINELS = ("auto", "automatic")
 # (a) embedding example images into the prompt makes the request
 # heavier for the VLM and (b) the format is simple enough that text
 # examples are sufficient to nail the output shape. The actual query
-# attaches BOTH camera frames so the VLM sees the room from two angles.
+# attaches ONE side-by-side composite image (camera A on the left,
+# camera B on the right) -- passing two images as separate entries in
+# the same Ollama message confuses Qwen2.5-VL's chat template and
+# makes it emit the raw <|im_start|> token instead of a real answer.
 _PROMPT = """\
 You are helping configure a real-time video stitching system. Your
-job: look at two camera views of the SAME room and list the static
-foreground objects in it.
+job: look at a side-by-side image showing two camera views of the
+SAME room (camera A on the left half, camera B on the right half)
+and list the static foreground objects in it.
 
 The class names you output will be fed to an open-vocabulary
 segmentation model (YOLOE) which will detect them in every frame. The
@@ -66,6 +70,9 @@ Rules:
     visually notice.
   - EXCLUDE: walls, floor, ceiling, doors, windows, ceiling lights,
     light fixtures mounted to the structure, people, pets, hands.
+  - Treat the two halves as views of the same room -- an object
+    visible in only one half still counts once. Output each item only
+    once even if it appears in both halves.
 
 Examples of correct outputs from OTHER rooms (these are just to show
 the FORMAT -- do not copy them blindly):
@@ -73,8 +80,8 @@ the FORMAT -- do not copy them blindly):
     couch, coffee table, tv, bookshelf, lamp, ottoman
     desk, monitor, keyboard, office chair, plant, whiteboard
 
-Now look at these two camera views of the target room and output the
-class list:
+Now look at this side-by-side image of the target room and output
+the class list:
 """
 
 
@@ -85,6 +92,25 @@ def _encode_png_bytes(frame_bgr):
     if not ok:
         raise RuntimeError("cv2.imencode failed on baseline frame")
     return buf.tobytes()
+
+
+def _side_by_side(frame_a_bgr, frame_b_bgr):
+    """Stack two BGR frames horizontally for the VLM. If the source
+    cameras have different heights, the taller frame is resized down to
+    match the shorter so cv2.hconcat works. We pass a single combined
+    image to Ollama because Qwen2.5-VL on Ollama mis-handles two
+    images in the same chat message (emits the <|im_start|> token)."""
+    H_a, W_a = frame_a_bgr.shape[:2]
+    H_b, W_b = frame_b_bgr.shape[:2]
+    if H_a != H_b:
+        target_h = min(H_a, H_b)
+        if H_a != target_h:
+            new_w = max(1, int(round(W_a * target_h / H_a)))
+            frame_a_bgr = cv2.resize(frame_a_bgr, (new_w, target_h))
+        if H_b != target_h:
+            new_w = max(1, int(round(W_b * target_h / H_b)))
+            frame_b_bgr = cv2.resize(frame_b_bgr, (new_w, target_h))
+    return cv2.hconcat([frame_a_bgr, frame_b_bgr])
 
 
 def _parse_class_list(text):
@@ -135,8 +161,7 @@ def suggest_fg_classes(frame_a_bgr, frame_b_bgr,
             "Python package. Install it with: pip install ollama"
         ) from e
 
-    img_a = _encode_png_bytes(frame_a_bgr)
-    img_b = _encode_png_bytes(frame_b_bgr)
+    combined_png = _encode_png_bytes(_side_by_side(frame_a_bgr, frame_b_bgr))
 
     try:
         response = ollama.chat(
@@ -144,7 +169,7 @@ def suggest_fg_classes(frame_a_bgr, frame_b_bgr,
             messages=[{
                 "role": "user",
                 "content": prompt,
-                "images": [img_a, img_b],
+                "images": [combined_png],
             }],
             options={
                 # Deterministic-ish output; we want the same class list
