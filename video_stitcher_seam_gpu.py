@@ -326,9 +326,16 @@ def _maybe_auto_discover_fg_classes(args):
     print("[info] --yoloe_fg_classes auto: reading frame 0 from each video...")
     frame_a = _grab_frame_zero(args.video_a)
     frame_b = _grab_frame_zero(args.video_b)
-    print("[info] querying local VLM for room-specific FG classes "
-          "(can take a few seconds on first call)...")
-    classes = suggest_fg_classes(frame_a, frame_b)
+    model_name = getattr(args, "ollama_model", None)
+    if model_name:
+        print(f"[info] querying VLM ({model_name}) for room-specific "
+              "FG classes (can take a few seconds on first call)...")
+        classes = suggest_fg_classes(frame_a, frame_b,
+                                     model_name=model_name)
+    else:
+        print("[info] querying local VLM for room-specific FG classes "
+              "(can take a few seconds on first call)...")
+        classes = suggest_fg_classes(frame_a, frame_b)
     print(f"[info] VLM suggested {len(classes)} classes: {classes}")
     args.yoloe_fg_classes = classes
 
@@ -388,6 +395,14 @@ def main():
                              "classes via a local VLM (Qwen2.5-VL through "
                              "Ollama by default); requires `pip install "
                              "ollama` and the model pulled locally.")
+    parser.add_argument("--ollama_model", default=None,
+                        help="Override the Ollama model tag used by "
+                             "--yoloe_fg_classes auto. Default is "
+                             "stitcher.auto_fg.DEFAULT_OLLAMA_MODEL "
+                             "(qwen2.5vl:7b). Switch to qwen2.5vl:3b "
+                             "or a quantized variant if the 7B doesn't "
+                             "fit on your GPU and Ollama falls back to "
+                             "CPU inference.")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
