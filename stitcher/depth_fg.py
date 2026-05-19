@@ -66,3 +66,78 @@ def estimate_depth(frame_bgr):
     if depth.shape != (H, W):
         depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
     return depth
+
+
+# ---------------------------------------------------------------------------
+# Classification helpers (pure functions; no model / network I/O)
+# ---------------------------------------------------------------------------
+
+def classify_box_label(depth_map, bbox, scene_reference, threshold):
+    """
+    Classify a single bbox as 'fg' or 'bg' from its bbox-median depth.
+
+    Args:
+        depth_map: (H, W) float; larger value = closer to the camera
+            (Depth Anything V2 output).
+        bbox: (x1, y1, x2, y2[, ...]) in image pixel coords. Extra
+            tuple elements (e.g. a confidence) are ignored.
+        scene_reference: scalar baseline; typically a percentile of
+            the depth map (median is a reasonable default).
+        threshold: bbox is 'fg' if median(depth[bbox]) >
+            scene_reference * threshold. threshold = 1.0 means
+            "bbox closer than scene median". Higher threshold =
+            stricter foreground criterion (fewer 'fg' labels).
+
+    Returns: 'fg' or 'bg'. Out-of-bounds or degenerate bboxes
+    default to 'bg' (the safer answer for the seam-avoidance use
+    case: if we can't tell, don't flag it).
+    """
+    H, W = depth_map.shape
+    x1, y1, x2, y2 = (int(round(c)) for c in bbox[:4])
+    x1 = max(0, min(W, x1))
+    x2 = max(0, min(W, x2))
+    y1 = max(0, min(H, y1))
+    y2 = max(0, min(H, y2))
+    if x2 <= x1 or y2 <= y1:
+        return "bg"
+    region = depth_map[y1:y2, x1:x2]
+    if region.size == 0:
+        return "bg"
+    return ("fg" if float(np.median(region)) > scene_reference * threshold
+            else "bg")
+
+
+def classify_classes_by_depth(boxes_by_class, depth_map, threshold,
+                              reference_percentile=50.0):
+    """
+    Given per-class bboxes and a depth map, return a dict
+    {class_id: 'fg' | 'bg'}.
+
+    A class is labelled 'fg' if ANY of its detections is classified
+    as foreground -- one foreground sighting is enough to keep the
+    class in the candidate set.
+
+    Classes with no detections at all are OMITTED from the output
+    dict (not 'bg'). Callers that want to distinguish "detected but
+    background" from "not detected at all" can check key membership.
+
+    Args:
+        boxes_by_class: dict {class_id: [(x1,y1,x2,y2,...), ...]}.
+            Matches the shape of PersonSegmenter.predict_classes_boxes.
+        depth_map: (H, W) float inverse-depth map.
+        threshold: see classify_box_label.
+        reference_percentile: percentile of the depth map used as
+            scene reference (50 = median; 60-75 leans the reference
+            further back, marking more bboxes as 'fg').
+    """
+    if not boxes_by_class:
+        return {}
+    scene_ref = float(np.percentile(depth_map, reference_percentile))
+    out = {}
+    for cid, boxes in boxes_by_class.items():
+        if not boxes:
+            continue
+        labels = [classify_box_label(depth_map, b, scene_ref, threshold)
+                  for b in boxes]
+        out[cid] = "fg" if "fg" in labels else "bg"
+    return out
