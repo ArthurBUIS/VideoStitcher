@@ -238,3 +238,127 @@ def suggest_fg_classes(frame_a_bgr, frame_b_bgr,
             f"---\n{content}\n---"
         )
     return classes
+
+
+# ---------------------------------------------------------------------------
+# Optional depth post-filter (enabled by --depth_threshold)
+# ---------------------------------------------------------------------------
+#
+# Post-processes the class list returned by suggest_fg_classes. The
+# original VLM call is unchanged -- this layer runs YOLOE on each
+# camera frame to locate the VLM's classes, then drops any class
+# whose detections sit at or past the scene depth reference.
+#
+# Order: VLM -> YOLOE -> Depth Anything V2 -> keep iff any bbox is
+# foreground in any frame. Wall-mounted "background" items the VLM
+# happened to pick up get filtered out before they reach the seam
+# planner.
+
+def _free_gpu_memory():
+    """Best-effort release of cached CUDA memory between the
+    discovery's YOLOE / depth-model load and the main pipeline's
+    own model loads."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def filter_classes_with_depth(class_list, frame_a_bgr, frame_b_bgr,
+                              depth_threshold,
+                              yoloe_weights="yoloe-11s-seg.pt",
+                              yoloe_device="cuda:0",
+                              reference_percentile=50.0):
+    """
+    Post-filter a VLM class list using YOLOE bbox detection plus
+    Depth Anything V2 inverse depth.
+
+    Pipeline per call:
+      1. Load YOLOE with these specific text classes.
+      2. Detect per-class bboxes on each frame.
+      3. Estimate depth on each frame.
+      4. Per class, a detection is 'fg' if its bbox-median depth >
+         scene_reference * threshold. A class is KEPT if any
+         detection in either frame is 'fg'.
+      5. Free the YOLOE + depth models before returning so the
+         main pipeline can load its own clean YOLOE.
+
+    Returns: a subset of class_list (in original order) containing
+    only classes with at least one foreground detection.
+
+    Notes:
+      - Classes that YOLOE failed to detect in either frame are
+        dropped (they can't guide the seam regardless of depth).
+      - Designed to be a no-op replacement for the original list
+        when depth_threshold=None -- callers can branch on the
+        flag before invoking this function.
+    """
+    if not class_list:
+        return class_list
+
+    from stitcher.depth_fg import (
+        classify_classes_by_depth,
+        estimate_depth,
+    )
+    from stitcher.segmentation import PersonSegmenter
+
+    print(f"[auto_fg] depth post-filter on {len(class_list)} class(es) "
+          f"(threshold={depth_threshold}, "
+          f"ref_pctl={reference_percentile})...", flush=True)
+
+    # YOLOE detection on each frame.
+    seg = PersonSegmenter(
+        yoloe_weights, device=yoloe_device,
+        use_yoloe=True, text_classes=list(class_list),
+    )
+    try:
+        class_ids = list(range(len(class_list)))
+        boxes_a = seg.predict_classes_boxes(frame_a_bgr,
+                                            class_ids=class_ids)
+        boxes_b = seg.predict_classes_boxes(frame_b_bgr,
+                                            class_ids=class_ids)
+    finally:
+        del seg
+        _free_gpu_memory()
+
+    # Depth + classification per frame.
+    depth_a = estimate_depth(frame_a_bgr)
+    depth_b = estimate_depth(frame_b_bgr)
+    labels_a = classify_classes_by_depth(
+        boxes_a, depth_a,
+        threshold=depth_threshold,
+        reference_percentile=reference_percentile,
+    )
+    labels_b = classify_classes_by_depth(
+        boxes_b, depth_b,
+        threshold=depth_threshold,
+        reference_percentile=reference_percentile,
+    )
+
+    # Merge per-frame decisions: keep a class if any frame says 'fg'.
+    kept = []
+    print("[auto_fg] depth-filter decisions:")
+    for cid, name in enumerate(class_list):
+        a = labels_a.get(cid)
+        b = labels_b.get(cid)
+        if a is None and b is None:
+            print(f"  {name!r}: DROPPED (no YOLOE detections)")
+            continue
+        if a == "fg" or b == "fg":
+            kept.append(name)
+            print(f"  {name!r}: KEPT  (camA={a or '-'}, camB={b or '-'})")
+        else:
+            print(f"  {name!r}: DROPPED (camA={a or '-'}, "
+                  f"camB={b or '-'})")
+
+    # Release depth model too (transformers caches it as a module
+    # global -- the user can re-import to get it back if they want
+    # to run again in the same process).
+    _free_gpu_memory()
+    return kept

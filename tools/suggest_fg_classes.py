@@ -41,7 +41,11 @@ if _REPO_ROOT not in sys.path:
 
 import cv2  # noqa: E402
 
-from stitcher.auto_fg import DEFAULT_OLLAMA_MODEL, suggest_fg_classes  # noqa: E402
+from stitcher.auto_fg import (  # noqa: E402
+    DEFAULT_OLLAMA_MODEL,
+    filter_classes_with_depth,
+    suggest_fg_classes,
+)
 
 
 def _grab_frame_zero(path):
@@ -68,6 +72,17 @@ def main():
     parser.add_argument("--ollama_model", default=DEFAULT_OLLAMA_MODEL,
                         help=f"Ollama model tag to use. "
                              f"Default: {DEFAULT_OLLAMA_MODEL}.")
+    parser.add_argument("--depth_threshold", type=float, default=None,
+                        help="Optional: post-filter the VLM list using "
+                             "YOLOE + Depth Anything V2. A class is "
+                             "kept only if YOLOE detects it AND any "
+                             "detection has bbox-median depth > "
+                             "scene_median * threshold. 1.0 = closer "
+                             "than scene median; higher = stricter. "
+                             "Requires `pip install transformers`.")
+    parser.add_argument("--yoloe_weights", default="yoloe-11s-seg.pt",
+                        help="YOLOE weights for the --depth_threshold "
+                             "filter. Default: yoloe-11s-seg.pt.")
     args = parser.parse_args()
 
     print(f"[suggest_fg_classes] reading frame 0 from {args.video_a}",
@@ -84,8 +99,20 @@ def main():
         frame_a, frame_b, model_name=args.ollama_model,
     )
 
-    print(f"[suggest_fg_classes] discovered ({len(classes)} classes): "
+    print(f"[suggest_fg_classes] VLM discovered ({len(classes)} classes): "
           f"{classes}", file=sys.stderr)
+
+    if args.depth_threshold is not None:
+        print(f"[suggest_fg_classes] depth post-filter "
+              f"(threshold={args.depth_threshold}); first run loads "
+              "Depth Anything V2 + YOLOE", file=sys.stderr)
+        classes = filter_classes_with_depth(
+            classes, frame_a, frame_b,
+            depth_threshold=args.depth_threshold,
+            yoloe_weights=args.yoloe_weights,
+        )
+        print(f"[suggest_fg_classes] after depth filter "
+              f"({len(classes)} classes): {classes}", file=sys.stderr)
 
     # Clean CSV on stdout — pipe-friendly. Quoting wrapped each item so
     # multi-word classes like "yellow chair" survive shell tokenisation

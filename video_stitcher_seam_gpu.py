@@ -337,6 +337,29 @@ def _maybe_auto_discover_fg_classes(args):
               "(can take a few seconds on first call)...")
         classes = suggest_fg_classes(frame_a, frame_b)
     print(f"[info] VLM suggested {len(classes)} classes: {classes}")
+
+    depth_threshold = getattr(args, "depth_threshold", None)
+    if depth_threshold is not None and classes:
+        from stitcher.auto_fg import filter_classes_with_depth
+
+        kwargs = {"depth_threshold": depth_threshold}
+        yw = getattr(args, "yoloe_weights", None)
+        if yw:
+            kwargs["yoloe_weights"] = yw
+        classes = filter_classes_with_depth(
+            classes, frame_a, frame_b, **kwargs,
+        )
+        print(f"[info] after depth post-filter ({len(classes)} classes): "
+              f"{classes}")
+        if not classes:
+            raise RuntimeError(
+                "--depth_threshold post-filter dropped every class. "
+                "Either no VLM-suggested class was detected by YOLOE, "
+                "or all detections sat in the background. Lower the "
+                "threshold or fall back to running without "
+                "--depth_threshold."
+            )
+
     args.yoloe_fg_classes = classes
 
 
@@ -399,10 +422,18 @@ def main():
                         help="Override the Ollama model tag used by "
                              "--yoloe_fg_classes auto. Default is "
                              "stitcher.auto_fg.DEFAULT_OLLAMA_MODEL "
-                             "(qwen2.5vl:7b). Switch to qwen2.5vl:3b "
-                             "or a quantized variant if the 7B doesn't "
-                             "fit on your GPU and Ollama falls back to "
-                             "CPU inference.")
+                             "(qwen2.5vl:3b). Switch to a quantised 7B "
+                             "if the 3B's choices are too noisy.")
+    parser.add_argument("--depth_threshold", type=float, default=None,
+                        help="Optional depth-aware post-filter for "
+                             "--yoloe_fg_classes auto. When set, after "
+                             "the VLM returns a class list we run YOLOE "
+                             "+ Depth Anything V2 on each frame and "
+                             "keep only classes with at least one "
+                             "detection whose bbox-median depth > "
+                             "scene_median * threshold. 1.0 = closer "
+                             "than scene median; higher = stricter. "
+                             "Requires `pip install transformers`.")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
