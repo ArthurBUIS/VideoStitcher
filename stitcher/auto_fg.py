@@ -27,7 +27,7 @@ pipeline doesn't need it installed unless auto-discovery is used.
 import cv2
 
 
-DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:3b"
 
 
 # Auto-discovery sentinel(s): if --yoloe_fg_classes is set to one of
@@ -48,7 +48,10 @@ _PROMPT = """\
 You are helping configure a real-time video stitching system. Your
 job: look at a side-by-side image showing two camera views of the
 SAME room (camera A on the left half, camera B on the right half)
-and list the static foreground objects in it.
+and list the most important static objects that are on the foreground
+OR that must not be cut through by the panorama seam. It is important
+that you list the most important objects only, not everything in the
+room -- the seam can only avoid a handful of objects.
 
 The class names you output will be fed to an open-vocabulary
 segmentation model (YOLOE) which will detect them in every frame. The
@@ -58,10 +61,10 @@ so the seam never cuts through them.
 Rules:
   - Output ONLY a comma-separated list. NO other text, no header, no
     period at the end, no markdown.
-  - 4 to 10 items total.
+  - 4 to 8 items total.
   - Each item should be a singular noun or a short noun phrase
     (1-3 words).
-  - Be specific when distinctive: "yellow chair" beats "chair" if it
+  - Be specific when distinctive: "red chair" beats "chair" if it
     is a notable colour; "monitor" beats "screen"; "stool" beats
     "seat".
   - Include: chairs, couches, tables, monitors, plants, picture
@@ -74,11 +77,14 @@ Rules:
     visible in only one half still counts once. Output each item only
     once even if it appears in both halves.
 
-Examples of correct outputs from OTHER rooms (these are just to show
-the FORMAT -- do not copy them blindly):
-    yellow chair, monitor, stool, picture frame, plant
-    couch, coffee table, tv, bookshelf, lamp, ottoman
-    desk, monitor, keyboard, office chair, plant, whiteboard
+Examples:
+  - A blue chair on the foreground -> "blue chair"
+  - A red chair on the background -> no output (it is on the background
+    and is not an important object)
+  - A frame on the background -> "picture frame" (it is on the background
+    but is a notable object that should be preserved in the panorama)
+  - A ceiling light -> no output (ceiling lights are structural and not
+    visually important)
 
 Now look at this side-by-side image of the target room and output
 the class list:

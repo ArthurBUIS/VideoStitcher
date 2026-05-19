@@ -25,7 +25,7 @@ Usage:
 
 Setup (one-time):
     1. Install Ollama: https://ollama.com
-    2. Pull the model: ollama pull qwen2.5vl:7b
+    2. Pull the model: ollama pull qwen2.5vl:3b
     3. pip install ollama
 """
 
