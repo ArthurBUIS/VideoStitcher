@@ -94,23 +94,56 @@ def _encode_png_bytes(frame_bgr):
     return buf.tobytes()
 
 
-def _side_by_side(frame_a_bgr, frame_b_bgr):
-    """Stack two BGR frames horizontally for the VLM. If the source
-    cameras have different heights, the taller frame is resized down to
-    match the shorter so cv2.hconcat works. We pass a single combined
-    image to Ollama because Qwen2.5-VL on Ollama mis-handles two
-    images in the same chat message (emits the <|im_start|> token)."""
-    H_a, W_a = frame_a_bgr.shape[:2]
-    H_b, W_b = frame_b_bgr.shape[:2]
+# Per-frame longest-side limit before the side-by-side concat. With
+# typical 1920x1080 cameras this brings each half down to about 900x506
+# and the composite to roughly 1800x506 — well inside what Qwen2.5-VL
+# tokenises efficiently on a T1000. The model downsamples internally
+# anyway, so we lose no usable detail.
+_VLM_PER_FRAME_MAX_DIM = 900
+
+
+def _downscale_long_side(frame_bgr, max_dim):
+    H, W = frame_bgr.shape[:2]
+    longest = max(H, W)
+    if longest <= max_dim:
+        return frame_bgr
+    scale = max_dim / longest
+    new_w = max(1, int(round(W * scale)))
+    new_h = max(1, int(round(H * scale)))
+    return cv2.resize(frame_bgr, (new_w, new_h),
+                      interpolation=cv2.INTER_AREA)
+
+
+def _side_by_side(frame_a_bgr, frame_b_bgr,
+                  per_frame_max_dim=_VLM_PER_FRAME_MAX_DIM):
+    """Stack two BGR frames horizontally for the VLM.
+
+    Each frame is first downscaled so its longest side is at most
+    `per_frame_max_dim` — without this, a 1920x1080 + 1920x1080 pair
+    becomes a 3840x1080 composite that produces thousands of visual
+    tokens and hangs the Qwen2.5-VL inference on small GPUs.
+
+    If the cameras have different heights after the per-frame
+    downscale, the taller one is resized down to match the shorter so
+    cv2.hconcat works.
+
+    We pass a single combined image to Ollama because Qwen2.5-VL on
+    Ollama mis-handles two images in the same chat message (emits the
+    raw <|im_start|> chat-template token instead of a real answer).
+    """
+    a = _downscale_long_side(frame_a_bgr, per_frame_max_dim)
+    b = _downscale_long_side(frame_b_bgr, per_frame_max_dim)
+    H_a = a.shape[0]
+    H_b = b.shape[0]
     if H_a != H_b:
         target_h = min(H_a, H_b)
         if H_a != target_h:
-            new_w = max(1, int(round(W_a * target_h / H_a)))
-            frame_a_bgr = cv2.resize(frame_a_bgr, (new_w, target_h))
+            new_w = max(1, int(round(a.shape[1] * target_h / H_a)))
+            a = cv2.resize(a, (new_w, target_h), interpolation=cv2.INTER_AREA)
         if H_b != target_h:
-            new_w = max(1, int(round(W_b * target_h / H_b)))
-            frame_b_bgr = cv2.resize(frame_b_bgr, (new_w, target_h))
-    return cv2.hconcat([frame_a_bgr, frame_b_bgr])
+            new_w = max(1, int(round(b.shape[1] * target_h / H_b)))
+            b = cv2.resize(b, (new_w, target_h), interpolation=cv2.INTER_AREA)
+    return cv2.hconcat([a, b])
 
 
 def _parse_class_list(text):
