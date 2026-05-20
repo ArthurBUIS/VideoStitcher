@@ -1,9 +1,12 @@
 """
 Auto-discovery of the static-FG class list for --yoloe_fg_classes.
 
-Orchestrates Steps 1+2+3 of the auto-FG-v2 flow on one camera frame:
+Orchestrates Steps 0+1+2+3 of the auto-FG-v2 flow on one camera frame:
 
-  Step 1: YOLOE detects every object in a broad indoor vocabulary
+  Step 0: Qwen2.5-VL inventories the room (color + detail per item)
+          (stitcher.vlm_inventory.list_objects_with_details).
+          The result is the per-scene YOLOE vocabulary.
+  Step 1: YOLOE detects every object from the inventory vocab
           (stitcher.object_inventory.detect_all_objects).
   Step 2: Depth Anything V2 annotates each bbox with a depth value
           in [0, 1] (stitcher.depth_inventory.annotate_inventory_with_depth).
@@ -13,14 +16,13 @@ Orchestrates Steps 1+2+3 of the auto-FG-v2 flow on one camera frame:
           ranks by visual importance, not strict FG/BG.
 
 The flow runs BEFORE the stitcher allocates any GPU state, so each
-of YOLOE / Depth Anything / (Ollama-hosted) Qwen lives in VRAM only
-during its own step:
+model only lives in VRAM during its own step:
 
+  Qwen (step 0) -> Ollama process, separate VRAM
   YOLOE         -> loaded + released inside detect_all_objects
   Depth         -> loaded by annotate_inventory_with_depth, released
-                   by release_depth() before the VLM call
-  Qwen2.5-VL    -> runs in a separate Ollama process, doesn't share
-                   our Python process's VRAM
+                   by release_depth() before the VLM judge call
+  Qwen (step 3) -> Ollama process, separate VRAM
 
 Two entry points:
   * tools/suggest_fg_classes_v2.py -- standalone CLI; prints the
@@ -37,6 +39,7 @@ from stitcher.depth_inventory import (
     release_depth,
 )
 from stitcher.object_inventory import detect_all_objects
+from stitcher.vlm_inventory import list_objects_with_details
 from stitcher.vlm_judge import DEFAULT_OLLAMA_MODEL, judge_inventory
 
 
@@ -74,10 +77,12 @@ def suggest_fg_classes_v2(frame_bgr,
                           device="cuda:0",
                           ollama_model=DEFAULT_OLLAMA_MODEL,
                           min_confidence=0.0,
+                          inventory_vocab=None,
                           return_details=False):
     """
     Pick a list of static-FG class names for YOLOE to track, by
-    chaining the object inventory + depth annotation + VLM judge.
+    chaining the VLM inventory + YOLOE detection + depth annotation
+    + VLM judge.
 
     Args:
         frame_bgr: HxWx3 uint8 BGR image. ONE camera frame is enough
@@ -85,33 +90,58 @@ def suggest_fg_classes_v2(frame_bgr,
             is unreliable with Qwen2.5-VL on Ollama.
         yoloe_weights: YOLOE weights path. Default yoloe-11s-seg.pt.
         device: torch device for YOLOE + depth. Default "cuda:0".
-        ollama_model: Ollama tag for the VLM judge.
+        ollama_model: Ollama tag used for BOTH the inventory call
+            (step 0) and the judge call (step 3).
         min_confidence: drop YOLOE detections below this score before
             the depth + VLM steps. Default 0.0 keeps everything.
-        return_details: if True, also return (records, raw_vlm_text)
-            -- useful when the caller wants to log / save them.
+        inventory_vocab: optional pre-baked YOLOE text-class list.
+            When provided, Step 0 is skipped and YOLOE looks for
+            exactly these classes. Useful for ablation tests and to
+            force a known vocabulary (e.g. the hardcoded
+            INVENTORY_CLASSES fallback from
+            stitcher.object_inventory).
+        return_details: if True, also return
+            (vocab, records, raw_vlm_text) where vocab is the YOLOE
+            text-class list and raw_vlm_text is the judge's raw
+            response.
 
     Returns:
         list of class names to feed --yoloe_fg_classes (e.g.
-        ['chair', 'tv', 'desk', 'houseplant']).
-        If return_details is True: (classes, records, raw_vlm_text).
+        ['blue armchair', 'wooden desk', 'dual monitor setup', ...]).
+        If return_details is True:
+            (classes, vocab, records, raw_vlm_text).
 
     Raises RuntimeError with an actionable hint if YOLOE finds
     nothing, if Ollama is unreachable, or if the VLM returns no
-    usable names.
+    usable names at any step.
     """
+    # Step 0: VLM inventory (skipped when caller supplies a vocab).
+    if inventory_vocab is None:
+        vocab = list_objects_with_details(
+            frame_bgr, model_name=ollama_model,
+        )
+    else:
+        vocab = list(inventory_vocab)
+    if not vocab:
+        raise RuntimeError(
+            "auto-FG-v2: inventory vocabulary is empty. The VLM "
+            "produced no phrases (or an empty inventory_vocab was "
+            "passed in)."
+        )
+
     # Step 1
     detections = detect_all_objects(
         frame_bgr,
         yoloe_weights=yoloe_weights,
         device=device,
+        class_list=vocab,
         min_confidence=min_confidence,
     )
     if not detections:
         raise RuntimeError(
-            "auto-FG-v2: YOLOE detected no objects in the frame. "
-            "Try a different frame, lower --min_confidence, or "
-            "extend INVENTORY_CLASSES."
+            "auto-FG-v2: YOLOE detected no objects in the frame "
+            "with the inventory vocab. Try a different frame, "
+            "lower --min_confidence, or relax the inventory prompt."
         )
 
     # Step 2
@@ -134,5 +164,5 @@ def suggest_fg_classes_v2(frame_bgr,
     )
 
     if return_details:
-        return classes, records, raw
+        return classes, vocab, records, raw
     return classes

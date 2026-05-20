@@ -64,7 +64,7 @@ def main():
     print("[suggest_fg_classes_v2] running inventory + depth + VLM judge "
           f"(ollama: {args.ollama_model})...", file=sys.stderr)
 
-    classes, records, raw = suggest_fg_classes_v2(
+    classes, vocab, records, raw = suggest_fg_classes_v2(
         frame,
         yoloe_weights=args.yoloe_weights,
         device=args.device,
@@ -74,12 +74,17 @@ def main():
     )
 
     # Detailed log -> stderr, clean class list -> stdout.
-    print(f"[suggest_fg_classes_v2] {len(records)} detection(s):",
-          file=sys.stderr)
+    print(f"[suggest_fg_classes_v2] step 0 inventory vocab "
+          f"({len(vocab)} phrases):", file=sys.stderr)
+    for p in vocab:
+        print(f"  - {p}", file=sys.stderr)
+    print(f"[suggest_fg_classes_v2] step 1+2 detections "
+          f"({len(records)}):", file=sys.stderr)
     for r in records:
         print(f"  d={r['depth']:.2f}  conf={r['conf']:.2f}  "
               f"{r['class']}", file=sys.stderr)
-    print("[suggest_fg_classes_v2] raw VLM response:", file=sys.stderr)
+    print("[suggest_fg_classes_v2] step 3 raw VLM response:",
+          file=sys.stderr)
     print("  " + raw.replace("\n", "\n  "), file=sys.stderr)
     print(f"[suggest_fg_classes_v2] selected ({len(classes)}):",
           file=sys.stderr)
