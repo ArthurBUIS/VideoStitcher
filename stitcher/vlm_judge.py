@@ -44,8 +44,9 @@ room. The seam can cause visible distortion where it crosses an
 object, so we need to route it AROUND a small set of visually
 important objects.
 
-Look at the image and at the list of detected objects. Tell me
-which classes the seam should avoid cutting through.
+Look at the image and at the list of detected objects. Among the
+list, keep only the classes that the seam should avoid cutting
+through.
 
 Each entry lists how many instances of the class were detected and
 their depth range. Depth is normalized: 0.0 = far from the camera,
@@ -56,10 +57,15 @@ Detected objects:
 
 Rules for picking classes to protect:
   - Pick classes that would look bad if a seam cut across them:
-    items with sharp edges, text, screens, faces, recognisable
-    shapes; items the eye naturally tracks.
-  - Both close AND far objects can matter. A TV on the back wall
-    is worth protecting even though it is far.
+    items with sharp edges, text or screens, items the eye naturally
+    tracks.
+  - Foreground objects are more important, because their 
+    low distance to the cameras increase the parallax. Thus, a table
+    in the background must be dropped, while a table in the foreground
+    must be kept for example
+  - Far objects matter only if they are visually important. A TV on 
+    the back wall is worth protecting even though it is far, while a
+    plant on the back wall is not.
   - EXCLUDE:
       - floor or wall coverings that blend with surroundings
         (carpets, rugs, mats, plain panels)
@@ -74,6 +80,20 @@ Output format:
   - Class names must come EXACTLY from the list above, in lowercase.
 
 Example output: chair, tv, desk, picture frame
+
+Concrete examples:
+  - A blue chair on the foreground -> INCLUDE (it can cause visual 
+    artefacts because of the high parallax)
+  - A red chair on the background -> EXCLUDE (it is on the background
+    and is not an important object)
+  - A frame on the background -> INCLUDE (it is on the background
+    but is a notable object that should be preserved in the panorama)
+  - A ceiling light -> EXCLUDE (ceiling lights are structural and not
+    visually important)
+  - A plant on the background -> EXCLUDE (plants are visually complex
+    but often blend well with the surroundings, plus it's not the
+    main focus of the scene)
+
 """
 
 
