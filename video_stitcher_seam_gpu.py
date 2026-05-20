@@ -333,7 +333,15 @@ def main():
                         help="Text prompts for static FG classes when "
                              "--fg_model is yoloe. Default: chair couch "
                              "bed 'dining table' tv laptop book "
-                             "'potted plant' backpack.")
+                             "'potted plant' backpack. Pass the single "
+                             "value 'auto' to let auto-FG-v2 (YOLOE "
+                             "inventory + Depth Anything V2 + Qwen2.5-VL) "
+                             "pick the classes from frame 0 of --video_a.")
+    parser.add_argument("--auto_fg_ollama_model",
+                        default="qwen2.5vl:3b",
+                        help="Ollama model tag for the VLM judge when "
+                             "--yoloe_fg_classes is 'auto'. Default: "
+                             "qwen2.5vl:3b (fits in 8 GB VRAM).")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
@@ -433,6 +441,26 @@ def main():
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
+
+    # --yoloe_fg_classes auto: run the VLM discovery flow on frame 0
+    # of video_a BEFORE the stitcher allocates any state, then drop
+    # the resulting class list into args in place.
+    from stitcher.auto_fg_v2 import (
+        is_auto_sentinel, read_frame_zero, suggest_fg_classes_v2,
+    )
+    if is_auto_sentinel(args.yoloe_fg_classes):
+        print(f"[auto-fg-v2] reading frame 0 from {args.video_a}")
+        frame = read_frame_zero(args.video_a)
+        print("[auto-fg-v2] running inventory + depth + VLM judge "
+              f"(ollama: {args.auto_fg_ollama_model})...")
+        classes = suggest_fg_classes_v2(
+            frame,
+            yoloe_weights=args.yoloe_weights,
+            ollama_model=args.auto_fg_ollama_model,
+        )
+        print(f"[auto-fg-v2] selected classes: {classes}")
+        args.yoloe_fg_classes = classes
+
     run(args)
 
 
