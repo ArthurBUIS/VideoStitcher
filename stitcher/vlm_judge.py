@@ -276,6 +276,11 @@ def judge_inventory(frame_bgr, records,
         ) from e
 
     class_summary = _summarize_inventory(records)
+    # Debug: log the exact class_summary the VLM will see in the prompt.
+    import sys as _sys
+    print("[vlm_judge] class_summary injected into prompt:",
+          file=_sys.stderr)
+    print(class_summary, file=_sys.stderr)
     prompt = prompt_template.format(class_summary=class_summary)
 
     small = _downscale_long_side(frame_bgr, _VLM_MAX_DIM)
