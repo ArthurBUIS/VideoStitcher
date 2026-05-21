@@ -134,6 +134,7 @@ from stitcher.seam import (
     find_dp_seam,
     upscale_seam,
 )
+from stitcher.person_tracking import PersonTracker
 from stitcher.segmentation import (
     PERSON_CLASS_ID,
     PersonSegmenter,
@@ -280,6 +281,13 @@ def run(args):
     flag definitions live in the entry script; this function only
     consumes the resulting Namespace.
     """
+    # --person_tracking implies --autocrop -- tracking on the raw
+    # canvas would track inside the polygonal black borders. Bump
+    # the flag silently before anything looks at it.
+    if getattr(args, "person_tracking", False) and not args.autocrop:
+        print("[info] --person_tracking implies --autocrop; enabling it.")
+        args.autocrop = True
+
     dev = detect_device()
     _print_device_banner(dev)
 
@@ -683,8 +691,29 @@ def run(args):
     motion_mask_holder = [None]
     motion_q = queue.Queue(maxsize=1)
 
+    # Smooth horizontal-rail person tracker. Lazy-initialised so we
+    # only pay the import cost when actually requested.
+    tracker = None
+    writer_output_size = output_size
+    if getattr(args, "person_tracking", False):
+        tracker = PersonTracker(
+            smooth_seconds=args.person_tracking_smooth_seconds,
+            drift_seconds=args.person_tracking_drift_seconds,
+            fps=sync_reader.output_fps,
+            aspect=args.person_tracking_aspect,
+        )
+        writer_output_size = tracker.get_crop_size(
+            output_size[0], output_size[1],
+        )
+        print(f"[info] Person tracking enabled: "
+              f"output cropped from {output_size[0]}x{output_size[1]} "
+              f"to {writer_output_size[0]}x{writer_output_size[1]} "
+              f"(aspect {args.person_tracking_aspect:.2f}, "
+              f"smooth {args.person_tracking_smooth_seconds:.1f}s, "
+              f"drift {args.person_tracking_drift_seconds:.1f}s).")
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, output_size)
+    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, writer_output_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
     writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
@@ -802,6 +831,17 @@ def run(args):
                 person_mask_bbox = latest_mask["person_mask_bbox"]
             if args.debug_mask:
                 person_for_debug = latest_mask.get("person_mask_cpu")
+
+        # Per-frame person-tracking EMA. Updates with the most recently
+        # published canvas-space person mask -- might be stale by up to
+        # --yolo_every frames, but EMA smooths it; the rail-glide feel
+        # comes from updating EVERY frame regardless of YOLO cadence.
+        tracking_crop = None
+        if tracker is not None:
+            canvas_mask = (latest_mask.get("canvas_person_mask_cpu")
+                           if latest_mask is not None else None)
+            tracker.update(canvas_mask, output_size[0], output_size[1])
+            tracking_crop = tracker.get_crop_bounds()
 
         # Motion mask comes from the async motion_worker. Read the most
         # recent published mask (it's from frame N-1 by construction);
@@ -930,6 +970,7 @@ def run(args):
             "person_for_debug": person_for_debug,
             "fg_for_debug": fg_for_debug,
             "motion_for_debug": motion_for_debug,
+            "tracking_crop": tracking_crop,
             "compute_done_event": compute_done_event,
         }
 
@@ -965,6 +1006,7 @@ def run(args):
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
             motion_for_debug = payload["motion_for_debug"]
+            tracking_crop = payload.get("tracking_crop")
 
             # Closure runs on the writer thread AFTER copy_event has
             # been synchronised; sees the pinned numpy view as `arr`.
@@ -975,7 +1017,8 @@ def run(args):
                              seam_x_full=seam_x_full,
                              fg_for_debug=fg_for_debug,
                              motion_for_debug=motion_for_debug,
-                             person_for_debug=person_for_debug):
+                             person_for_debug=person_for_debug,
+                             tracking_crop=tracking_crop):
                 if args.debug_mask:
                     if fg_for_debug is not None:
                         draw_mask_overlay(arr, fg_for_debug,
@@ -991,6 +1034,11 @@ def run(args):
                 if args.debug_seam:
                     draw_seam_overlay(arr, seam_x_full,
                                       static["overlap_bbox"])
+                if tracking_crop is not None:
+                    x0, x1 = tracking_crop
+                    arr = arr[:, x0:x1]
+                    if not arr.flags["C_CONTIGUOUS"]:
+                        arr = np.ascontiguousarray(arr)
                 return arr
 
             return ("async", pinned, copy_event, post_sync_fn,
@@ -1020,6 +1068,12 @@ def run(args):
                                   static["overlap_bbox"])
         if args.debug_seam:
             draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
+        tracking_crop = payload.get("tracking_crop")
+        if tracking_crop is not None:
+            x0, x1 = tracking_crop
+            stitched = stitched[:, x0:x1]
+            if not stitched.flags["C_CONTIGUOUS"]:
+                stitched = np.ascontiguousarray(stitched)
         return ("sync", stitched)
 
     # --- Pipelined execution with three worker threads -------------------
@@ -1076,6 +1130,13 @@ def run(args):
                         mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
                         union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
                         union_t = dilate_gpu(union_t, args.mask_dilate)
+                        # Snapshot the FULL-canvas (not bbox-cropped) dilated
+                        # union for the person tracker. Cheap (~ms uint8
+                        # copy) and only when tracking is enabled.
+                        canvas_person_mask_cpu_track = (
+                            union_t.cpu().numpy() if tracker is not None
+                            else None
+                        )
                         raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
                         new_float = (raw_mask_t > 0).float()
                         if person_mask_ema_t is None:
@@ -1100,6 +1161,7 @@ def run(args):
                             "person_mask_bbox_t": person_mask_bbox_t,
                             "person_mask_bbox": None,
                             "person_mask_cpu": person_mask_cpu,
+                            "canvas_person_mask_cpu": canvas_person_mask_cpu_track,
                             "ready_event": ready_event,
                         }
                     else:
@@ -1114,6 +1176,9 @@ def run(args):
                                                   cv2.INTER_NEAREST)
                         union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
                         union = cv2.dilate(union, dilate_kernel)
+                        canvas_person_mask_cpu_track = (
+                            union.copy() if tracker is not None else None
+                        )
                         raw_mask = union[y0:y1, x0:x1]
                         new_float = (raw_mask > 0).astype(np.float32)
                         if person_mask_ema is None:
@@ -1132,6 +1197,7 @@ def run(args):
                             "person_mask_cpu": (
                                 person_mask_bbox if args.debug_mask else None
                             ),
+                            "canvas_person_mask_cpu": canvas_person_mask_cpu_track,
                             "ready_event": None,
                         }
 
