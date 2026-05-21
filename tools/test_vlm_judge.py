@@ -134,14 +134,18 @@ def main():
               f"{r['class']}")
 
     print(f"[test_vlm_judge] step 3: VLM judge ({args.ollama_model})...")
-    kept, raw = judge_inventory(
+    kept, decisions, raw = judge_inventory(
         frame, records,
         model_name=args.ollama_model,
-        return_raw=True,
+        return_details=True,
     )
-    print("[test_vlm_judge]   raw VLM response:")
-    print("    " + raw.replace("\n", "\n    "))
+    print(f"[test_vlm_judge]   per-class decisions ({len(decisions)}):")
+    for d in decisions:
+        flag = "KEEP" if d["keep"] else "drop"
+        print(f"    [{flag}] {d['name']:<22s} {d['reason']}")
     print(f"[test_vlm_judge]   kept classes ({len(kept)}): {kept}")
+    print("[test_vlm_judge]   raw VLM response (JSON):")
+    print("    " + raw.replace("\n", "\n    "))
 
     prefix = args.output_prefix or (
         os.path.splitext(args.video)[0] + "_vlm_judge"

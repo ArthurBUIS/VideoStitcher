@@ -10,15 +10,26 @@ ask a locally-hosted vision-language model (Qwen2.5-VL via Ollama by
 default) to judge which classes in the inventory are visually
 important enough that the stitching seam should route around them.
 
-The big change from auto_fg v1 is that the VLM ranks by *importance*,
-not by foreground/background. A TV mounted on the back wall is far
-in depth but visually critical; a rug in the foreground is close in
-depth but the seam is invisible through it. The depth value goes
-into the prompt as a hint, but the VLM is the final decider.
+The VLM ranks by *importance*, not by foreground/background. A TV
+mounted on the back wall is far in depth but visually critical; a
+rug in the foreground is close in depth but a seam through it is
+invisible. Depth goes into the prompt as a hint, but the VLM is the
+final decider.
+
+Output is JSON-schema-constrained per-item decisions:
+    {"decisions": [{"name", "keep", "reason"}, ...]}
+which forces the model to commit a boolean per class (with one
+short sentence of justification). This pattern is known to work
+better than free-form lists on sub-7B Qwen2.5-VL variants -- the
+model has to think about each candidate twice instead of skimming.
+
+The prompt itself is a POSITIVE WHITELIST (keep only items that
+satisfy ALL of these rules) rather than an EXCLUDE-list-with-
+worked-examples; the research showed text-only few-shots aren't
+internalised by Qwen2.5-VL the way image-paired ones are.
 
 Why single-image, single-message: Qwen2.5-VL on Ollama has been
-unreliable with multi-image or composite inputs (GGML asserts, raw
-chat-template tokens leaking into the output). One frame in one
+unreliable with multi-image or composite inputs. One frame in one
 message is the only call shape that consistently behaves.
 """
 
@@ -34,67 +45,84 @@ DEFAULT_OLLAMA_MODEL = "qwen2.5vl:3b"
 _VLM_MAX_DIM = 896
 
 
-# The judge prompt. Edit this directly to tune which kinds of object
-# the VLM is inclined to keep. The {class_summary} placeholder is
-# filled per call from the depth-annotated inventory.
+# The judge prompt. Edit this directly to tune the keep rules. The
+# {class_summary} placeholder is filled per call from the depth-
+# annotated inventory.
+#
+# Design notes:
+#   - Positive whitelist (rules to KEEP), not a negation list.
+#   - No worked examples -- text-only few-shots don't help
+#     Qwen2.5-VL and the model tended to over-include.
+#   - The schema (built per call below) constrains output to a
+#     fixed JSON shape with one decision per class; the prompt only
+#     needs to communicate the rules + the output contract.
 JUDGE_PROMPT_TEMPLATE = """\
 You are helping configure a real-time video stitching system. A
 panorama seam will be drawn between two camera views of the same
 room. The seam can cause visible distortion where it crosses an
-object, so we need to route it AROUND a small set of visually
-important objects.
+object, so we need to route the seam AROUND items that would
+visibly break if a seam cut through them.
 
-Look at the image and at the list of detected objects. Among the
-list, keep only the classes that the seam should avoid cutting
-through.
+Look at the image. For EACH class in the list below, decide whether
+the panorama seam should avoid cutting through that class.
 
-Each entry lists how many instances of the class were detected and
-their depth range. Depth is normalized: 0.0 = far from the camera,
-1.0 = close to the camera.
+Keep a class ONLY when ALL of these are true:
+  1. Clearly defined geometry: sharp edges, straight lines, text,
+     a screen, or a recognisable rigid shape.
+  2. Foreground or mid-ground placement (depth closer to 1.0 means
+     closer to the camera; parallax matters most there).
+  3. A seam crossing the object would be visibly disruptive to a
+     human viewer.
 
-Detected objects:
+If a class does not satisfy ALL three rules, set keep = false.
+Common drops:
+  - floor / wall coverings (carpets, rugs, mats)
+  - soft / organic / blending shapes (plants, leaves, fabrics,
+    decorative cushions)
+  - far-background objects with no rigid geometry
+  - visually flat or repetitive items
+
+Depth is normalized: 0.0 = far from the camera, 1.0 = close. Each
+entry below lists how many instances of the class were detected and
+their depth range.
+
+Detected classes:
 {class_summary}
 
-Rules for picking classes to protect:
-  - Pick classes that would look bad if a seam cut across them:
-    items with sharp edges, text or screens, items the eye naturally
-    tracks.
-  - Foreground objects are more important, because their 
-    low distance to the cameras increase the parallax. Thus, a table
-    in the background must be dropped, while a table in the foreground
-    must be kept for example
-  - Far objects matter only if they are visually important. A TV on 
-    the back wall is worth protecting even though it is far, while a
-    plant on the back wall is not.
-  - EXCLUDE:
-      - floor or wall coverings that blend with surroundings
-        (carpets, rugs, mats, plain panels)
-      - things so small or visually flat that a seam through them
-        is invisible
-      - structural background (walls, ceilings, doors, windows)
-  - 3 to 8 classes total.
-
-Output format:
-  - ONLY a comma-separated list. No prose, no preface, no period,
-    no markdown.
-  - Class names must come EXACTLY from the list above, in lowercase.
-
-Example output: chair, tv, desk, picture frame
-
-Concrete examples:
-  - A blue chair on the foreground -> INCLUDE (it can cause visual 
-    artefacts because of the high parallax)
-  - A red chair on the background -> EXCLUDE (it is on the background
-    and is not an important object)
-  - A frame on the background -> INCLUDE (it is on the background
-    but is a notable object that should be preserved in the panorama)
-  - A ceiling light -> EXCLUDE (ceiling lights are structural and not
-    visually important)
-  - A plant on the background -> EXCLUDE (plants are visually complex
-    but often blend well with the surroundings, plus it's not the
-    main focus of the scene)
-
+For EACH class in the list above, emit one decision. The "reason"
+should be one short sentence anchored in the three rules above
+(e.g. "rigid screen in mid-ground", "soft organic shape in the
+background"). Use class names EXACTLY as they appear in the list.
 """
+
+
+def _build_decision_schema(class_names):
+    """
+    Build a JSON schema that constrains the VLM to emit exactly one
+    decision per class in `class_names`. The `name` field is locked
+    to that enum so the model can't hallucinate names.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "enum": list(class_names),
+                        },
+                        "keep": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["name", "keep", "reason"],
+                },
+            },
+        },
+        "required": ["decisions"],
+    }
 
 
 def _encode_png_bytes(frame_bgr):
@@ -119,11 +147,10 @@ def _downscale_long_side(frame_bgr, max_dim):
 def _summarize_inventory(records):
     """
     Group depth-annotated records by class name; return a multiline
-    bullet list with count + depth range for each class.
+    bullet list with instance count + depth range per class.
 
-    The order is by max depth descending so the VLM reads the
-    closest classes first -- a soft prior that closer things tend
-    to matter more, without forcing it on the model.
+    Ordered by max depth descending (closest classes first) -- a
+    soft prior nudging the model toward foreground-first reasoning.
     """
     by_class = {}
     for r in records:
@@ -147,37 +174,63 @@ def _summarize_inventory(records):
     return "\n".join(lines)
 
 
-def _parse_class_list(text, allowed):
+def _parse_decisions(raw_text, allowed):
     """
-    Parse the VLM's response into a list of class names, keeping only
-    those that appeared in the inventory (case-insensitive match).
-    Tolerates leading/trailing punctuation, markdown, prose noise.
+    Parse Ollama's JSON-schema-constrained response into a list of
+    decision dicts: [{"name", "keep", "reason"}, ...].
+
+    Filters out entries whose name isn't in `allowed` (defence
+    against any schema-validation failures or surprise outputs).
+    Preserves the model's emission order.
     """
-    text = (text or "").strip().strip(".").strip()
-    text = text.replace("**", "").replace("__", "").replace("`", "")
-    for prefix in ("output:", "answer:", "classes:", "result:"):
-        if text.lower().startswith(prefix):
-            text = text[len(prefix):].strip()
-    items = [it.strip().strip('"').strip("'").lower()
-             for it in text.split(",")]
-    items = [it for it in items if it]
-    allowed_lc = {a.lower(): a for a in allowed}
-    seen = set()
+    import json
+
+    text = (raw_text or "").strip()
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"VLM did not return JSON despite the schema constraint. "
+            f"Parse error: {e}\nRaw response:\n---\n{text}\n---"
+        )
+
+    decisions_raw = obj.get("decisions", [])
+    if not isinstance(decisions_raw, list):
+        raise RuntimeError(
+            f"VLM response missing 'decisions' array. Got:\n"
+            f"---\n{text}\n---"
+        )
+
+    allowed_set = set(allowed)
     out = []
-    for it in items:
-        if it in allowed_lc and it not in seen:
-            seen.add(it)
-            out.append(allowed_lc[it])
+    seen = set()
+    for d in decisions_raw:
+        if not isinstance(d, dict):
+            continue
+        name = d.get("name")
+        keep = d.get("keep")
+        reason = d.get("reason", "")
+        if not isinstance(name, str) or not isinstance(keep, bool):
+            continue
+        if name not in allowed_set or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "keep": keep, "reason": str(reason)})
     return out
 
 
 def judge_inventory(frame_bgr, records,
                     model_name=DEFAULT_OLLAMA_MODEL,
                     prompt_template=JUDGE_PROMPT_TEMPLATE,
-                    return_raw=False):
+                    return_details=False):
     """
-    Ask the VLM which classes in `records` are important enough that
-    the panorama seam should avoid cutting through them.
+    Ask the VLM which classes in `records` the panorama seam should
+    avoid cutting through.
+
+    The call uses Ollama's `format=` JSON-schema constraint to force
+    one decision per inventory class, with a boolean `keep` and a
+    one-sentence `reason`. The returned class list contains every
+    class where keep == true.
 
     Args:
         frame_bgr: HxWx3 uint8 BGR image -- the SINGLE frame the VLM
@@ -186,27 +239,26 @@ def judge_inventory(frame_bgr, records,
             single-frame.
         records: list of dicts as returned by
             stitcher.depth_inventory.annotate_inventory_with_depth.
-        model_name: Ollama tag of a Qwen2.5-VL model. Default is the
-            3 B variant which fits in 8 GB VRAM. Pass a larger tag if
-            you have the headroom.
+        model_name: Ollama tag of a Qwen2.5-VL model. Default
+            qwen2.5vl:3b. Try qwen2.5vl:7b if you have VRAM headroom.
         prompt_template: edit JUDGE_PROMPT_TEMPLATE at module scope
             to tune what the VLM keeps, or pass an override here.
             Must contain a {class_summary} placeholder.
-        return_raw: if True, also return the VLM's raw text response
-            (useful for the validator).
+        return_details: if True, also return (decisions, raw_text)
+            where decisions is the full per-item list (kept + dropped
+            + reasons) and raw_text is the VLM's JSON string.
 
     Returns:
-        list of class names to protect (subset of the classes
-        appearing in `records`, preserving the VLM's order).
-        If return_raw is True, returns (classes, raw_text).
+        list of class names to protect.
+        If return_details is True: (classes, decisions, raw_text).
 
     Raises RuntimeError with an actionable hint when the `ollama`
     package is missing, the daemon isn't running, the model isn't
-    pulled, or the VLM returned no usable class names.
+    pulled, the VLM returned malformed JSON, or no class was kept.
     """
     if not records:
-        if return_raw:
-            return [], ""
+        if return_details:
+            return [], [], ""
         return []
 
     try:
@@ -223,6 +275,9 @@ def judge_inventory(frame_bgr, records,
     small = _downscale_long_side(frame_bgr, _VLM_MAX_DIM)
     img_png = _encode_png_bytes(small)
 
+    allowed = sorted({r["class"] for r in records})
+    schema = _build_decision_schema(allowed)
+
     try:
         response = ollama.chat(
             model=model_name,
@@ -231,6 +286,7 @@ def judge_inventory(frame_bgr, records,
                 "content": prompt,
                 "images": [img_png],
             }],
+            format=schema,
             options={
                 # Deterministic: same room, same answer.
                 "temperature": 0.0,
@@ -244,17 +300,21 @@ def judge_inventory(frame_bgr, records,
             "run `ollama serve`.\n"
             f"  - Model not pulled. Run `ollama pull {model_name}`.\n"
             "  - Different tag on your machine. Pass model_name=... "
-            "to override."
+            "to override.\n"
+            "  - ollama Python package older than 0.4 (format= support). "
+            "Upgrade with: pip install -U ollama"
         ) from e
 
     raw = response.get("message", {}).get("content", "")
-    allowed = sorted({r["class"] for r in records})
-    classes = _parse_class_list(raw, allowed)
+    decisions = _parse_decisions(raw, allowed)
+    classes = [d["name"] for d in decisions if d["keep"]]
     if not classes:
         raise RuntimeError(
-            "VLM returned no usable class names. Raw response was:\n"
-            f"---\n{raw}\n---"
+            "VLM kept no classes. Per-item decisions:\n"
+            + "\n".join(f"  {d['name']}: keep={d['keep']} reason={d['reason']!r}"
+                        for d in decisions)
+            + f"\nRaw response:\n---\n{raw}\n---"
         )
-    if return_raw:
-        return classes, raw
+    if return_details:
+        return classes, decisions, raw
     return classes

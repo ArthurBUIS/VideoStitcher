@@ -334,14 +334,19 @@ def main():
                              "--fg_model is yoloe. Default: chair couch "
                              "bed 'dining table' tv laptop book "
                              "'potted plant' backpack. Pass the single "
-                             "value 'auto' to let auto-FG-v2 (YOLOE "
-                             "inventory + Depth Anything V2 + Qwen2.5-VL) "
-                             "pick the classes from frame 0 of --video_a.")
-    parser.add_argument("--auto_fg_ollama_model",
-                        default="qwen2.5vl:3b",
-                        help="Ollama model tag for the VLM judge when "
-                             "--yoloe_fg_classes is 'auto'. Default: "
-                             "qwen2.5vl:3b (fits in 8 GB VRAM).")
+                             "value 'auto' to load classes from the "
+                             "auto-FG-v2 JSON written by "
+                             "tools/suggest_fg_classes_v2.py (see "
+                             "--auto_fg_classes_json). When the JSON "
+                             "is missing or malformed, the pipeline "
+                             "falls back to a small hardcoded list.")
+    parser.add_argument("--auto_fg_classes_json",
+                        default=None,
+                        help="Path to the auto-FG-v2 JSON consumed "
+                             "when --yoloe_fg_classes is 'auto'. "
+                             "Default: auto_fg_classes.json in the "
+                             "current directory (matches the default "
+                             "output of tools/suggest_fg_classes_v2.py).")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
@@ -442,24 +447,21 @@ def main():
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
 
-    # --yoloe_fg_classes auto: run the VLM discovery flow on frame 0
-    # of video_a BEFORE the stitcher allocates any state, then drop
-    # the resulting class list into args in place.
+    # --yoloe_fg_classes auto: read the class list from the JSON file
+    # written by tools/suggest_fg_classes_v2.py. No VLM in this
+    # process. If the file is missing or malformed, fall back to a
+    # small hardcoded list so the pipeline still boots.
     from stitcher.auto_fg_v2 import (
-        is_auto_sentinel, read_frame_zero, suggest_fg_classes_v2,
+        DEFAULT_AUTO_FG_JSON, is_auto_sentinel, load_classes_from_json,
     )
+    AUTO_FG_HARDCODED_FALLBACK = [
+        "screen", "frames", "stool", "chair", "computer",
+    ]
     if is_auto_sentinel(args.yoloe_fg_classes):
-        print(f"[auto-fg-v2] reading frame 0 from {args.video_a}")
-        frame = read_frame_zero(args.video_a)
-        print("[auto-fg-v2] running inventory + depth + VLM judge "
-              f"(ollama: {args.auto_fg_ollama_model})...")
-        classes = suggest_fg_classes_v2(
-            frame,
-            yoloe_weights=args.yoloe_weights,
-            ollama_model=args.auto_fg_ollama_model,
+        json_path = args.auto_fg_classes_json or DEFAULT_AUTO_FG_JSON
+        args.yoloe_fg_classes = load_classes_from_json(
+            json_path, fallback_classes=AUTO_FG_HARDCODED_FALLBACK,
         )
-        print(f"[auto-fg-v2] selected classes: {classes}")
-        args.yoloe_fg_classes = classes
 
     run(args)
 

@@ -1,7 +1,10 @@
 """
 Auto-discovery of the static-FG class list for --yoloe_fg_classes.
 
-Orchestrates Steps 0+1+2+3 of the auto-FG-v2 flow on one camera frame:
+The discovery flow itself runs OFF the main pipeline now: a standalone
+CLI (tools/suggest_fg_classes_v2.py) chains the four steps below and
+writes a JSON file. The main video pipeline, when given
+`--yoloe_fg_classes auto`, just reads that JSON.
 
   Step 0: Qwen2.5-VL inventories the room (color + detail per item)
           (stitcher.vlm_inventory.list_objects_with_details).
@@ -10,27 +13,28 @@ Orchestrates Steps 0+1+2+3 of the auto-FG-v2 flow on one camera frame:
           (stitcher.object_inventory.detect_all_objects).
   Step 2: Depth Anything V2 annotates each bbox with a depth value
           in [0, 1] (stitcher.depth_inventory.annotate_inventory_with_depth).
-  Step 3: Qwen2.5-VL judges which classes the panorama seam should
-          route around (stitcher.vlm_judge.judge_inventory). The
-          VLM sees the image AND the depth-annotated inventory and
-          ranks by visual importance, not strict FG/BG.
+  Step 3: Qwen2.5-VL judges per class (JSON schema with per-item
+          keep + reason) which classes the panorama seam should
+          route around (stitcher.vlm_judge.judge_inventory).
 
-The flow runs BEFORE the stitcher allocates any GPU state, so each
-model only lives in VRAM during its own step:
+The discovery script is decoupled from the main pipeline so that:
+  - the pipeline's deps stay minimal (no ollama / transformers
+    needed unless the user explicitly invokes discovery)
+  - the JSON file is reusable across pipeline runs
+  - the model env (ollama daemon, weights, transformers cache) can
+    live somewhere else entirely
 
-  Qwen (step 0) -> Ollama process, separate VRAM
-  YOLOE         -> loaded + released inside detect_all_objects
-  Depth         -> loaded by annotate_inventory_with_depth, released
-                   by release_depth() before the VLM judge call
-  Qwen (step 3) -> Ollama process, separate VRAM
-
-Two entry points:
-  * tools/suggest_fg_classes_v2.py -- standalone CLI; prints the
-    comma-separated kept-class list to stdout.
-  * --yoloe_fg_classes auto -- video_stitcher_seam_gpu.py picks up
-    this sentinel in main() and runs suggest_fg_classes_v2() before
-    booting the stitching pipeline.
+Entry points:
+  * tools/suggest_fg_classes_v2.py  -- runs the discovery, writes
+    auto_fg_classes.json (or a custom path), and also prints the
+    kept-class list to stdout for piping.
+  * video_stitcher_seam_gpu.py with --yoloe_fg_classes auto --
+    reads the JSON via load_classes_from_json() below; falls back
+    to a hardcoded list if the file is missing or malformed.
 """
+
+import json
+import os
 
 import cv2
 
@@ -45,6 +49,10 @@ from stitcher.vlm_judge import DEFAULT_OLLAMA_MODEL, judge_inventory
 
 # Sentinels for --yoloe_fg_classes that trigger auto-discovery.
 AUTO_SENTINELS = ("auto", "automatic")
+
+# Default path for the JSON written by tools/suggest_fg_classes_v2.py
+# and read by the main pipeline. Relative to the user's cwd.
+DEFAULT_AUTO_FG_JSON = "auto_fg_classes.json"
 
 
 def is_auto_sentinel(values):
@@ -97,19 +105,18 @@ def suggest_fg_classes_v2(frame_bgr,
         inventory_vocab: optional pre-baked YOLOE text-class list.
             When provided, Step 0 is skipped and YOLOE looks for
             exactly these classes. Useful for ablation tests and to
-            force a known vocabulary (e.g. the hardcoded
-            INVENTORY_CLASSES fallback from
-            stitcher.object_inventory).
+            force a known vocabulary.
         return_details: if True, also return
-            (vocab, records, raw_vlm_text) where vocab is the YOLOE
-            text-class list and raw_vlm_text is the judge's raw
-            response.
+            (vocab, records, decisions, raw_vlm_text) where
+            decisions is the full per-item judge output (kept +
+            dropped + reasons) and raw_vlm_text is the judge's
+            JSON string response.
 
     Returns:
         list of class names to feed --yoloe_fg_classes (e.g.
         ['blue armchair', 'wooden desk', 'dual monitor setup', ...]).
         If return_details is True:
-            (classes, vocab, records, raw_vlm_text).
+            (classes, vocab, records, decisions, raw_vlm_text).
 
     Raises RuntimeError with an actionable hint if YOLOE finds
     nothing, if Ollama is unreachable, or if the VLM returns no
@@ -157,12 +164,60 @@ def suggest_fg_classes_v2(frame_bgr,
     release_depth()
 
     # Step 3
-    classes, raw = judge_inventory(
+    classes, decisions, raw = judge_inventory(
         frame_bgr, records,
         model_name=ollama_model,
-        return_raw=True,
+        return_details=True,
     )
 
     if return_details:
-        return classes, vocab, records, raw
+        return classes, vocab, records, decisions, raw
     return classes
+
+
+# ---------------------------------------------------------------------------
+# JSON I/O for the pipeline <-> discovery hand-off
+# ---------------------------------------------------------------------------
+
+
+def load_classes_from_json(path, fallback_classes):
+    """
+    Load `kept_classes` from a JSON file produced by
+    tools/suggest_fg_classes_v2.py.
+
+    Returns `fallback_classes` if:
+      - the file doesn't exist
+      - the file isn't valid JSON
+      - the top-level "kept_classes" key is missing
+      - "kept_classes" isn't a non-empty list of strings
+
+    Prints a one-line diagnostic to stderr for each failure mode so
+    the user can tell *why* the fallback kicked in.
+    """
+    import sys
+
+    if not os.path.isfile(path):
+        print(f"[auto-fg-v2] no JSON at {path!r}; using hardcoded "
+              f"fallback {fallback_classes}", file=sys.stderr)
+        return list(fallback_classes)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[auto-fg-v2] could not parse {path!r} ({e}); using "
+              f"hardcoded fallback {fallback_classes}", file=sys.stderr)
+        return list(fallback_classes)
+
+    kept = data.get("kept_classes")
+    if (not isinstance(kept, list)
+            or not kept
+            or not all(isinstance(c, str) for c in kept)):
+        print(f"[auto-fg-v2] {path!r} has no usable kept_classes; "
+              f"using hardcoded fallback {fallback_classes}",
+              file=sys.stderr)
+        return list(fallback_classes)
+
+    print(f"[auto-fg-v2] loaded {len(kept)} class(es) from {path!r}: "
+          f"{kept}", file=sys.stderr)
+    return list(kept)
