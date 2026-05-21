@@ -294,6 +294,33 @@ def main():
     parser.add_argument("--autocrop", action="store_true",
                         help="Crop output to the largest axis-aligned "
                              "rectangle inside the stitched canvas.")
+    parser.add_argument("--person_tracking", action="store_true",
+                        help="Emit a 3:2 horizontal sub-crop centred "
+                             "on the closest person (largest blob in "
+                             "the canvas-space person mask), smoothed "
+                             "so the output feels like a camera "
+                             "gliding on a horizontal rail. Implies "
+                             "--autocrop (tracking the raw canvas "
+                             "would track inside the polygonal black "
+                             "borders).")
+    parser.add_argument("--person_tracking_aspect", type=float,
+                        default=1.5,
+                        help="Width/height ratio of the tracking crop. "
+                             "Default: 1.5 (3:2). Only the horizontal "
+                             "bounds change; full height is kept.")
+    parser.add_argument("--person_tracking_smooth_seconds", type=float,
+                        default=1.0,
+                        help="EMA time constant for the crop centre "
+                             "when a person is detected. Default: "
+                             "1.0 s. Lower = camera follows the person "
+                             "more snappily; higher = more sluggish.")
+    parser.add_argument("--person_tracking_drift_seconds", type=float,
+                        default=3.0,
+                        help="EMA time constant for the drift-back-to-"
+                             "centre behaviour when no person is "
+                             "detected. Default: 3.0 s (slower than "
+                             "the tracking constant so a brief absence "
+                             "doesn't trigger an obvious re-centring).")
     parser.add_argument("--yolo_every", type=int, default=8)
     parser.add_argument("--mask_dilate", type=int, default=15)
     parser.add_argument("--mask_ema", type=float, default=1.0,
