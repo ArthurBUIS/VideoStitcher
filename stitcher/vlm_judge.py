@@ -95,18 +95,35 @@ and their depth range.
 Detected classes:
 {class_summary}
 
-For EACH class in the list above, emit one decision. The "reason"
-should be one short sentence that names the specific keep or drop rule
-(1, 2, 3, 4, 5 or 6) that triggered, or the specific drop condition. Use
+For EACH class in the list above, emit one decision. The "rule"
+field must be the integer (1, 2, 3, 4, 5, or 6) of the rule that
+triggered for that class. Pick exactly ONE rule per class. Use
 class names EXACTLY as they appear in the list.
 """
+
+
+# Rule number -> (keep, human-readable reason). Edit this in tandem
+# with the rule list in JUDGE_PROMPT_TEMPLATE above. Rules 1+2 are
+# keeps; the rest are drops. The reason text is what downstream
+# code (test_vlm_judge, suggest_fg_classes_v2) shows in its logs.
+_RULE_TO_KEEP_AND_REASON = {
+    1: (True,  "screen / image / text (rule 1)"),
+    2: (True,  "foreground object, depth > 0.4 (rule 2)"),
+    3: (False, "floor / wall covering (rule 3)"),
+    4: (False, "structural background (rule 4)"),
+    5: (False, "decorative background object (rule 5)"),
+    6: (False, "other background (rule 6)"),
+}
 
 
 def _build_decision_schema(class_names):
     """
     Build a JSON schema that constrains the VLM to emit exactly one
     decision per class in `class_names`. The `name` field is locked
-    to that enum so the model can't hallucinate names.
+    to the inventory enum so the model can't hallucinate names; the
+    `rule` field is locked to integers 1..6 (one of the rules in
+    JUDGE_PROMPT_TEMPLATE). Rule -> keep/reason conversion happens
+    in _parse_decisions via _RULE_TO_KEEP_AND_REASON.
     """
     return {
         "type": "object",
@@ -120,10 +137,12 @@ def _build_decision_schema(class_names):
                             "type": "string",
                             "enum": list(class_names),
                         },
-                        "keep": {"type": "boolean"},
-                        "reason": {"type": "string"},
+                        "rule": {
+                            "type": "integer",
+                            "enum": sorted(_RULE_TO_KEEP_AND_REASON),
+                        },
                     },
-                    "required": ["name", "keep", "reason"],
+                    "required": ["name", "rule"],
                 },
             },
         },
@@ -183,10 +202,15 @@ def _summarize_inventory(records):
 def _parse_decisions(raw_text, allowed):
     """
     Parse Ollama's JSON-schema-constrained response into a list of
-    decision dicts: [{"name", "keep", "reason"}, ...].
+    decision dicts: [{"name", "keep", "reason", "rule"}, ...].
 
-    Filters out entries whose name isn't in `allowed` (defence
-    against any schema-validation failures or surprise outputs).
+    Each VLM entry carries a "rule" integer; this function looks up
+    (keep, reason) in _RULE_TO_KEEP_AND_REASON and emits the same
+    {name, keep, reason} shape downstream code already consumes,
+    plus a "rule" field for visibility.
+
+    Filters out entries whose name isn't in `allowed` or whose rule
+    isn't in the mapping (defence against schema-validation surprises).
     Preserves the model's emission order.
     """
     import json
@@ -214,14 +238,22 @@ def _parse_decisions(raw_text, allowed):
         if not isinstance(d, dict):
             continue
         name = d.get("name")
-        keep = d.get("keep")
-        reason = d.get("reason", "")
-        if not isinstance(name, str) or not isinstance(keep, bool):
+        rule = d.get("rule")
+        if not isinstance(name, str) or not isinstance(rule, int):
             continue
         if name not in allowed_set or name in seen:
             continue
+        mapping = _RULE_TO_KEEP_AND_REASON.get(rule)
+        if mapping is None:
+            continue
+        keep, reason = mapping
         seen.add(name)
-        out.append({"name": name, "keep": keep, "reason": str(reason)})
+        out.append({
+            "name": name,
+            "keep": keep,
+            "reason": reason,
+            "rule": rule,
+        })
     return out
 
 
