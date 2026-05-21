@@ -80,6 +80,45 @@ class PersonSegmenter:
         merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
         return cv2.resize(merged_small, (W, H), interpolation=cv2.INTER_NEAREST)
 
+    def predict_classes_boxes(self, frame_bgr,
+                              class_ids=(PERSON_CLASS_ID,)):
+        """
+        Run inference and return per-class bounding boxes (no mask
+        post-processing). Mirror of predict_classes_mask_gpu but
+        returning box coordinates instead of a union mask.
+
+        Returns: dict {class_id (int): [(x1, y1, x2, y2, conf), ...]}.
+        Classes with no detections get an empty list. Pixel coords
+        in the input frame.
+
+        class_ids semantics match the mask helpers (COCO indices for
+        YOLOv8, indices into text_classes for YOLOE). Used by the
+        depth-aware static-FG selector (stitcher.static_fg) to look
+        up per-class bbox depth without paying for full mask
+        post-processing.
+        """
+        results = self.model.predict(
+            frame_bgr, classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = {int(cid): [] for cid in class_ids}
+        if not results:
+            return out
+        r = results[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return out
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        cls = r.boxes.cls.cpu().numpy().astype(int)
+        conf = r.boxes.conf.cpu().numpy()
+        for i in range(len(cls)):
+            cid = int(cls[i])
+            if cid in out:
+                out[cid].append((float(xyxy[i, 0]), float(xyxy[i, 1]),
+                                 float(xyxy[i, 2]), float(xyxy[i, 3]),
+                                 float(conf[i])))
+        return out
+
     def predict_classes_mask_gpu(self, frame_bgr, target_hw,
                                  class_ids=(PERSON_CLASS_ID,)):
         """

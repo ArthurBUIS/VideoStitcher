@@ -333,7 +333,19 @@ def main():
                         help="Text prompts for static FG classes when "
                              "--fg_model is yoloe. Default: chair couch "
                              "bed 'dining table' tv laptop book "
-                             "'potted plant' backpack.")
+                             "'potted plant' backpack. Pass the single "
+                             "value 'auto' to let the depth-aware "
+                             "static-FG selector pick the list from "
+                             "frame 0 of --video_a (see "
+                             "stitcher/static_fg.py for the ALWAYS_KEEP "
+                             "and FOREGROUND_ONLY tier lists).")
+    parser.add_argument("--static_fg_depth_threshold", type=float,
+                        default=None,
+                        help="Override the normalized-depth threshold "
+                             "for the FOREGROUND_ONLY tier when "
+                             "--yoloe_fg_classes is 'auto'. Depth is in "
+                             "[0, 1] where 1.0 = closest to the camera. "
+                             "Default: stitcher.static_fg.FG_DEPTH_THRESHOLD.")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
@@ -433,6 +445,41 @@ def main():
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
+
+    # --yoloe_fg_classes auto: run the depth-aware tiered selector on
+    # frame 0 of video_a BEFORE the stitcher allocates any state, then
+    # drop the resulting class list into args in place.
+    if (len(args.yoloe_fg_classes) == 1
+            and str(args.yoloe_fg_classes[0]).strip().lower()
+            in ("auto", "automatic")):
+        import cv2
+        from stitcher.static_fg import select_fg_classes_static
+
+        print(f"[static-fg] reading frame 0 from {args.video_a}")
+        cap = cv2.VideoCapture(args.video_a)
+        try:
+            ok, frame0 = cap.read()
+        finally:
+            cap.release()
+        if not ok or frame0 is None:
+            raise RuntimeError(
+                f"--yoloe_fg_classes auto: could not read frame 0 "
+                f"from {args.video_a}"
+            )
+        print("[static-fg] running YOLOE + depth on frame 0...")
+        kept, verdicts = select_fg_classes_static(
+            frame0,
+            depth_threshold=args.static_fg_depth_threshold,
+            yoloe_weights=args.yoloe_weights,
+            return_details=True,
+        )
+        for v in verdicts:
+            flag = "keep" if v["kept"] else "drop"
+            print(f"  [{flag}] {v['class']:<20s} ({v['tier']}): "
+                  f"{v['reason']}")
+        print(f"[static-fg] final vocab ({len(kept)}): {kept}")
+        args.yoloe_fg_classes = kept
+
     run(args)
 
 
