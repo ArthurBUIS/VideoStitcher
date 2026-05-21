@@ -70,10 +70,8 @@ Set keep = true if ANY ONE of the following clearly applies:
   1. The class contains a screen, an image, or text that would
      visibly misalign if a seam crossed it. Examples: TVs, monitors,
      framed art, posters, whiteboards, screens of any kind -> true
-  2. The class is an object belonging to the foreground or 
-     mid-ground. You can detect it by its depth score (0.0 = far, 
-     1.0 = close). The object should be kept only if its depth is
-     higher than 0.4 -> true
+  2. The class is an object belonging to the foreground, so its depth
+     is higher than 0.4 -> true
      
 
 Set keep = false ONLY when the class clearly satisfies one of these:
@@ -81,8 +79,10 @@ Set keep = false ONLY when the class clearly satisfies one of these:
     doesn't track (carpets, rugs, mats) -> false
   4. Structural background that's clearly not an object (walls,
     ceiling, doors, windows) -> false
-  5. Any other objects that belong to the background and was not
-     concerned by the 4 rules above -> false
+  5. Decorative background objects that is not a screen or a frame
+     (lamps, plants, furniture) -> false
+  6. Any other objects that belong to the background and was not
+     concerned by the 5 rules above -> false
 
 Default when uncertain: keep = true. Over-keeping is cheap (the
 seam planner can route around extras). Over-dropping is expensive
@@ -97,7 +97,7 @@ Detected classes:
 
 For EACH class in the list above, emit one decision. The "reason"
 should be one short sentence that names the specific keep or drop rule
-(1, 2, 3 or 4) that triggered, or the specific drop condition. Use
+(1, 2, 3, 4, 5 or 6) that triggered, or the specific drop condition. Use
 class names EXACTLY as they appear in the list.
 """
 
