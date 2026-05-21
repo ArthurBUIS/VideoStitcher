@@ -63,36 +63,47 @@ room. The seam can cause visible distortion where it crosses an
 object, so we need to route the seam AROUND items that would
 visibly break if a seam cut through them.
 
-Look at the image. For EACH class in the list below, decide whether
-the panorama seam should avoid cutting through that class.
+Look at the image. For EACH class in the list below, decide
+keep = true or keep = false.
 
-Keep a class ONLY when ALL of these are true:
-  1. Clearly defined geometry: sharp edges, straight lines, text,
-     a screen, or a recognisable rigid shape.
-  2. Foreground or mid-ground placement (depth closer to 1.0 means
-     closer to the camera; parallax matters most there).
-  3. A seam crossing the object would be visibly disruptive to a
-     human viewer.
+Set keep = true if ANY ONE of the following clearly applies:
+  1. The class has rigid geometry that a viewer's eye tracks --
+     sharp edges, straight lines, recognisable furniture silhouette.
+     Examples that qualify: chairs, armchairs, stools, tables,
+     desks, shelves, cabinets, picture frames, posters, lamps,
+     monitors, TVs.
+  2. The class contains text, a screen, or fine detail that would
+     visibly misalign if a seam crossed it. Examples: TVs, monitors,
+     framed art, posters, whiteboards, books, screens of any kind.
+  3. The class is a substantial piece of foreground or mid-ground
+     furniture (depth closer to 1.0 = closer to the camera) that a
+     viewer would notice on entering the room.
 
-If a class does not satisfy ALL three rules, set keep = false.
-Common drops:
-  - floor / wall coverings (carpets, rugs, mats)
-  - soft / organic / blending shapes (plants, leaves, fabrics,
-    decorative cushions)
-  - far-background objects with no rigid geometry
-  - visually flat or repetitive items
+Set keep = false ONLY when the class clearly fails all three:
+  - Floor or wall coverings whose pattern repeats and the eye
+    doesn't track (carpets, rugs, mats).
+  - Genuinely soft / organic / non-rigid items where distortion
+    is invisible (plants, leaves, fabric throws, cushions). A
+    framed PICTURE of a plant is still a framed picture -- keep
+    it. An armchair is rigid furniture, not "soft" -- keep it.
+  - Structural background that's clearly not an object (walls,
+    ceiling, doors, windows).
+
+Default when uncertain: keep = true. Over-keeping is cheap (the
+seam planner can route around extras). Over-dropping is expensive
+(the seam can then cut through important objects).
 
 Depth is normalized: 0.0 = far from the camera, 1.0 = close. Each
-entry below lists how many instances of the class were detected and
-their depth range.
+entry below lists how many instances of the class were detected
+and their depth range.
 
 Detected classes:
 {class_summary}
 
 For EACH class in the list above, emit one decision. The "reason"
-should be one short sentence anchored in the three rules above
-(e.g. "rigid screen in mid-ground", "soft organic shape in the
-background"). Use class names EXACTLY as they appear in the list.
+should be one short sentence that names the specific keep rule
+(1, 2, or 3) that triggered, or the specific drop condition. Use
+class names EXACTLY as they appear in the list.
 """
 
 
