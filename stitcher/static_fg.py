@@ -50,7 +50,6 @@ ALWAYS_KEEP = [
     "screen",
     "picture frame",
     "poster",
-    "whiteboard",
 ]
 
 FOREGROUND_ONLY = [
@@ -70,7 +69,6 @@ FOREGROUND_ONLY = [
     "plant",
     "potted plant",
     "houseplant",
-    "lamp",
     "floor lamp",
 ]
 
