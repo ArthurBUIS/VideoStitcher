@@ -180,7 +180,14 @@ def _build_segmenters(args, dev):
     Build one segmenter per task (person, FG). When both tasks pick the
     same model type, share a single underlying model.
 
-    Returns (person_segmenter, person_class_ids, fg_segmenter, fg_class_ids).
+    For YOLOE FG, the vocabulary is taken from
+    stitcher.static_fg (ALWAYS_KEEP + FOREGROUND_ONLY) -- the
+    --yoloe_fg_classes CLI arg is ignored in that path. The returned
+    `fg_only_class_ids` is the subset of fg_class_ids that the runtime
+    depth filter applies to (i.e. the FOREGROUND_ONLY entries).
+
+    Returns (person_segmenter, person_class_ids, fg_segmenter,
+             fg_class_ids, fg_only_class_ids).
     """
     person_yoloe = args.person_model == "yoloe"
     fg_yoloe = args.fg_model == "yoloe"
@@ -194,20 +201,35 @@ def _build_segmenters(args, dev):
             use_yoloe=True, text_classes=text_classes,
         )
 
+    # YOLOE-FG vocabulary always comes from stitcher.static_fg now.
+    if fg_yoloe:
+        from stitcher.static_fg import (
+            get_combined_vocab, get_fg_only_indices,
+        )
+        fg_vocab = get_combined_vocab()
+    else:
+        fg_vocab = None  # YOLOv8 path uses COCO IDs, no text vocab.
+
     if person_yoloe and fg_yoloe:
-        text_classes = [args.yoloe_person_class] + list(args.yoloe_fg_classes)
+        text_classes = [args.yoloe_person_class] + list(fg_vocab)
         print(f"[info] Loading YOLOE for person + FG: {args.yoloe_weights}")
         print(f"[info] YOLOE classes (index 0 = person, 1+ = FG): {text_classes}")
         person_segmenter = _mk_yoloe(text_classes)
         fg_segmenter = person_segmenter
         person_class_ids = [0]
         fg_class_ids = list(range(1, len(text_classes)))
+        # Map FOREGROUND_ONLY entries back into the combined-class
+        # indices: each fg_only_idx returned by get_fg_only_indices
+        # is a position in fg_vocab, which lives at fg_class_ids[idx].
+        fg_only_local = get_fg_only_indices(fg_vocab)
+        fg_only_class_ids = [fg_class_ids[i] for i in fg_only_local]
     elif not person_yoloe and not fg_yoloe:
         print(f"[info] Loading YOLOv8 for person + FG: {args.yolo_weights}")
         person_segmenter = _mk_yolov8()
         fg_segmenter = person_segmenter
         person_class_ids = [PERSON_CLASS_ID]
         fg_class_ids = list(args.fg_classes)
+        fg_only_class_ids = []
     elif person_yoloe and not fg_yoloe:
         print(f"[info] Loading YOLOE for person: {args.yoloe_weights} "
               f"(class: {args.yoloe_person_class!r})")
@@ -216,16 +238,19 @@ def _build_segmenters(args, dev):
         print(f"[info] Loading YOLOv8 for FG: {args.yolo_weights}")
         fg_segmenter = _mk_yolov8()
         fg_class_ids = list(args.fg_classes)
+        fg_only_class_ids = []
     else:  # not person_yoloe and fg_yoloe
         print(f"[info] Loading YOLOv8 for person: {args.yolo_weights}")
         person_segmenter = _mk_yolov8()
         person_class_ids = [PERSON_CLASS_ID]
         print(f"[info] Loading YOLOE for FG: {args.yoloe_weights} "
-              f"(classes: {list(args.yoloe_fg_classes)})")
-        fg_segmenter = _mk_yoloe(list(args.yoloe_fg_classes))
-        fg_class_ids = list(range(len(args.yoloe_fg_classes)))
+              f"(vocab from stitcher.static_fg, {len(fg_vocab)} classes)")
+        fg_segmenter = _mk_yoloe(list(fg_vocab))
+        fg_class_ids = list(range(len(fg_vocab)))
+        fg_only_class_ids = get_fg_only_indices(fg_vocab)
 
-    return person_segmenter, person_class_ids, fg_segmenter, fg_class_ids
+    return (person_segmenter, person_class_ids,
+            fg_segmenter, fg_class_ids, fg_only_class_ids)
 
 
 def _print_device_banner(dev):
@@ -362,7 +387,8 @@ def run(args):
             lut_a = build_gain_lut(gains_a)
             lut_b = build_gain_lut(gains_b)
 
-    person_segmenter, person_class_ids, fg_segmenter, fg_class_ids = (
+    (person_segmenter, person_class_ids,
+     fg_segmenter, fg_class_ids, fg_only_class_ids) = (
         _build_segmenters(args, dev)
     )
     dilate_kernel = cv2.getStructuringElement(
@@ -444,15 +470,35 @@ def run(args):
     use_fg = not args.no_fg
     fg_mask_bbox_t = None  # GPU path
     fg_mask_bbox = None    # CPU path
+    # Depth threshold for the runtime FOREGROUND_ONLY filter. Used
+    # only when fg_only_class_ids is non-empty (i.e. --fg_model
+    # yoloe). --static_fg_depth_threshold overrides the default from
+    # stitcher.static_fg.FG_DEPTH_THRESHOLD.
+    if fg_only_class_ids:
+        from stitcher.static_fg import FG_DEPTH_THRESHOLD
+        fg_depth_threshold = (args.static_fg_depth_threshold
+                              if args.static_fg_depth_threshold is not None
+                              else FG_DEPTH_THRESHOLD)
+    else:
+        fg_depth_threshold = None
     if use_fg:
-        print(f"[info] Computing static FG mask via YOLO segmentation. "
-              f"Class IDs: {fg_class_ids}")
+        if fg_only_class_ids:
+            print(f"[info] Computing static FG mask via YOLO segmentation "
+                  f"with per-detection depth filter "
+                  f"(threshold={fg_depth_threshold:.2f}). "
+                  f"Class IDs: {fg_class_ids} "
+                  f"(fg-only: {fg_only_class_ids})")
+        else:
+            print(f"[info] Computing static FG mask via YOLO segmentation. "
+                  f"Class IDs: {fg_class_ids}")
         t0 = time.time()
         if dev["cuda_available"]:
             fg_mask_bbox_t = compute_fg_mask_seg_gpu(
                 fg_segmenter, frame_a, frame_b, fg_class_ids,
                 grid_a_t, grid_b_t, args.fg_dilate,
                 static["overlap_bbox"], overlap_in_bbox_t,
+                fg_only_class_ids=fg_only_class_ids,
+                depth_threshold=fg_depth_threshold,
             )
             coverage = (fg_mask_bbox_t > 0).float().mean().item() * 100
         else:
@@ -461,6 +507,8 @@ def run(args):
                 map_ax, map_ay, map_bx, map_by,
                 fg_dilate_kernel,
                 static["overlap_bbox"], static["overlap_in_bbox"],
+                fg_only_class_ids=fg_only_class_ids,
+                depth_threshold=fg_depth_threshold,
             )
             coverage = float((fg_mask_bbox > 0).mean()) * 100
         print(f"[info] FG mask computed in {(time.time()-t0)*1000:.1f} ms  "
@@ -676,6 +724,8 @@ def run(args):
                     fg_segmenter, frame_a, frame_b, fg_class_ids,
                     grid_a_t, grid_b_t, args.fg_dilate,
                     static["overlap_bbox"], overlap_in_bbox_t,
+                    fg_only_class_ids=fg_only_class_ids,
+                    depth_threshold=fg_depth_threshold,
                 )
             else:
                 fg_mask_bbox = compute_fg_mask_seg_cpu(
@@ -683,6 +733,8 @@ def run(args):
                     map_ax, map_ay, map_bx, map_by,
                     fg_dilate_kernel,
                     static["overlap_bbox"], static["overlap_in_bbox"],
+                    fg_only_class_ids=fg_only_class_ids,
+                    depth_threshold=fg_depth_threshold,
                 )
 
         # Warp.

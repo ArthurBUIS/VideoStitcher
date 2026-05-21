@@ -330,10 +330,21 @@ def main():
                         default=["chair", "couch", "bed", "dining table",
                                  "tv", "laptop", "book", "potted plant",
                                  "backpack"],
-                        help="Text prompts for static FG classes when "
-                             "--fg_model is yoloe. Default: chair couch "
-                             "bed 'dining table' tv laptop book "
-                             "'potted plant' backpack.")
+                        help="Text prompts for static FG classes. Used "
+                             "ONLY when --fg_model is yolov8 (alongside "
+                             "--fg_classes for COCO IDs). When --fg_model "
+                             "is yoloe, the FG vocabulary comes from "
+                             "stitcher/static_fg.py's ALWAYS_KEEP + "
+                             "FOREGROUND_ONLY lists and this flag is "
+                             "ignored. Edit those lists to tune.")
+    parser.add_argument("--static_fg_depth_threshold", type=float,
+                        default=None,
+                        help="Override the normalized-depth threshold "
+                             "applied per detection to the FOREGROUND_ONLY "
+                             "tier (--fg_model yoloe only). Depth is in "
+                             "[0, 1] where 1.0 = closest to the camera. "
+                             "Default: stitcher.static_fg.FG_DEPTH_THRESHOLD "
+                             "(0.4).")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
