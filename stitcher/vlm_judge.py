@@ -36,7 +36,7 @@ message is the only call shape that consistently behaves.
 import cv2
 
 
-DEFAULT_OLLAMA_MODEL = "qwen2.5vl:3b"
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 
 
 # Image is downscaled before being sent to the VLM so the call fits
@@ -67,27 +67,22 @@ Look at the image. For EACH class in the list below, decide
 keep = true or keep = false.
 
 Set keep = true if ANY ONE of the following clearly applies:
-  1. The class has rigid geometry that a viewer's eye tracks --
-     sharp edges, straight lines, recognisable furniture silhouette.
-     Examples that qualify: chairs, armchairs, stools, tables,
-     desks, shelves, cabinets, picture frames, posters, lamps,
-     monitors, TVs.
-  2. The class contains text, a screen, or fine detail that would
+  1. The class contains a screen, an image, or text that would
      visibly misalign if a seam crossed it. Examples: TVs, monitors,
-     framed art, posters, whiteboards, books, screens of any kind.
-  3. The class is a substantial piece of foreground or mid-ground
-     furniture (depth closer to 1.0 = closer to the camera) that a
-     viewer would notice on entering the room.
+     framed art, posters, whiteboards, screens of any kind -> true
+  2. The class is an object belonging to the foreground or 
+     mid-ground. You can detect it by its depth score (0.0 = far, 
+     1.0 = close). The object should be kept only if its depth is
+     higher than 0.4 -> true
+     
 
-Set keep = false ONLY when the class clearly fails all three:
-  - Floor or wall coverings whose pattern repeats and the eye
-    doesn't track (carpets, rugs, mats).
-  - Genuinely soft / organic / non-rigid items where distortion
-    is invisible (plants, leaves, fabric throws, cushions). A
-    framed PICTURE of a plant is still a framed picture -- keep
-    it. An armchair is rigid furniture, not "soft" -- keep it.
-  - Structural background that's clearly not an object (walls,
-    ceiling, doors, windows).
+Set keep = false ONLY when the class clearly satisfies one of these:
+  3. Floor or wall coverings whose pattern repeats and the eye
+    doesn't track (carpets, rugs, mats) -> false
+  4. Structural background that's clearly not an object (walls,
+    ceiling, doors, windows) -> false
+  5. Any other objects that belong to the background and was not
+     concerned by the 4 rules above -> false
 
 Default when uncertain: keep = true. Over-keeping is cheap (the
 seam planner can route around extras). Over-dropping is expensive
@@ -101,8 +96,8 @@ Detected classes:
 {class_summary}
 
 For EACH class in the list above, emit one decision. The "reason"
-should be one short sentence that names the specific keep rule
-(1, 2, or 3) that triggered, or the specific drop condition. Use
+should be one short sentence that names the specific keep or drop rule
+(1, 2, 3 or 4) that triggered, or the specific drop condition. Use
 class names EXACTLY as they appear in the list.
 """
 
