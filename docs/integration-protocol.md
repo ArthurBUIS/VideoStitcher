@@ -290,7 +290,35 @@ later readers know why they're the way they are.
   time).
 
 
-## 11. Open items (post-spike)
+## 11. Implementation notes (post-spike)
+
+Lessons from the first end-to-end protocol spike
+(`tools/test_pipe_harness.py`) that aren't strictly part of the
+wire format but bind anyone implementing either side:
+
+- **Concurrent send and receive on both ends.** Each side MUST run
+  the input-send loop and the output-read loop on independent
+  threads (or independent async tasks). A single-threaded
+  "send-all-inputs then read-all-outputs" pattern *deadlocks*:
+  typical TCP send buffers are ~64 KB on Windows, so after the
+  first 1080p RGBA frame (~8 MB) both sides' `sendall` calls block
+  waiting for the peer to drain. The harness's "host" side hit
+  this and was restructured to drain stitched output on a reader
+  thread while the input sender runs on the main thread.
+
+- **Pair frames on the sender side.** Each frame header carries
+  its own timestamp; PipeFrameSource pairs them by waiting for one
+  frame per camera before emitting a tuple. Senders should still
+  alternate cameras 0, 1, 0, 1, ... at roughly the same wall-clock
+  rate to keep pairing latency low.
+
+- **One transport per channel.** The two named pipes (control,
+  frames) are *not* multiplexed onto a single connection. Cleaner
+  parsers; easier debugging; one side's slowness on one channel
+  doesn't block the other.
+
+
+## 12. Open items (post-spike)
 
 To be resolved once we have a working spike and concrete data:
 
