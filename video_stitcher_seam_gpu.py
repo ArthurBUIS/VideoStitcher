@@ -285,9 +285,31 @@ from stitcher.segmentation import DEFAULT_FG_CLASS_IDS
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video_a", required=True)
-    parser.add_argument("--video_b", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--video_a", default=None,
+                        help="Input video from camera A. Required with "
+                             "--io file (default).")
+    parser.add_argument("--video_b", default=None,
+                        help="Input video from camera B. Required with "
+                             "--io file (default).")
+    parser.add_argument("--output", default=None,
+                        help="Output stitched mp4. Required with "
+                             "--io file (default).")
+    # --- Pipe-mode I/O ---------------------------------------------------
+    parser.add_argument("--io", choices=["file", "pipe"], default="file",
+                        help="I/O mode. 'file' (default) reads two mp4 "
+                             "files and writes one mp4 file. 'pipe' "
+                             "connects to a host process (Electron, the "
+                             "test harness) over two TCP channels and "
+                             "streams paired RGBA frames in / stitched "
+                             "RGBA frames out. See "
+                             "docs/integration-protocol.md.")
+    parser.add_argument("--control_port", type=int, default=None,
+                        help="TCP port for the protocol's control channel "
+                             "(line-delimited JSON). Required with --io pipe.")
+    parser.add_argument("--frames_port", type=int, default=None,
+                        help="TCP port for the protocol's frames channel "
+                             "(binary, 32B header + RGBA payload). "
+                             "Required with --io pipe.")
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--debug_seam", action="store_true")
     parser.add_argument("--debug_mask", action="store_true")
@@ -471,7 +493,23 @@ def main():
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
-    run(args)
+
+    # Dispatch by I/O mode. File mode is the historical default and
+    # keeps the same CLI shape; pipe mode hands off to the long-lived
+    # service entry point in stitcher.pipe_main.
+    if args.io == "file":
+        if not (args.video_a and args.video_b and args.output):
+            parser.error(
+                "--io file requires --video_a, --video_b and --output"
+            )
+        run(args)
+    elif args.io == "pipe":
+        if args.control_port is None or args.frames_port is None:
+            parser.error(
+                "--io pipe requires --control_port and --frames_port"
+            )
+        from stitcher.pipe_main import run_pipe_session
+        run_pipe_session(args)
 
 
 if __name__ == "__main__":
