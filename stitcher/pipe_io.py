@@ -18,6 +18,7 @@ warping + DP.
 
 import numpy as np
 
+from stitcher.frame_io import FrameSink, FrameSource
 from stitcher.protocol import (
     FORMAT_RGBA8888,
     HEADER_SIZE,
@@ -31,7 +32,7 @@ from stitcher.protocol import (
 )
 
 
-class PipeFrameSource:
+class PipeFrameSource(FrameSource):
     """
     Reads paired (left, right) frames off the frames channel.
 
@@ -45,13 +46,46 @@ class PipeFrameSource:
     """
 
     def __init__(self, frames_transport, control_transport=None,
-                 cam_left_index=0, cam_right_index=1):
+                 cam_left_index=0, cam_right_index=1,
+                 declared_fps=30.0):
         self._fr = frames_transport
         self._ctrl = control_transport
         self._cam_left = cam_left_index
         self._cam_right = cam_right_index
         # Most recent frame per camera, awaiting its pair.
         self._pending = {cam_left_index: None, cam_right_index: None}
+        # Nominal fps used by the pipeline for EMA alphas + FG
+        # recompute cadence. In pipe mode there's no file-fps to read;
+        # the host can declare a value via start_session (the protocol
+        # doesn't currently carry one per camera, so this is fed in
+        # via the constructor). Spike default: 30 fps.
+        self._declared_fps = float(declared_fps)
+
+    def open(self):
+        # Transports are passed in already connected (the protocol
+        # handshake runs before this source is instantiated), so
+        # there's nothing to open at this layer. The method exists
+        # to satisfy the FrameSource ABC contract.
+        pass
+
+    def close(self):
+        # The two transports are owned by pipe_main (which manages
+        # the session lifecycle and closes them in its finally
+        # block), so this is a no-op. Kept to satisfy the ABC.
+        pass
+
+    @property
+    def output_fps(self):
+        return self._declared_fps
+
+    def summary(self):
+        return (f"[pipe] PipeFrameSource: declared {self._declared_fps:.2f} "
+                f"fps, paired cams ({self._cam_left}, {self._cam_right})")
+
+    def summary_post(self):
+        # No file-mode "frames dropped because of FPS desync" stat
+        # to report; the host is responsible for pairing.
+        return "[pipe] PipeFrameSource finished."
 
     def read_pair(self):
         """
@@ -124,19 +158,51 @@ class PipeFrameSource:
             pass
 
 
-class PipeFrameSink:
+class PipeFrameSink(FrameSink):
     """
     Writes stitched output frames to the frames channel.
 
     Takes a BGR uint8 HxWx3 numpy array (the pipeline's native
-    format), converts to RGBA, packs the header, sends both header
-    and payload over the transport.
+    format), converts to RGBA, packs the 32-byte header, sends both
+    header and payload over the transport. Async writes (GPU path)
+    are handled by synchronising the cuda event on the calling
+    thread, running the post-sync transform (debug overlays /
+    tracking crop), then sending. This serialises encoding on the
+    composite worker -- acceptable for the spike; a ThreadedVideoWriter-
+    style background thread can be added later if it becomes a
+    bottleneck.
     """
 
     def __init__(self, frames_transport):
         self._fr = frames_transport
 
-    def write(self, frame_bgr, timestamp_us):
+    def open(self, width, height, fps):
+        # The transport is already connected and the wire format is
+        # self-describing per frame, so there's no per-session
+        # setup. Kept to satisfy the FrameSink ABC.
+        pass
+
+    def write(self, frame_bgr, timestamp_us=0):
+        self._send_bgr(frame_bgr, timestamp_us)
+
+    def write_async(self, pinned, event, post_sync_fn=None, free_cb=None,
+                    timestamp_us=0):
+        try:
+            # Wait for the GPU pyramid + pinned copy to finish.
+            event.synchronize()
+            arr = pinned.numpy()
+            if post_sync_fn is not None:
+                arr = post_sync_fn(arr)
+            self._send_bgr(arr, timestamp_us)
+        finally:
+            if free_cb is not None:
+                free_cb()
+
+    def close(self):
+        # Transport is owned by pipe_main; no-op here.
+        pass
+
+    def _send_bgr(self, frame_bgr, timestamp_us):
         H, W = frame_bgr.shape[:2]
         # BGR -> RGBA. In a BGR array, ch 0 = B, 1 = G, 2 = R.
         # In an RGBA array,         ch 0 = R, 1 = G, 2 = B, 3 = A.
@@ -160,11 +226,6 @@ class PipeFrameSink:
         except ConnectionError:
             # Transport closed mid-write; treat as session-end.
             pass
-
-    def close(self):
-        # No resources held beyond the transport, which the caller
-        # owns. close() exists for symmetry with FrameSink users.
-        pass
 
 
 class ControlChannel:
