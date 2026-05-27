@@ -712,13 +712,9 @@ def run(args):
 
     # File-mode sink wraps cv2.VideoWriter + ThreadedVideoWriter.
     # Pipe mode plugs in PipeFrameSink behind the same FrameSink ABC.
-    print(f"[diag] opening sink (w={writer_output_size[0]} "
-          f"h={writer_output_size[1]} fps={source.output_fps:.3f})",
-          flush=True)
     sink = FileFrameSink(args.output)
     sink.open(writer_output_size[0], writer_output_size[1],
               source.output_fps)
-    print("[diag] sink open OK", flush=True)
 
     # Reuse the homography frame as the first iteration; subsequent
     # iterations pull from source.read_pair() (file mode: backed by
@@ -1534,14 +1530,8 @@ def run(args):
                         composite_in_q.put(SENTINEL)
                         return
                     fa, fb, idx, ts_us = item
-                    if idx < 3:
-                        print(f"[diag] compute_worker got frame {idx}",
-                              flush=True)
                     t_work0 = time.perf_counter()
                     payload = compute_one(fa, fb, idx, ts_us)
-                    if idx < 3:
-                        print(f"[diag] compute_worker done frame {idx}",
-                              flush=True)
                     if prof is not None:
                         prof["compute"].record(
                             (time.perf_counter() - t_work0) * 1000
@@ -1619,13 +1609,11 @@ def run(args):
         motion_thread = threading.Thread(
             target=motion_worker, name="motion", daemon=True,
         )
-    print("[diag] starting worker threads...", flush=True)
     compute_thread.start()
     composite_thread.start()
     yolo_thread.start()
     if motion_thread is not None:
         motion_thread.start()
-    print("[diag] worker threads started, entering main loop", flush=True)
 
     def profile_printer():
         # Rolling print every args.profile_interval seconds until shutdown.
@@ -1658,20 +1646,14 @@ def run(args):
                         (time.perf_counter() - t_dec0) * 1000
                     )
                 if pair is None:
-                    print("[diag] source returned None (EOF)", flush=True)
                     break
                 fa, fb, ts_us = pair
-            if frame_idx < 3:
-                print(f"[diag] putting frame {frame_idx} on compute_in_q "
-                      f"(qsize={compute_in_q.qsize()})", flush=True)
             t_put0 = time.perf_counter()
             compute_in_q.put((fa, fb, frame_idx, ts_us))
             if prof is not None:
                 prof["main_put_wait"].record(
                     (time.perf_counter() - t_put0) * 1000
                 )
-            if frame_idx < 3:
-                print(f"[diag] put frame {frame_idx} done", flush=True)
             frame_idx += 1
             if args.max_frames and frame_idx >= args.max_frames:
                 break
