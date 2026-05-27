@@ -94,8 +94,6 @@ from stitcher.geometry import (
     find_autocrop_rect,
 )
 from stitcher.io_utils import (
-    PrefetchingFrameReader,
-    ThreadedVideoWriter,
     draw_mask_overlay,
     draw_seam_overlay,
 )
@@ -141,7 +139,7 @@ from stitcher.segmentation import (
     compute_fg_mask_seg_cpu,
     compute_fg_mask_seg_gpu,
 )
-from stitcher.sync_reader import FrameSyncReader
+from stitcher.frame_io import FileFrameSink, FileFrameSource
 from stitcher.warp import (
     apply_gain_lut,
     build_gain_lut,
@@ -315,20 +313,20 @@ def run(args):
     args.video_a = _resolve_relpath(args.video_a)
     args.video_b = _resolve_relpath(args.video_b)
 
-    cap_a = cv2.VideoCapture(args.video_a)
-    cap_b = cv2.VideoCapture(args.video_b)
-    if not cap_a.isOpened() or not cap_b.isOpened():
-        raise RuntimeError("Could not open one of the input videos.")
-    fps_a = cap_a.get(cv2.CAP_PROP_FPS) or 25.0
-    fps_b = cap_b.get(cv2.CAP_PROP_FPS) or 25.0
-
-    sync_reader = FrameSyncReader(cap_a, cap_b, fps_a, fps_b)
-    print(sync_reader.summary())
+    # File-mode source. FileFrameSource encapsulates the pair of
+    # cv2.VideoCapture handles + FrameSyncReader (FPS desync) +
+    # PrefetchingFrameReader (overlap decode with compute). The pipe-
+    # mode source plugs into the same place via the same FrameSource
+    # ABC -- see stitcher/frame_io.py.
+    source = FileFrameSource(args.video_a, args.video_b)
+    source.open()
+    print(source.summary())
 
     # Read the first paired frame (used for homography + gain seed).
-    ok, frame_a, frame_b = sync_reader.read()
-    if not ok:
+    first_pair = source.read_pair()
+    if first_pair is None:
         raise RuntimeError("Could not read first frame pair.")
+    frame_a, frame_b, first_ts_us = first_pair
 
     print("[info] Estimating homography from first frame pair...")
     H_b_to_a = estimate_homography(frame_a, frame_b)
@@ -523,7 +521,7 @@ def run(args):
               f"({coverage:.1f}% of bbox flagged).")
 
     fg_recompute_frames = (
-        int(round(args.fg_recompute_seconds * sync_reader.output_fps))
+        int(round(args.fg_recompute_seconds * source.output_fps))
         if args.fg_recompute_seconds > 0 else 0
     )
     if use_fg and fg_recompute_frames > 0:
@@ -699,7 +697,7 @@ def run(args):
         tracker = PersonTracker(
             smooth_seconds=args.person_tracking_smooth_seconds,
             drift_seconds=args.person_tracking_drift_seconds,
-            fps=sync_reader.output_fps,
+            fps=source.output_fps,
             aspect=args.person_tracking_aspect,
         )
         writer_output_size = tracker.get_crop_size(
@@ -712,17 +710,16 @@ def run(args):
               f"smooth {args.person_tracking_smooth_seconds:.1f}s, "
               f"drift {args.person_tracking_drift_seconds:.1f}s).")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, writer_output_size)
-    if not raw_writer.isOpened():
-        raise RuntimeError(f"Could not open output writer for {args.output}")
-    writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
+    # File-mode sink wraps cv2.VideoWriter + ThreadedVideoWriter.
+    # Pipe mode plugs in PipeFrameSink behind the same FrameSink ABC.
+    sink = FileFrameSink(args.output)
+    sink.open(writer_output_size[0], writer_output_size[1],
+              source.output_fps)
 
     # Reuse the homography frame as the first iteration; subsequent
-    # iterations pull from a background thread that decodes the next
-    # paired frame in parallel with the compute loop.
-    pending_first_pair = (frame_a, frame_b)
-    prefetch_reader = PrefetchingFrameReader(sync_reader, queue_depth=3)
+    # iterations pull from source.read_pair() (file mode: backed by
+    # the prefetch decoder thread inside FileFrameSource).
+    pending_first_pair = (frame_a, frame_b, first_ts_us)
 
     # --- Per-frame compute and composite, as nested closures ---------------
     #
@@ -734,7 +731,7 @@ def run(args):
     # the final stitched image (composite_one). The two stages run on
     # consecutive frames at the same time.
 
-    def compute_one(frame_a, frame_b, frame_idx):
+    def compute_one(frame_a, frame_b, frame_idx, timestamp_us):
         """Warp + cost + EMA + DP seam. YOLO runs async on its own
         worker; we submit a request when it's time and read the latest
         published person mask from mask_holder.
@@ -962,6 +959,7 @@ def run(args):
 
         return {
             "frame_idx": frame_idx,
+            "timestamp_us": timestamp_us,
             "warped_a_t": warped_a_t,
             "warped_b_t": warped_b_t,
             "warped_a": warped_a,
@@ -978,11 +976,11 @@ def run(args):
         """Run the multi-band composite + debug overlays + autocrop.
 
         On GPU: returns ("async", pinned, event, post_sync_fn, free_cb)
-        — composite_worker hands this off to writer.write_async, which
+        — composite_worker hands this off to sink.write_async, which
         synchronises on the event before encoding. composite_one itself
         does NOT wait for the GPU.
 
-        On CPU: returns ("sync", stitched_ndarray) — the writer takes
+        On CPU: returns ("sync", stitched_ndarray) — the sink takes
         the already-materialized frame.
         """
         # Wait for the compute stage's output tensors to be ready (their
@@ -1525,9 +1523,9 @@ def run(args):
                     if item is SENTINEL:
                         composite_in_q.put(SENTINEL)
                         return
-                    fa, fb, idx = item
+                    fa, fb, idx, ts_us = item
                     t_work0 = time.perf_counter()
-                    payload = compute_one(fa, fb, idx)
+                    payload = compute_one(fa, fb, idx, ts_us)
                     if prof is not None:
                         prof["compute"].record(
                             (time.perf_counter() - t_work0) * 1000
@@ -1566,13 +1564,15 @@ def run(args):
                             (time.perf_counter() - t_work0) * 1000
                         )
                     t_write0 = time.perf_counter()
+                    payload_ts_us = payload.get("timestamp_us", 0)
                     if result[0] == "async":
                         _, pinned, event, post_sync_fn, free_cb = result
-                        writer.write_async(pinned, event,
-                                           post_sync_fn, free_cb)
+                        sink.write_async(pinned, event,
+                                         post_sync_fn, free_cb,
+                                         timestamp_us=payload_ts_us)
                     else:
                         _, stitched = result
-                        writer.write(stitched)
+                        sink.write(stitched, timestamp_us=payload_ts_us)
                     if prof is not None:
                         prof["composite_write"].record(
                             (time.perf_counter() - t_write0) * 1000
@@ -1620,19 +1620,20 @@ def run(args):
     try:
         while True:
             if pending_first_pair is not None:
-                fa, fb = pending_first_pair
+                fa, fb, ts_us = pending_first_pair
                 pending_first_pair = None
             else:
                 t_dec0 = time.perf_counter()
-                ok, fa, fb = prefetch_reader.read()
+                pair = source.read_pair()
                 if prof is not None:
                     prof["decode"].record(
                         (time.perf_counter() - t_dec0) * 1000
                     )
-                if not ok:
+                if pair is None:
                     break
+                fa, fb, ts_us = pair
             t_put0 = time.perf_counter()
-            compute_in_q.put((fa, fb, frame_idx))
+            compute_in_q.put((fa, fb, frame_idx, ts_us))
             if prof is not None:
                 prof["main_put_wait"].record(
                     (time.perf_counter() - t_put0) * 1000
@@ -1652,8 +1653,7 @@ def run(args):
         prof_stop.set()
         if profile_thread is not None:
             profile_thread.join()
-        prefetch_reader.close()
-        writer.close()
+        sink.close()
 
     if worker_error[0] is not None:
         raise worker_error[0]
@@ -1663,11 +1663,10 @@ def run(args):
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
           f"-- pipelined (compute + composite + yolo on separate threads)")
-    print(sync_reader.summary_post())
+    print(source.summary_post())
     print(f"[info] Output written to {args.output}")
 
     if prof is not None:
         _print_profile(prof, "final profile (over entire run)")
 
-    cap_a.release()
-    cap_b.release()
+    source.close()
