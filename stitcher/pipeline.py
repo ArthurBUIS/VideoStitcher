@@ -323,13 +323,13 @@ def run(args, source=None, sink_factory=None):
     print(f"[info] seam_lambda={args.seam_lambda}  "
           f"seam_edge_margin={args.seam_edge_margin}")
 
-    args.video_a = _resolve_relpath(args.video_a)
-    args.video_b = _resolve_relpath(args.video_b)
-
     # Source: default file-mode (FileFrameSource wraps two
     # cv2.VideoCapture handles + FrameSyncReader + PrefetchingFrameReader).
-    # Pipe mode passes a PipeFrameSource explicitly.
+    # Pipe mode passes a PipeFrameSource explicitly, so the file-path
+    # resolution / capture-open path stays guarded behind source==None.
     if source is None:
+        args.video_a = _resolve_relpath(args.video_a)
+        args.video_b = _resolve_relpath(args.video_b)
         source = FileFrameSource(args.video_a, args.video_b)
         source.open()
     print(source.summary())
@@ -582,12 +582,21 @@ def run(args, source=None, sink_factory=None):
             baseline_frame_a, baseline_frame_b = load_baseline_images(
                 paths_a, paths_b,
             )
-        else:
+        elif args.video_a is not None and args.video_b is not None:
+            # File mode: re-open the videos and re-grab frame 0 as the
+            # baseline. (Slightly redundant since we've already read it,
+            # but keeps the existing CLI behaviour.)
             print("[info] Motion baselines not provided; falling back to "
                   "frame 0 of each video.")
             baseline_frame_a, baseline_frame_b = grab_baseline_from_videos(
                 args.video_a, args.video_b,
             )
+        else:
+            # Pipe mode + no baselines provided: reuse the first paired
+            # frame the source already gave us for homography.
+            print("[info] Motion baselines not provided; falling back to "
+                  "the first frame pair received from the source.")
+            baseline_frame_a, baseline_frame_b = frame_a.copy(), frame_b.copy()
         validate_baseline_shape(
             frame_a, frame_b, baseline_frame_a, baseline_frame_b,
         )
@@ -1699,7 +1708,10 @@ def run(args, source=None, sink_factory=None):
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
           f"-- pipelined (compute + composite + yolo on separate threads)")
     print(source.summary_post())
-    print(f"[info] Output written to {args.output}")
+    if args.output is not None:
+        print(f"[info] Output written to {args.output}")
+    else:
+        print("[info] Output streamed over pipe (no file path).")
 
     if prof is not None:
         _print_profile(prof, "final profile (over entire run)")
