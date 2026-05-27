@@ -1583,7 +1583,7 @@ def run(args):
                             (time.perf_counter() - t_work0) * 1000
                         )
                     t_write0 = time.perf_counter()
-                    payload_ts_us = payload.get("timestamp_us", 0)
+                    payload_ts_us = item.get("timestamp_us", 0)
                     if result[0] == "async":
                         _, pinned, event, post_sync_fn, free_cb = result
                         sink.write_async(pinned, event,
