@@ -273,11 +273,24 @@ def _print_device_banner(dev):
     print("=" * 60)
 
 
-def run(args):
+def run(args, source=None, sink_factory=None):
     """
-    Run the full stitching pipeline using the parsed args. Argparse and
-    flag definitions live in the entry script; this function only
-    consumes the resulting Namespace.
+    Run the full stitching pipeline.
+
+    Args:
+        args: parsed CLI args (argparse Namespace).
+        source: optional FrameSource. If None, constructs a
+            FileFrameSource from args.video_a / args.video_b -- the
+            default file-mode CLI path. Pass a PipeFrameSource to
+            run the pipeline in pipe mode (see stitcher.pipe_main).
+        sink_factory: optional callable
+            (width, height, fps) -> FrameSink. The pipeline calls it
+            ONCE, after the output dimensions are known (post-
+            autocrop and post-tracking-crop math). If None, defaults
+            to a factory that builds a FileFrameSink writing to
+            args.output. Pipe mode passes a factory that constructs
+            a PipeFrameSink and notifies the host via
+            session_started in the same call.
     """
     # --person_tracking implies --autocrop -- tracking on the raw
     # canvas would track inside the polygonal black borders. Bump
@@ -313,13 +326,12 @@ def run(args):
     args.video_a = _resolve_relpath(args.video_a)
     args.video_b = _resolve_relpath(args.video_b)
 
-    # File-mode source. FileFrameSource encapsulates the pair of
-    # cv2.VideoCapture handles + FrameSyncReader (FPS desync) +
-    # PrefetchingFrameReader (overlap decode with compute). The pipe-
-    # mode source plugs into the same place via the same FrameSource
-    # ABC -- see stitcher/frame_io.py.
-    source = FileFrameSource(args.video_a, args.video_b)
-    source.open()
+    # Source: default file-mode (FileFrameSource wraps two
+    # cv2.VideoCapture handles + FrameSyncReader + PrefetchingFrameReader).
+    # Pipe mode passes a PipeFrameSource explicitly.
+    if source is None:
+        source = FileFrameSource(args.video_a, args.video_b)
+        source.open()
     print(source.summary())
 
     # Read the first paired frame (used for homography + gain seed).
@@ -712,9 +724,16 @@ def run(args):
 
     # File-mode sink wraps cv2.VideoWriter + ThreadedVideoWriter.
     # Pipe mode plugs in PipeFrameSink behind the same FrameSink ABC.
-    sink = FileFrameSink(args.output)
-    sink.open(writer_output_size[0], writer_output_size[1],
-              source.output_fps)
+    # Sink factory: default file-mode (FileFrameSink at args.output).
+    # Pipe mode passes a factory that builds a PipeFrameSink + sends
+    # session_started to the host with these dimensions.
+    if sink_factory is None:
+        def sink_factory(w, h, fps):
+            s = FileFrameSink(args.output)
+            s.open(w, h, fps)
+            return s
+    sink = sink_factory(writer_output_size[0], writer_output_size[1],
+                        source.output_fps)
 
     # Reuse the homography frame as the first iteration; subsequent
     # iterations pull from source.read_pair() (file mode: backed by
