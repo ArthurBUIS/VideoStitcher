@@ -32,6 +32,79 @@ def compute_gain_compensation(warped_a, warped_b, overlap_bbox, overlap_in_bbox)
     return g_a, g_b
 
 
+def compute_joint_gain_compensation_3cam(
+    warped_L, warped_C, warped_R,
+    overlap_LC_bbox, overlap_LC_in_bbox,
+    overlap_CR_bbox, overlap_CR_in_bbox,
+):
+    """
+    Per-channel BGR gain scalars (g_L, g_C, g_R) jointly solved across
+    the two adjacent overlaps. Closed-form solution preserves overall
+    brightness via the constraint g_L * g_C * g_R == 1.
+
+    The pairwise function above can't be applied twice naively, because
+    Center participates in both overlaps and the two pairwise solutions
+    would disagree on Center's gain. We get a consistent triple instead.
+
+    Math, per channel:
+        Let alpha   = mean(L,  L<>C overlap)
+            beta_L  = mean(C,  L<>C overlap)
+            beta_R  = mean(C,  C<>R overlap)
+            gamma   = mean(R,  C<>R overlap)
+
+        We want corrected intensities to match in each overlap:
+            alpha * g_L  =  beta_L * g_C            (1)
+            beta_R * g_C  =  gamma * g_R            (2)
+            g_L * g_C * g_R = 1                     (constraint)
+
+        From (1):  g_L  = (beta_L / alpha) * g_C
+        From (2):  g_R  = (beta_R / gamma) * g_C
+        Substituting into the constraint:
+            (beta_L / alpha) * g_C * g_C * (beta_R / gamma) * g_C  = 1
+            g_C^3  =  (alpha * gamma) / (beta_L * beta_R)
+            g_C    =  ((alpha * gamma) / (beta_L * beta_R)) ** (1/3)
+
+        Then back-substitute g_L and g_R.
+
+    Returns (g_L, g_C, g_R), each a (3,) float32 BGR vector. Means
+    clipped to >= 1.0 before division to avoid division by ~0 in
+    very dark images.
+    """
+    # L<>C overlap means
+    xL0, yL0, xL1, yL1 = overlap_LC_bbox
+    wL_in_LC = warped_L[yL0:yL1, xL0:xL1]
+    wC_in_LC = warped_C[yL0:yL1, xL0:xL1]
+    alpha = np.array(
+        cv2.mean(wL_in_LC, mask=overlap_LC_in_bbox)[:3], dtype=np.float32
+    )
+    beta_L = np.array(
+        cv2.mean(wC_in_LC, mask=overlap_LC_in_bbox)[:3], dtype=np.float32
+    )
+
+    # C<>R overlap means
+    xR0, yR0, xR1, yR1 = overlap_CR_bbox
+    wC_in_CR = warped_C[yR0:yR1, xR0:xR1]
+    wR_in_CR = warped_R[yR0:yR1, xR0:xR1]
+    beta_R = np.array(
+        cv2.mean(wC_in_CR, mask=overlap_CR_in_bbox)[:3], dtype=np.float32
+    )
+    gamma = np.array(
+        cv2.mean(wR_in_CR, mask=overlap_CR_in_bbox)[:3], dtype=np.float32
+    )
+
+    alpha  = np.clip(alpha,  1.0, None)
+    beta_L = np.clip(beta_L, 1.0, None)
+    beta_R = np.clip(beta_R, 1.0, None)
+    gamma  = np.clip(gamma,  1.0, None)
+
+    # Closed-form solve (per channel, vectorised across BGR).
+    g_C_cubed = (alpha * gamma) / (beta_L * beta_R)
+    g_C = np.cbrt(g_C_cubed).astype(np.float32)
+    g_L = ((beta_L / alpha) * g_C).astype(np.float32)
+    g_R = ((beta_R / gamma) * g_C).astype(np.float32)
+    return g_L, g_C, g_R
+
+
 def build_gain_lut(gains_bgr):
     """CPU: build a (1, 256, 3) lookup table for cv2.LUT."""
     x = np.arange(256, dtype=np.float32)
@@ -124,6 +197,75 @@ def warp_pair_gpu(frame_a_bgr_cpu, frame_b_bgr_cpu,
         mode="bilinear", padding_mode="zeros", align_corners=True,
     ).clamp(0, 255).to(torch.uint8)
     return warped_a, warped_b
+
+
+def warp_triplet_gpu(
+    frame_L_bgr_cpu, frame_C_bgr_cpu, frame_R_bgr_cpu,
+    grid_triplet_t, device,
+    gain_L_t=None, gain_C_t=None, gain_R_t=None,
+    non_blocking=True,
+):
+    """
+    Three-frame warp. Mirrors warp_pair_gpu's fast path: when all three
+    source frames share a shape, uploads them, stacks into a
+    (3, 3, H_src, W_src) tensor, and runs a single grid_sample against
+    the precomputed (3, H_dst, W_dst, 2) grid stack -- one kernel launch
+    for all three warps.
+
+    Falls back to three separate grid_sample calls when the source
+    shapes differ (mixed-resolution cameras). The destination shape is
+    identical either way since all three grids target the same canvas.
+
+    Returns (warped_L_t, warped_C_t, warped_R_t), each
+    (1, 3, H_dst, W_dst) uint8 -- same per-camera shape warp_pair_gpu
+    returns, so downstream per-frame code that only ever sees one
+    camera's tensor at a time is unchanged.
+
+    grid_triplet_t must be torch.cat([grid_L_t, grid_C_t, grid_R_t],
+    dim=0). Build it once at startup; it's static.
+    """
+    tL = torch.from_numpy(frame_L_bgr_cpu).to(device, non_blocking=non_blocking)
+    tC = torch.from_numpy(frame_C_bgr_cpu).to(device, non_blocking=non_blocking)
+    tR = torch.from_numpy(frame_R_bgr_cpu).to(device, non_blocking=non_blocking)
+    tL = tL.permute(2, 0, 1).unsqueeze(0).float()
+    tC = tC.permute(2, 0, 1).unsqueeze(0).float()
+    tR = tR.permute(2, 0, 1).unsqueeze(0).float()
+    if gain_L_t is not None:
+        tL = (tL * gain_L_t).clamp(0, 255)
+    if gain_C_t is not None:
+        tC = (tC * gain_C_t).clamp(0, 255)
+    if gain_R_t is not None:
+        tR = (tR * gain_R_t).clamp(0, 255)
+
+    if tL.shape[2:] == tC.shape[2:] == tR.shape[2:]:
+        # Fast path: batched grid_sample of size 3.
+        t = torch.cat([tL, tC, tR], dim=0)
+        warped = F.grid_sample(
+            t, grid_triplet_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        warped = warped.clamp(0, 255).to(torch.uint8)
+        return warped[0:1], warped[1:2], warped[2:3]
+
+    # Fallback: different source shapes -> three separate grid_samples.
+    grid_L_t = grid_triplet_t[0:1]
+    grid_C_t = grid_triplet_t[1:2]
+    grid_R_t = grid_triplet_t[2:3]
+    warped_L = F.grid_sample(
+        tL, grid_L_t, mode="bilinear",
+        padding_mode="zeros", align_corners=True,
+    ).clamp(0, 255).to(torch.uint8)
+    warped_C = F.grid_sample(
+        tC, grid_C_t, mode="bilinear",
+        padding_mode="zeros", align_corners=True,
+    ).clamp(0, 255).to(torch.uint8)
+    warped_R = F.grid_sample(
+        tR, grid_R_t, mode="bilinear",
+        padding_mode="zeros", align_corners=True,
+    ).clamp(0, 255).to(torch.uint8)
+    return warped_L, warped_C, warped_R
 
 
 def warp_gpu(frame_bgr_cpu, grid_t, device, gain_t=None, non_blocking=True):
