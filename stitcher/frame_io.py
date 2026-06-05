@@ -39,7 +39,13 @@ from stitcher.sync_reader import FrameSyncReader
 
 
 class FrameSource(ABC):
-    """Source of paired BGR frames feeding the stitcher's compute loop."""
+    """Source of paired BGR frames feeding the stitcher's compute loop.
+
+    2-camera sources implement read_pair(). 3-camera sources implement
+    read_triplet(). The pipeline picks which to call based on the
+    number of cameras the caller advertises (file mode: presence of
+    args.video_c; pipe mode: len(start_session.input_cameras)).
+    """
 
     @abstractmethod
     def open(self) -> None:
@@ -52,9 +58,34 @@ class FrameSource(ABC):
         paired frame, or None at end-of-stream / disconnect.
         """
 
+    def read_triplet(self):
+        """
+        Return (frame_left_bgr, frame_center_bgr, frame_right_bgr,
+        timestamp_us) for the next 3-camera tuple, or None at
+        end-of-stream / disconnect.
+
+        Default implementation raises NotImplementedError. 2-camera
+        sources are not required to override; 3-camera sources must.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support 3-camera mode "
+            "(read_triplet not overridden)."
+        )
+
     @abstractmethod
     def close(self) -> None:
         """Release underlying resources. Idempotent."""
+
+    @property
+    def n_cameras(self) -> int:
+        """
+        Number of cameras this source produces per emit. 2-camera
+        sources return 2 (and the pipeline calls read_pair); 3-camera
+        sources return 3 (and the pipeline calls read_triplet).
+        Default is 2 so existing 2-cam implementations don't need to
+        override.
+        """
+        return 2
 
     @property
     @abstractmethod
@@ -186,6 +217,101 @@ class FileFrameSource(FrameSource):
 
     def summary_post(self) -> str:
         return self._sync_reader.summary_post() if self._sync_reader else ""
+
+
+class FileFrameSource3(FrameSource):
+    """
+    Reads 3-camera triplets from three video files. Simpler than the
+    2-camera FileFrameSource: assumes all three videos share the same
+    FPS (which is the production case -- portal cameras run in
+    lockstep), and just reads each cap in step.
+
+    Used by the file-mode entry path when --video_left / --video_center
+    / --video_right are all provided. Pipe-mode 3-cam uses
+    PipeFrameSource's read_triplet().
+
+    Intentionally minimal -- the rich frame-sync behaviour in
+    FrameSyncReader (cross-FPS resampling) isn't extended here because
+    portal cameras don't need it; the spike's value is letting us
+    re-stitch logged 3-cam captures from disk for debugging without
+    spinning up the renderer.
+    """
+
+    def __init__(self, path_L: str, path_C: str, path_R: str):
+        self._paths = (path_L, path_C, path_R)
+        self._caps = [None, None, None]
+        self._fps = 25.0
+        self._frame_idx = 0
+        self._opened = False
+
+    def open(self) -> None:
+        for i, p in enumerate(self._paths):
+            cap = cv2.VideoCapture(p)
+            if not cap.isOpened():
+                # Release any already-opened caps before raising.
+                for already in self._caps:
+                    if already is not None:
+                        already.release()
+                raise RuntimeError(f"Could not open {p!r}")
+            self._caps[i] = cap
+        fps_values = [cap.get(cv2.CAP_PROP_FPS) or 0.0 for cap in self._caps]
+        # Take the max non-zero FPS as the timeline; warn if they
+        # disagree (the simple reader doesn't resample).
+        nonzero = [f for f in fps_values if f > 0]
+        if nonzero:
+            self._fps = max(nonzero)
+        if len({round(f, 2) for f in fps_values}) > 1:
+            print(
+                f"[warn] FileFrameSource3: input FPS values differ "
+                f"({fps_values}); reading in lockstep at {self._fps:.2f} "
+                "and not resampling. For cross-FPS sync use the 2-camera "
+                "FileFrameSource path."
+            )
+        self._opened = True
+
+    def read_pair(self):
+        raise NotImplementedError(
+            "FileFrameSource3 is a 3-camera source; use read_triplet()."
+        )
+
+    def read_triplet(self):
+        if not self._opened:
+            raise RuntimeError(
+                "FileFrameSource3: read_triplet() before open()"
+            )
+        frames = []
+        for cap in self._caps:
+            ok, frame = cap.read()
+            if not ok:
+                return None
+            frames.append(frame)
+        ts_us = int(self._frame_idx * 1_000_000.0 / max(self._fps, 1e-6))
+        self._frame_idx += 1
+        return frames[0], frames[1], frames[2], ts_us
+
+    def close(self) -> None:
+        for i, cap in enumerate(self._caps):
+            if cap is not None:
+                cap.release()
+            self._caps[i] = None
+        self._opened = False
+
+    @property
+    def n_cameras(self) -> int:
+        return 3
+
+    @property
+    def output_fps(self) -> float:
+        return self._fps
+
+    def summary(self) -> str:
+        return (
+            f"[file] FileFrameSource3: 3 inputs @ {self._fps:.2f} fps "
+            f"(lockstep)"
+        )
+
+    def summary_post(self) -> str:
+        return f"[file] FileFrameSource3: {self._frame_idx} triplets read."
 
 
 class FileFrameSink(FrameSink):

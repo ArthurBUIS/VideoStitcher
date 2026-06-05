@@ -88,13 +88,25 @@ def run_pipe_session(args):
                 f"expected start_session, got {start!r}"
             )
         cams = start.get("input_cameras", [])
-        print(f"[pipe-main] start_session: {len(cams)} input camera(s)",
+        n_cams = len(cams)
+        print(f"[pipe-main] start_session: {n_cams} input camera(s)",
               flush=True)
+        if n_cams not in (2, 3):
+            raise ProtocolError(
+                f"unsupported camera count: {n_cams} "
+                "(this stitcher supports 2 or 3 input cameras)"
+            )
         # Calibration field is ignored in the spike; pipeline computes
-        # homography from frame 0 like file mode.
+        # homographies from frame 0 like file mode.
+        cam_indices = tuple(
+            int(c.get("index", i)) for i, c in enumerate(cams)
+        )
 
         # --- 3. Run the pipeline with pipe-backed source / sink ------
-        source = PipeFrameSource(frames_t, control_transport=ctrl_t)
+        source = PipeFrameSource(
+            frames_t, control_transport=ctrl_t,
+            cam_indices=cam_indices,
+        )
 
         def sink_factory(w, h, fps):
             # First moment we know the stitched output size. Tell the
