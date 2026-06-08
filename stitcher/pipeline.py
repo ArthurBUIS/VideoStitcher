@@ -82,16 +82,21 @@ import torch.nn.functional as F
 
 from stitcher.compositing import (
     composite_multiband_cpu,
+    composite_multiband_cpu_3cam,
     composite_multiband_gpu_async,
+    composite_multiband_gpu_async_3cam,
     get_pyr_kernel_2d,
 )
 from stitcher.device import detect_device
 from stitcher.geometry import (
     build_remap,
     build_static_geometry,
+    build_static_geometry_3cam,
     compute_canvas,
+    compute_canvas_3cam,
     estimate_homography,
     find_autocrop_rect,
+    find_autocrop_rect_3cam,
 )
 from stitcher.io_utils import (
     draw_mask_overlay,
@@ -127,6 +132,7 @@ from stitcher.motion import (
 from stitcher.seam import (
     add_edge_margin_penalty,
     add_seam_regularizer,
+    add_x_mid_seam_cap,
     compute_cost_and_ema_gpu,
     compute_cost_fast_cpu,
     find_dp_seam,
@@ -139,16 +145,18 @@ from stitcher.segmentation import (
     compute_fg_mask_seg_cpu,
     compute_fg_mask_seg_gpu,
 )
-from stitcher.frame_io import FileFrameSink, FileFrameSource
+from stitcher.frame_io import FileFrameSink, FileFrameSource, FileFrameSource3
 from stitcher.warp import (
     apply_gain_lut,
     build_gain_lut,
     build_gain_tensor,
     build_grid_sample_tensor,
     compute_gain_compensation,
+    compute_joint_gain_compensation_3cam,
     dilate_gpu,
     warp_mask_gpu,
     warp_pair_gpu,
+    warp_triplet_gpu,
 )
 
 
@@ -327,12 +335,34 @@ def run(args, source=None, sink_factory=None):
     # cv2.VideoCapture handles + FrameSyncReader + PrefetchingFrameReader).
     # Pipe mode passes a PipeFrameSource explicitly, so the file-path
     # resolution / capture-open path stays guarded behind source==None.
+    #
+    # 3-camera file-mode dispatch: presence of args.video_center is the
+    # trigger -- if it's set we open a FileFrameSource3 across the three
+    # --video_left/center/right paths; otherwise we fall back to the
+    # existing 2-camera --video_a/b path. Pipe mode reaches this point
+    # with `source` already populated (built by pipe_main.run_pipe_session
+    # off the start_session cam list), so file-vs-pipe stays orthogonal
+    # to 2-vs-3-camera.
     if source is None:
-        args.video_a = _resolve_relpath(args.video_a)
-        args.video_b = _resolve_relpath(args.video_b)
-        source = FileFrameSource(args.video_a, args.video_b)
+        if getattr(args, "video_center", None):
+            args.video_left = _resolve_relpath(args.video_left)
+            args.video_center = _resolve_relpath(args.video_center)
+            args.video_right = _resolve_relpath(args.video_right)
+            source = FileFrameSource3(
+                args.video_left, args.video_center, args.video_right,
+            )
+        else:
+            args.video_a = _resolve_relpath(args.video_a)
+            args.video_b = _resolve_relpath(args.video_b)
+            source = FileFrameSource(args.video_a, args.video_b)
         source.open()
     print(source.summary())
+
+    # 3-camera dispatch: divert to a dedicated implementation that uses
+    # the 3-cam primitives committed earlier in the wip/three-camera
+    # branch. The 2-camera path below this point is unchanged.
+    if source.n_cameras == 3:
+        return _run_3cam(args, source, sink_factory, dev, ema_eff)
 
     # Read the first paired frame (used for homography + gain seed).
     first_pair = source.read_pair()
@@ -1717,3 +1747,504 @@ def run(args, source=None, sink_factory=None):
         _print_profile(prof, "final profile (over entire run)")
 
     source.close()
+
+
+# ===========================================================================
+# 3-camera pipeline
+# ===========================================================================
+
+def _run_3cam(args, source, sink_factory, dev, ema_eff):
+    """
+    3-camera dispatch from run(). MVP scope -- joint gain compensation,
+    two-seam DP with x_mid cap, 3-camera multiband composite, autocrop,
+    person tracking. Features intentionally deferred to a follow-up
+    commit (will warn if asked for):
+      - YOLOE person mask in cost (no person penalty in 3-cam yet)
+      - Motion detection
+      - Static FG mask
+      - Debug overlays
+      - Async worker threads (everything runs sequentially)
+
+    Even with those gaps this delivers a working end-to-end 3-camera
+    panorama. The architecture decisions made for this MVP (Approach A
+    two-overlap dictionary, x_mid cap with blend_width margin, joint
+    gain comp) are exactly what the follow-up commits build on.
+    """
+    import numpy as np  # local re-import for clarity in this isolated path
+    import cv2
+    import torch
+    import torch.nn.functional as F
+
+    if getattr(args, "person_tracking", False) and not args.autocrop:
+        # Mirror the 2-cam behavior.
+        print("[info] --person_tracking implies --autocrop; enabling it.")
+        args.autocrop = True
+
+    # Warn about deferred features rather than silently dropping them.
+    if not args.no_fg:
+        print(
+            "[warn] 3-camera mode: static FG mask is not yet supported in "
+            "this MVP. Continuing with no FG penalty in the seam cost."
+        )
+    if not bool(getattr(args, "no_motion", True)):
+        # Note: in the 2-cam path args.motion is computed from "not no_motion".
+        # In 3-cam we just skip motion entirely.
+        print(
+            "[warn] 3-camera mode: motion detection is not yet supported. "
+            "Continuing with no motion penalty in the seam cost."
+        )
+
+    # --- 1. First frame triplet + homographies -----------------------------
+    first_triplet = source.read_triplet()
+    if first_triplet is None:
+        raise RuntimeError("Could not read first frame triplet.")
+    frame_L, frame_C, frame_R, first_ts_us = first_triplet
+
+    print("[info] Estimating homographies from first frame triplet...")
+    # estimate_homography(img_a, img_b) returns H mapping B's coords into A's.
+    # We want H mapping each non-Center camera's coords into Center's, so
+    # call with Center as the "a" anchor.
+    H_L_to_C = estimate_homography(frame_C, frame_L)
+    H_R_to_C = estimate_homography(frame_C, frame_R)
+
+    canvas_size, T, H_L_to_canvas, H_C_to_canvas, H_R_to_canvas = (
+        compute_canvas_3cam(
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            H_L_to_C, H_R_to_C,
+        )
+    )
+    print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
+
+    # --- 2. Autocrop --------------------------------------------------------
+    crop_rect = None
+    if args.autocrop:
+        crop_rect = find_autocrop_rect_3cam(
+            H_L_to_C, H_R_to_C,
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            canvas_size, T,
+        )
+        cx, cy, cw, ch = crop_rect
+        print(
+            f"[info] Autocrop: x={cx} y={cy} size={cw}x{ch} "
+            f"(from full canvas {canvas_size[0]}x{canvas_size[1]})"
+        )
+        T_crop = np.array(
+            [[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64
+        )
+        H_L_to_canvas = T_crop @ H_L_to_canvas
+        H_C_to_canvas = T_crop @ H_C_to_canvas
+        H_R_to_canvas = T_crop @ H_R_to_canvas
+        output_size = (cw, ch)
+    else:
+        output_size = canvas_size
+
+    # --- 3. Remap maps + static 3-cam geometry -----------------------------
+    print("[info] Precomputing remap maps + static geometry (3-cam)...")
+    map_Lx, map_Ly = build_remap(H_L_to_canvas, output_size)
+    map_Cx, map_Cy = build_remap(H_C_to_canvas, output_size)
+    map_Rx, map_Ry = build_remap(H_R_to_canvas, output_size)
+    static_3cam = build_static_geometry_3cam(
+        frame_L.shape, frame_C.shape, frame_R.shape,
+        map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+        output_size,
+    )
+    ctx_LC = static_3cam["overlap_LC"]
+    ctx_CR = static_3cam["overlap_CR"]
+    bbox_LC = ctx_LC.bbox
+    bbox_CR = ctx_CR.bbox
+    print(
+        f"[info] L<>C overlap bbox: x=[{bbox_LC[0]},{bbox_LC[2]}) "
+        f"y=[{bbox_LC[1]},{bbox_LC[3]}) "
+        f"size={bbox_LC[2]-bbox_LC[0]}x{bbox_LC[3]-bbox_LC[1]}"
+    )
+    print(
+        f"[info] C<>R overlap bbox: x=[{bbox_CR[0]},{bbox_CR[2]}) "
+        f"y=[{bbox_CR[1]},{bbox_CR[3]}) "
+        f"size={bbox_CR[2]-bbox_CR[0]}x{bbox_CR[3]-bbox_CR[1]}"
+    )
+    print(f"[info] x_mid (canvas x): {static_3cam['x_mid']}")
+    # Per-overlap shapes used by the per-frame cost matrices.
+    bbox_shape_LC = (bbox_LC[3] - bbox_LC[1], bbox_LC[2] - bbox_LC[0])
+    bbox_shape_CR = (bbox_CR[3] - bbox_CR[1], bbox_CR[2] - bbox_CR[0])
+
+    # --- 4. Joint gain compensation ----------------------------------------
+    lut_L = lut_C = lut_R = None
+    gain_L_t = gain_C_t = gain_R_t = None
+    if not args.no_gain_comp:
+        print("[info] Computing joint gain compensation from first triplet...")
+        wL0 = cv2.remap(frame_L, map_Lx, map_Ly, cv2.INTER_LINEAR)
+        wC0 = cv2.remap(frame_C, map_Cx, map_Cy, cv2.INTER_LINEAR)
+        wR0 = cv2.remap(frame_R, map_Rx, map_Ry, cv2.INTER_LINEAR)
+        gains_L, gains_C, gains_R = compute_joint_gain_compensation_3cam(
+            wL0, wC0, wR0,
+            bbox_LC, ctx_LC.overlap,
+            bbox_CR, ctx_CR.overlap,
+        )
+        print(
+            f"[info] gains_L = [{gains_L[0]:.3f}, "
+            f"{gains_L[1]:.3f}, {gains_L[2]:.3f}]"
+        )
+        print(
+            f"[info] gains_C = [{gains_C[0]:.3f}, "
+            f"{gains_C[1]:.3f}, {gains_C[2]:.3f}]"
+        )
+        print(
+            f"[info] gains_R = [{gains_R[0]:.3f}, "
+            f"{gains_R[1]:.3f}, {gains_R[2]:.3f}]"
+        )
+        if dev["cuda_available"]:
+            gain_L_t = build_gain_tensor(gains_L, torch.device("cuda"))
+            gain_C_t = build_gain_tensor(gains_C, torch.device("cuda"))
+            gain_R_t = build_gain_tensor(gains_R, torch.device("cuda"))
+        else:
+            lut_L = build_gain_lut(gains_L)
+            lut_C = build_gain_lut(gains_C)
+            lut_R = build_gain_lut(gains_R)
+
+    # --- 5. GPU context (3-cam) --------------------------------------------
+    gpu_ctx_3cam = None
+    grid_triplet_t = None
+    overlap_LC_t = None
+    overlap_CR_t = None
+    if dev["cuda_available"]:
+        torch_device = torch.device("cuda")
+        # Per-overlap GPU validity masks for the composite.
+        valid_in_LC_np = cv2.bitwise_or(ctx_LC.mask_left, ctx_LC.mask_right)
+        valid_in_CR_np = cv2.bitwise_or(ctx_CR.mask_left, ctx_CR.mask_right)
+        # Per-overlap GPU dicts for the composite helper.
+        overlap_LC_gpu = {
+            "overlap_in_bbox_t": torch.from_numpy(ctx_LC.overlap).to(torch_device),
+            "only_a_in_bbox_t": torch.from_numpy(ctx_LC.only_left).to(torch_device),
+            "only_b_in_bbox_t": torch.from_numpy(ctx_LC.only_right).to(torch_device),
+            "valid_in_bbox_t": torch.from_numpy(valid_in_LC_np).to(torch_device),
+        }
+        overlap_CR_gpu = {
+            "overlap_in_bbox_t": torch.from_numpy(ctx_CR.overlap).to(torch_device),
+            "only_a_in_bbox_t": torch.from_numpy(ctx_CR.only_left).to(torch_device),
+            "only_b_in_bbox_t": torch.from_numpy(ctx_CR.only_right).to(torch_device),
+            "valid_in_bbox_t": torch.from_numpy(valid_in_CR_np).to(torch_device),
+        }
+        gpu_ctx_3cam = {
+            "device": torch_device,
+            "kernel2d": get_pyr_kernel_2d(torch_device),
+            "only_L_u8_t": torch.from_numpy(static_3cam["only_L_u8"]).to(torch_device),
+            "only_C_u8_t": torch.from_numpy(static_3cam["only_C_u8"]).to(torch_device),
+            "only_R_u8_t": torch.from_numpy(static_3cam["only_R_u8"]).to(torch_device),
+            "overlap_LC_gpu": overlap_LC_gpu,
+            "overlap_CR_gpu": overlap_CR_gpu,
+        }
+        # Pinned ring buffer for the async writer handoff.
+        out_W, out_H = output_size
+        pinned_ring_size = 6
+        free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
+        pinned_ring = []
+        for _ in range(pinned_ring_size):
+            buf = torch.empty(
+                (out_H, out_W, 3), dtype=torch.uint8, pin_memory=True,
+            )
+            pinned_ring.append(buf)
+            free_pinned_q.put(buf)
+        # Triplet warp grid: cat of three single-grid tensors.
+        grid_L_t = build_grid_sample_tensor(map_Lx, map_Ly, frame_L.shape, torch_device)
+        grid_C_t = build_grid_sample_tensor(map_Cx, map_Cy, frame_C.shape, torch_device)
+        grid_R_t = build_grid_sample_tensor(map_Rx, map_Ry, frame_R.shape, torch_device)
+        grid_triplet_t = torch.cat([grid_L_t, grid_C_t, grid_R_t], dim=0)
+        overlap_LC_t = overlap_LC_gpu["overlap_in_bbox_t"]
+        overlap_CR_t = overlap_CR_gpu["overlap_in_bbox_t"]
+        print("[device] GPU contexts initialised (3-cam).")
+
+    # --- 6. Person tracker (operates on output canvas; camera-count agnostic)
+    tracker = None
+    writer_output_size = output_size
+    if getattr(args, "person_tracking", False):
+        tracker = PersonTracker(
+            smooth_seconds=args.person_tracking_smooth_seconds,
+            drift_seconds=args.person_tracking_drift_seconds,
+            fps=source.output_fps,
+            aspect=args.person_tracking_aspect,
+        )
+        writer_output_size = tracker.get_crop_size(
+            output_size[0], output_size[1],
+        )
+        print(
+            f"[info] Person tracking enabled: output cropped from "
+            f"{output_size[0]}x{output_size[1]} to "
+            f"{writer_output_size[0]}x{writer_output_size[1]} "
+            f"(aspect {args.person_tracking_aspect:.2f})."
+        )
+
+    # --- 7. Output sink ----------------------------------------------------
+    if sink_factory is None:
+        def sink_factory(w, h, fps):
+            s = FileFrameSink(args.output)
+            s.open(w, h, fps)
+            return s
+    sink = sink_factory(
+        writer_output_size[0], writer_output_size[1], source.output_fps,
+    )
+
+    # --- 8. Main loop (sequential MVP) -------------------------------------
+    out_buf_cpu = (
+        np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
+        if not dev["cuda_available"] else None
+    )
+
+    cost_ema_LC_t = None
+    cost_ema_CR_t = None
+    cost_ema_LC = None
+    cost_ema_CR = None
+    seam_prev_small_LC = None
+    seam_prev_small_CR = None
+    x_mid = static_3cam["x_mid"]
+    # In bbox-local cost-matrix coords: cap = (x_mid - bbox.x0) // seam_downscale.
+    # For the LC seam we forbid x >= cap; for the CR seam we forbid x <= cap.
+    ds = max(1, args.seam_downscale)
+
+    pending_first_triplet = (frame_L, frame_C, frame_R, first_ts_us)
+    frame_idx = 0
+    last_print = time.time()
+    frames_since_print = 0
+    print("[info] Streaming frames (3-cam, sequential MVP path)...")
+    try:
+        while True:
+            if pending_first_triplet is not None:
+                fL, fC, fR, ts_us = pending_first_triplet
+                pending_first_triplet = None
+            else:
+                trip = source.read_triplet()
+                if trip is None:
+                    break
+                fL, fC, fR, ts_us = trip
+
+            # --- Warp the triplet ---
+            if dev["cuda_available"]:
+                warped_L_t, warped_C_t, warped_R_t = warp_triplet_gpu(
+                    fL, fC, fR, grid_triplet_t, gpu_ctx_3cam["device"],
+                    gain_L_t=gain_L_t, gain_C_t=gain_C_t, gain_R_t=gain_R_t,
+                )
+                # ---- L<>C cost + seam ----
+                cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
+                    warped_L_t, warped_C_t, overlap_LC_t,
+                    cost_ema_LC_t, ema_eff,
+                    None,  # no person mask in MVP
+                    None,  # no fg mask
+                    args.fg_penalty, args.person_penalty,
+                    bbox_LC,
+                    motion_mask_bbox_t=None,
+                    motion_penalty=args.motion_penalty,
+                )
+                if args.seam_edge_margin > 0:
+                    m = min(
+                        args.seam_edge_margin,
+                        cost_for_dp_LC_t.shape[1] // 2,
+                    )
+                    cost_for_dp_LC_t[:, :m] += args.edge_penalty
+                    cost_for_dp_LC_t[:, -m:] += args.edge_penalty
+                if ds > 1:
+                    cost_small_LC_t = F.avg_pool2d(
+                        cost_for_dp_LC_t.unsqueeze(0).unsqueeze(0),
+                        kernel_size=ds, stride=ds,
+                    )[0, 0]
+                else:
+                    cost_small_LC_t = cost_for_dp_LC_t
+                cost_small_LC = cost_small_LC_t.cpu().numpy()
+
+                # ---- C<>R cost + seam ----
+                cost_ema_CR_t, cost_for_dp_CR_t = compute_cost_and_ema_gpu(
+                    warped_C_t, warped_R_t, overlap_CR_t,
+                    cost_ema_CR_t, ema_eff,
+                    None, None,
+                    args.fg_penalty, args.person_penalty,
+                    bbox_CR,
+                    motion_mask_bbox_t=None,
+                    motion_penalty=args.motion_penalty,
+                )
+                if args.seam_edge_margin > 0:
+                    m = min(
+                        args.seam_edge_margin,
+                        cost_for_dp_CR_t.shape[1] // 2,
+                    )
+                    cost_for_dp_CR_t[:, :m] += args.edge_penalty
+                    cost_for_dp_CR_t[:, -m:] += args.edge_penalty
+                if ds > 1:
+                    cost_small_CR_t = F.avg_pool2d(
+                        cost_for_dp_CR_t.unsqueeze(0).unsqueeze(0),
+                        kernel_size=ds, stride=ds,
+                    )[0, 0]
+                else:
+                    cost_small_CR_t = cost_for_dp_CR_t
+                cost_small_CR = cost_small_CR_t.cpu().numpy()
+            else:
+                if lut_L is not None:
+                    fL_g = apply_gain_lut(fL, lut_L)
+                    fC_g = apply_gain_lut(fC, lut_C)
+                    fR_g = apply_gain_lut(fR, lut_R)
+                else:
+                    fL_g, fC_g, fR_g = fL, fC, fR
+                warped_L = cv2.remap(fL_g, map_Lx, map_Ly, cv2.INTER_LINEAR)
+                warped_C = cv2.remap(fC_g, map_Cx, map_Cy, cv2.INTER_LINEAR)
+                warped_R = cv2.remap(fR_g, map_Rx, map_Ry, cv2.INTER_LINEAR)
+                # CPU cost: photometric only.
+                wL_bb_LC = warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                wC_bb_LC = warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                photo_LC = compute_cost_fast_cpu(
+                    wL_bb_LC, wC_bb_LC, ctx_LC.overlap,
+                    np.empty(
+                        (bbox_shape_LC[0], bbox_shape_LC[1], 3),
+                        dtype=np.float32,
+                    ),
+                )
+                if cost_ema_LC is None or cost_ema_LC.shape != photo_LC.shape:
+                    cost_ema_LC = photo_LC.copy()
+                else:
+                    cv2.addWeighted(
+                        photo_LC, ema_eff,
+                        cost_ema_LC, 1.0 - ema_eff, 0, dst=cost_ema_LC,
+                    )
+                cost_for_dp_LC = cost_ema_LC.copy()
+                add_edge_margin_penalty(
+                    cost_for_dp_LC, args.seam_edge_margin,
+                    edge_penalty=args.edge_penalty,
+                )
+                cost_small_LC = (
+                    cv2.resize(
+                        cost_for_dp_LC,
+                        (
+                            cost_for_dp_LC.shape[1] // ds,
+                            cost_for_dp_LC.shape[0] // ds,
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    ) if ds > 1 else cost_for_dp_LC.copy()
+                )
+
+                wC_bb_CR = warped_C[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                wR_bb_CR = warped_R[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                photo_CR = compute_cost_fast_cpu(
+                    wC_bb_CR, wR_bb_CR, ctx_CR.overlap,
+                    np.empty(
+                        (bbox_shape_CR[0], bbox_shape_CR[1], 3),
+                        dtype=np.float32,
+                    ),
+                )
+                if cost_ema_CR is None or cost_ema_CR.shape != photo_CR.shape:
+                    cost_ema_CR = photo_CR.copy()
+                else:
+                    cv2.addWeighted(
+                        photo_CR, ema_eff,
+                        cost_ema_CR, 1.0 - ema_eff, 0, dst=cost_ema_CR,
+                    )
+                cost_for_dp_CR = cost_ema_CR.copy()
+                add_edge_margin_penalty(
+                    cost_for_dp_CR, args.seam_edge_margin,
+                    edge_penalty=args.edge_penalty,
+                )
+                cost_small_CR = (
+                    cv2.resize(
+                        cost_for_dp_CR,
+                        (
+                            cost_for_dp_CR.shape[1] // ds,
+                            cost_for_dp_CR.shape[0] // ds,
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    ) if ds > 1 else cost_for_dp_CR.copy()
+                )
+
+            # --- x_mid seam cap + regularizer + DP -------------------------
+            # Cap is in the small-cost matrix's x coordinate, derived from
+            # x_mid on the canvas: subtract the overlap's x0, then divide
+            # by seam_downscale.
+            cap_LC_in_small = max(0, (x_mid - bbox_LC[0]) // ds)
+            cap_CR_in_small = max(0, (x_mid - bbox_CR[0]) // ds)
+            # Margin: blend_width // ds, so the soft alpha has room to
+            # taper down to 0 by x_mid (in small-cost coords).
+            margin_small = max(1, args.blend_width // ds)
+            add_x_mid_seam_cap(
+                cost_small_LC, cap_LC_in_small,
+                side="right", blend_margin=margin_small,
+            )
+            add_x_mid_seam_cap(
+                cost_small_CR, cap_CR_in_small,
+                side="left", blend_margin=margin_small,
+            )
+            add_seam_regularizer(
+                cost_small_LC, seam_prev_small_LC, args.seam_lambda,
+            )
+            add_seam_regularizer(
+                cost_small_CR, seam_prev_small_CR, args.seam_lambda,
+            )
+            seam_LC_small = find_dp_seam(cost_small_LC)
+            seam_CR_small = find_dp_seam(cost_small_CR)
+            seam_prev_small_LC = seam_LC_small.copy()
+            seam_prev_small_CR = seam_CR_small.copy()
+            seam_LC_full = upscale_seam(seam_LC_small, bbox_shape_LC, ds)
+            seam_CR_full = upscale_seam(seam_CR_small, bbox_shape_CR, ds)
+
+            # --- Person tracking update (no YOLO mask in MVP) --------------
+            tracking_crop = None
+            if tracker is not None:
+                # MVP shortcut: no live person mask → tracker drifts back
+                # to its centre. Acceptable until YOLO support lands.
+                tracker.update(None, output_size[0], output_size[1])
+                tracking_crop = tracker.get_crop_bounds()
+
+            # --- Composite -------------------------------------------------
+            if dev["cuda_available"]:
+                pinned = free_pinned_q.get()
+                copy_event = composite_multiband_gpu_async_3cam(
+                    warped_L_t, warped_C_t, warped_R_t,
+                    static_3cam,
+                    seam_LC_full, seam_CR_full,
+                    args.blend_width, args.blend_levels,
+                    pinned, gpu_ctx_3cam,
+                )
+
+                def post_sync_fn(arr, tracking_crop=tracking_crop):
+                    if tracking_crop is not None:
+                        x0, x1 = tracking_crop
+                        arr = arr[:, x0:x1]
+                        if not arr.flags["C_CONTIGUOUS"]:
+                            arr = np.ascontiguousarray(arr)
+                    return arr
+
+                sink.write_async(
+                    pinned, copy_event,
+                    post_sync_fn=post_sync_fn,
+                    free_cb=lambda p=pinned: free_pinned_q.put(p),
+                    timestamp_us=ts_us,
+                )
+            else:
+                stitched = composite_multiband_cpu_3cam(
+                    warped_L, warped_C, warped_R, static_3cam,
+                    seam_LC_full, seam_CR_full,
+                    args.blend_width, args.blend_levels, out_buf_cpu,
+                )
+                if tracking_crop is not None:
+                    x0, x1 = tracking_crop
+                    stitched = stitched[:, x0:x1]
+                    if not stitched.flags["C_CONTIGUOUS"]:
+                        stitched = np.ascontiguousarray(stitched)
+                sink.write(stitched, timestamp_us=ts_us)
+
+            frame_idx += 1
+            frames_since_print += 1
+            now = time.time()
+            if now - last_print > 5.0:
+                fps = frames_since_print / max(now - last_print, 1e-6)
+                print(
+                    f"[info] 3-cam: frame {frame_idx}, "
+                    f"{fps:.1f} fps over last {now - last_print:.1f}s"
+                )
+                last_print = now
+                frames_since_print = 0
+
+            if args.max_frames and frame_idx >= args.max_frames:
+                break
+    finally:
+        sink.close()
+        source.close()
+
+    print(f"[info] 3-cam: processed {frame_idx} frame(s).")
+    if hasattr(source, "summary_post"):
+        print(source.summary_post())
+    print(args.output and f"[info] Output written to {args.output}"
+          or "[info] Output streamed over pipe (no file path).")

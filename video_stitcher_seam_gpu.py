@@ -286,11 +286,26 @@ from stitcher.segmentation import DEFAULT_FG_CLASS_IDS
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video_a", default=None,
-                        help="Input video from camera A. Required with "
-                             "--io file (default).")
+                        help="Input video from camera A. 2-camera file "
+                             "mode (default).")
     parser.add_argument("--video_b", default=None,
-                        help="Input video from camera B. Required with "
-                             "--io file (default).")
+                        help="Input video from camera B. 2-camera file "
+                             "mode (default).")
+    parser.add_argument("--video_left", default=None,
+                        help="Input video from the LEFT camera (3-camera "
+                             "file mode). Use with --video_center and "
+                             "--video_right. Presence of --video_center "
+                             "is what triggers the 3-camera pipeline.")
+    parser.add_argument("--video_center", default=None,
+                        help="Input video from the CENTER camera "
+                             "(3-camera file mode). The Center camera is "
+                             "the geometric anchor: the canvas is built "
+                             "around it and both L<>C and C<>R "
+                             "homographies project into its frame.")
+    parser.add_argument("--video_right", default=None,
+                        help="Input video from the RIGHT camera (3-camera "
+                             "file mode). Use with --video_left and "
+                             "--video_center.")
     parser.add_argument("--output", default=None,
                         help="Output stitched mp4. Required with "
                              "--io file (default).")
@@ -498,10 +513,31 @@ def main():
     # keeps the same CLI shape; pipe mode hands off to the long-lived
     # service entry point in stitcher.pipe_main.
     if args.io == "file":
-        if not (args.video_a and args.video_b and args.output):
-            parser.error(
-                "--io file requires --video_a, --video_b and --output"
-            )
+        # 3-camera file mode is triggered by --video_center; in that mode
+        # we require all three of --video_left/center/right + --output and
+        # IGNORE --video_a/b. Otherwise we fall back to the historical
+        # 2-camera shape which requires --video_a/b/output.
+        if args.video_center is not None:
+            missing_3cam = [
+                name for name, val in (
+                    ("--video_left", args.video_left),
+                    ("--video_center", args.video_center),
+                    ("--video_right", args.video_right),
+                    ("--output", args.output),
+                ) if not val
+            ]
+            if missing_3cam:
+                parser.error(
+                    "3-camera file mode requires "
+                    + ", ".join(missing_3cam)
+                )
+        else:
+            if not (args.video_a and args.video_b and args.output):
+                parser.error(
+                    "--io file requires --video_a, --video_b and --output "
+                    "(or --video_left/--video_center/--video_right for "
+                    "3-camera mode)"
+                )
         run(args)
     elif args.io == "pipe":
         if args.control_port is None or args.frames_port is None:
