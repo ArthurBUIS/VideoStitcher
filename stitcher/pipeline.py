@@ -1789,13 +1789,9 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             "[warn] 3-camera mode: static FG mask is not yet supported in "
             "this MVP. Continuing with no FG penalty in the seam cost."
         )
-    if not bool(getattr(args, "no_motion", True)):
-        # Note: in the 2-cam path args.motion is computed from "not no_motion".
-        # In 3-cam we just skip motion entirely.
-        print(
-            "[warn] 3-camera mode: motion detection is not yet supported. "
-            "Continuing with no motion penalty in the seam cost."
-        )
+    # Motion is now supported in 3-cam mode (set up in section 5a below).
+    # --motion_baseline_a/b are still 2-cam-specific and are ignored here;
+    # 3-cam baselines come from the first frame triplet.
 
     # --- 1. First frame triplet + homographies -----------------------------
     first_triplet = source.read_triplet()
@@ -1956,6 +1952,112 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         overlap_CR_t = overlap_CR_gpu["overlap_in_bbox_t"]
         print("[device] GPU contexts initialised (3-cam).")
 
+    # --- 5a. Motion detection baselines (per overlap) --------------------
+    #
+    # 3-camera motion mirrors the 2-camera path but with two contexts:
+    # baselines for the L<>C overlap and baselines for the C<>R overlap.
+    # Center's baseline is held twice -- once cropped to bbox_LC and once
+    # to bbox_CR -- which costs nothing in practice (a few hundred KB at
+    # half-res) and keeps the per-frame code shape-symmetric with the
+    # 2-cam compute_motion_mask_gpu/cpu signatures.
+    #
+    # We reuse the first frame triplet as the baseline -- same fall-back
+    # rule the 2-cam path uses when no baseline images are provided. The
+    # --motion_baseline_a/b CLI args are NOT consulted in 3-cam mode
+    # (deliberate: they're inherently 2-camera).
+    use_motion_3cam = not bool(getattr(args, "no_motion", False))
+    motion_dilate_kernel_3cam = None
+    baseline_L_in_LC_t = baseline_C_in_LC_t = None
+    baseline_C_in_CR_t = baseline_R_in_CR_t = None
+    baseline_L_in_LC = baseline_C_in_LC = None
+    baseline_C_in_CR = baseline_R_in_CR = None
+    overlap_in_bbox_motion_LC_t = overlap_in_bbox_motion_CR_t = None
+    overlap_in_bbox_motion_LC = overlap_in_bbox_motion_CR = None
+    if use_motion_3cam:
+        print(
+            f"[info] 3-cam motion: pixel method, threshold={args.motion_threshold} "
+            f"dilate={args.motion_dilate} penalty={args.motion_penalty:g} "
+            f"(running at half-res inside each overlap bbox)"
+        )
+        motion_dilate_kernel_3cam = (
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * args.motion_dilate + 1, 2 * args.motion_dilate + 1),
+            ) if args.motion_dilate > 0 else None
+        )
+        # Use the just-read first triplet as the baseline.
+        baseline_L = frame_L.copy()
+        baseline_C = frame_C.copy()
+        baseline_R = frame_R.copy()
+        if dev["cuda_available"]:
+            # Warp + crop to each overlap bbox, then downsample to half-res
+            # so per-frame motion runs on ~1/4 the pixel count of the bbox.
+            full_baseline_L_t, full_baseline_C_t, full_baseline_R_t = (
+                warp_triplet_gpu(
+                    baseline_L, baseline_C, baseline_R,
+                    grid_triplet_t, gpu_ctx_3cam["device"],
+                    gain_L_t=gain_L_t,
+                    gain_C_t=gain_C_t,
+                    gain_R_t=gain_R_t,
+                )
+            )
+            baseline_L_in_LC_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_L_t, bbox_LC)
+            ).float()
+            baseline_C_in_LC_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_C_t, bbox_LC)
+            ).float()
+            baseline_C_in_CR_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_C_t, bbox_CR)
+            ).float()
+            baseline_R_in_CR_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_R_t, bbox_CR)
+            ).float()
+            overlap_in_bbox_motion_LC_t = downsample_mask_half_gpu(
+                overlap_LC_t,
+            )
+            overlap_in_bbox_motion_CR_t = downsample_mask_half_gpu(
+                overlap_CR_t,
+            )
+            del full_baseline_L_t, full_baseline_C_t, full_baseline_R_t
+        else:
+            if lut_L is not None:
+                baseline_L = apply_gain_lut(baseline_L, lut_L)
+                baseline_C = apply_gain_lut(baseline_C, lut_C)
+                baseline_R = apply_gain_lut(baseline_R, lut_R)
+            full_baseline_L = cv2.remap(
+                baseline_L, map_Lx, map_Ly, cv2.INTER_LINEAR,
+            )
+            full_baseline_C = cv2.remap(
+                baseline_C, map_Cx, map_Cy, cv2.INTER_LINEAR,
+            )
+            full_baseline_R = cv2.remap(
+                baseline_R, map_Rx, map_Ry, cv2.INTER_LINEAR,
+            )
+
+            def _crop_cpu(img, bbox):
+                x0, y0, x1, y1 = bbox
+                return img[y0:y1, x0:x1].copy()
+
+            baseline_L_in_LC = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_L, bbox_LC),
+            ).astype(np.float32)
+            baseline_C_in_LC = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_C, bbox_LC),
+            ).astype(np.float32)
+            baseline_C_in_CR = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_C, bbox_CR),
+            ).astype(np.float32)
+            baseline_R_in_CR = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_R, bbox_CR),
+            ).astype(np.float32)
+            overlap_in_bbox_motion_LC = downsample_mask_half_cpu(
+                ctx_LC.overlap,
+            )
+            overlap_in_bbox_motion_CR = downsample_mask_half_cpu(
+                ctx_CR.overlap,
+            )
+
     # --- 5b. YOLO person segmenter for the seam-cost person penalty -------
     #
     # Synchronous integration: every --yolo_every frames we run a triplet
@@ -2097,6 +2199,46 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         union_t[yCb0:yCb1, xCb0:xCb1].contiguous()
                     )
 
+                # ---- Per-overlap motion masks (every frame) -----------
+                motion_mask_LC_t = motion_mask_CR_t = None
+                if use_motion_3cam:
+                    # Crop the just-warped triplet to each overlap bbox,
+                    # half-res it, diff vs. the baseline. Same algorithm
+                    # as compute_motion_mask_gpu in the 2-cam pipeline,
+                    # called twice with different (frame, baseline,
+                    # overlap_mask) triplets.
+                    wL_in_LC_t = downsample_image_half_gpu(
+                        crop_to_bbox_gpu(warped_L_t, bbox_LC)
+                    )
+                    wC_in_LC_t = downsample_image_half_gpu(
+                        crop_to_bbox_gpu(warped_C_t, bbox_LC)
+                    )
+                    motion_half_LC_t = compute_motion_mask_gpu(
+                        wL_in_LC_t, wC_in_LC_t,
+                        baseline_L_in_LC_t, baseline_C_in_LC_t,
+                        args.motion_threshold, args.motion_dilate,
+                        overlap_in_bbox_motion_LC_t,
+                    )
+                    motion_mask_LC_t = upsample_mask_to_bbox_gpu(
+                        motion_half_LC_t, bbox_LC,
+                    )
+
+                    wC_in_CR_t = downsample_image_half_gpu(
+                        crop_to_bbox_gpu(warped_C_t, bbox_CR)
+                    )
+                    wR_in_CR_t = downsample_image_half_gpu(
+                        crop_to_bbox_gpu(warped_R_t, bbox_CR)
+                    )
+                    motion_half_CR_t = compute_motion_mask_gpu(
+                        wC_in_CR_t, wR_in_CR_t,
+                        baseline_C_in_CR_t, baseline_R_in_CR_t,
+                        args.motion_threshold, args.motion_dilate,
+                        overlap_in_bbox_motion_CR_t,
+                    )
+                    motion_mask_CR_t = upsample_mask_to_bbox_gpu(
+                        motion_half_CR_t, bbox_CR,
+                    )
+
                 # ---- L<>C cost + seam ----
                 cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
                     warped_L_t, warped_C_t, overlap_LC_t,
@@ -2105,7 +2247,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     None,  # no fg mask in MVP
                     args.fg_penalty, args.person_penalty,
                     bbox_LC,
-                    motion_mask_bbox_t=None,
+                    motion_mask_bbox_t=motion_mask_LC_t,
                     motion_penalty=args.motion_penalty,
                 )
                 if args.seam_edge_margin > 0:
@@ -2132,7 +2274,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     None,  # no fg mask in MVP
                     args.fg_penalty, args.person_penalty,
                     bbox_CR,
-                    motion_mask_bbox_t=None,
+                    motion_mask_bbox_t=motion_mask_CR_t,
                     motion_penalty=args.motion_penalty,
                 )
                 if args.seam_edge_margin > 0:
@@ -2192,7 +2334,42 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]
                     ].copy()
 
-                # CPU cost: photometric + person penalty (if available).
+                # ---- Per-overlap motion masks (CPU, every frame) -------
+                motion_mask_LC = motion_mask_CR = None
+                if use_motion_3cam:
+                    wL_in_LC = downsample_image_half_cpu(
+                        warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                    ).astype(np.float32)
+                    wC_in_LC = downsample_image_half_cpu(
+                        warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                    ).astype(np.float32)
+                    motion_half_LC = compute_motion_mask_cpu(
+                        wL_in_LC, wC_in_LC,
+                        baseline_L_in_LC, baseline_C_in_LC,
+                        args.motion_threshold, motion_dilate_kernel_3cam,
+                        overlap_in_bbox_motion_LC,
+                    )
+                    motion_mask_LC = upsample_mask_to_bbox_cpu(
+                        motion_half_LC, bbox_LC,
+                    )
+
+                    wC_in_CR = downsample_image_half_cpu(
+                        warped_C[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                    ).astype(np.float32)
+                    wR_in_CR = downsample_image_half_cpu(
+                        warped_R[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                    ).astype(np.float32)
+                    motion_half_CR = compute_motion_mask_cpu(
+                        wC_in_CR, wR_in_CR,
+                        baseline_C_in_CR, baseline_R_in_CR,
+                        args.motion_threshold, motion_dilate_kernel_3cam,
+                        overlap_in_bbox_motion_CR,
+                    )
+                    motion_mask_CR = upsample_mask_to_bbox_cpu(
+                        motion_half_CR, bbox_CR,
+                    )
+
+                # CPU cost: photometric + person penalty + motion penalty.
                 wL_bb_LC = warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
                 wC_bb_LC = warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
                 photo_LC = compute_cost_fast_cpu(
@@ -2210,6 +2387,15 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_LC, 1.0 - ema_eff, 0, dst=cost_ema_LC,
                     )
                 cost_for_dp_LC = cost_ema_LC.copy()
+                # Motion penalty: applied where motion is detected AND
+                # the pixel is NOT a person (person takes priority).
+                if motion_mask_LC is not None and motion_mask_LC.any():
+                    motion_bool_LC = motion_mask_LC > 0
+                    if person_mask_bbox_LC is not None:
+                        motion_only_LC = motion_bool_LC & (person_mask_bbox_LC == 0)
+                    else:
+                        motion_only_LC = motion_bool_LC
+                    cost_for_dp_LC[motion_only_LC] += args.motion_penalty
                 if person_mask_bbox_LC is not None and person_mask_bbox_LC.any():
                     cost_for_dp_LC[person_mask_bbox_LC > 0] += args.person_penalty
                 add_edge_margin_penalty(
@@ -2244,6 +2430,13 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_CR, 1.0 - ema_eff, 0, dst=cost_ema_CR,
                     )
                 cost_for_dp_CR = cost_ema_CR.copy()
+                if motion_mask_CR is not None and motion_mask_CR.any():
+                    motion_bool_CR = motion_mask_CR > 0
+                    if person_mask_bbox_CR is not None:
+                        motion_only_CR = motion_bool_CR & (person_mask_bbox_CR == 0)
+                    else:
+                        motion_only_CR = motion_bool_CR
+                    cost_for_dp_CR[motion_only_CR] += args.motion_penalty
                 if person_mask_bbox_CR is not None and person_mask_bbox_CR.any():
                     cost_for_dp_CR[person_mask_bbox_CR > 0] += args.person_penalty
                 add_edge_margin_penalty(
