@@ -2398,7 +2398,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         overlap_in_bbox_motion_LC_t,
                     )
                     motion_mask_LC_t = upsample_mask_to_bbox_gpu(
-                        motion_half_LC_t, bbox_LC,
+                        motion_half_LC_t, bbox_shape_LC,
                     )
 
                     wC_in_CR_t = downsample_image_half_gpu(
@@ -2414,7 +2414,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         overlap_in_bbox_motion_CR_t,
                     )
                     motion_mask_CR_t = upsample_mask_to_bbox_gpu(
-                        motion_half_CR_t, bbox_CR,
+                        motion_half_CR_t, bbox_shape_CR,
                     )
 
                 # ---- L<>C cost + seam ----
@@ -2528,7 +2528,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         overlap_in_bbox_motion_LC,
                     )
                     motion_mask_LC = upsample_mask_to_bbox_cpu(
-                        motion_half_LC, bbox_LC,
+                        motion_half_LC, bbox_shape_LC,
                     )
 
                     wC_in_CR = downsample_image_half_cpu(
@@ -2544,7 +2544,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         overlap_in_bbox_motion_CR,
                     )
                     motion_mask_CR = upsample_mask_to_bbox_cpu(
-                        motion_half_CR, bbox_CR,
+                        motion_half_CR, bbox_shape_CR,
                     )
 
                 # CPU cost: photometric + person penalty + motion penalty.
