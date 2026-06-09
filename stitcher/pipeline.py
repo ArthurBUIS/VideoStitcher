@@ -144,6 +144,8 @@ from stitcher.segmentation import (
     PersonSegmenter,
     compute_fg_mask_seg_cpu,
     compute_fg_mask_seg_gpu,
+    compute_fg_mask_seg_triplet_canvas_cpu,
+    compute_fg_mask_seg_triplet_canvas_gpu,
 )
 from stitcher.frame_io import FileFrameSink, FileFrameSource, FileFrameSource3
 from stitcher.warp import (
@@ -1783,12 +1785,9 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         print("[info] --person_tracking implies --autocrop; enabling it.")
         args.autocrop = True
 
-    # Warn about deferred features rather than silently dropping them.
-    if not args.no_fg:
-        print(
-            "[warn] 3-camera mode: static FG mask is not yet supported in "
-            "this MVP. Continuing with no FG penalty in the seam cost."
-        )
+    # FG mask is now supported in 3-cam mode (set up after we have grids,
+    # in section 5c below). Motion is also supported (section 5a). The
+    # remaining 3-cam-only no-ops are debug overlays + async pipelining.
     # Motion is now supported in 3-cam mode (set up in section 5a below).
     # --motion_baseline_a/b are still 2-cam-specific and are ignored here;
     # 3-cam baselines come from the first frame triplet.
@@ -2094,6 +2093,137 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
     person_mask_bbox_CR = None
     canvas_person_mask_for_tracker = None  # full-canvas uint8 (CPU)
 
+    # --- 5c. Static FG mask (per-overlap slices of a canvas-wide mask) ----
+    #
+    # FG runs YOLO segmentation on all three source frames once at
+    # startup, warps each into canvas space, unions + dilates, then
+    # slices the canvas-wide result into bbox_LC and bbox_CR. The
+    # canvas-wide form is recomputed every fg_recompute_frames frames
+    # (same cadence as 2-cam) to track furniture/people that arrive or
+    # leave the room over the course of a long call.
+    #
+    # YOLOE + depth-filter FG is supported with the same args as 2-cam
+    # (--fg_model yoloe, --static_fg_depth_threshold). We re-use the
+    # person_segmenter as the fg_segmenter when --fg_model matches
+    # --person_model (YOLOv8 default), or build a separate YOLOE one
+    # via the same _build_segmenters helper if requested.
+    use_fg_3cam = not args.no_fg
+    fg_segmenter_3cam = None
+    fg_class_ids_3cam = []
+    fg_only_class_ids_3cam = []
+    fg_depth_threshold_3cam = None
+    fg_dilate_kernel_3cam = (
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * args.fg_dilate + 1, 2 * args.fg_dilate + 1),
+        ) if args.fg_dilate > 0 else None
+    )
+    fg_mask_bbox_LC_t = fg_mask_bbox_CR_t = None
+    fg_mask_bbox_LC = fg_mask_bbox_CR = None
+    fg_recompute_frames_3cam = (
+        int(round(args.fg_recompute_seconds * source.output_fps))
+        if args.fg_recompute_seconds > 0 else 0
+    )
+    if use_fg_3cam:
+        # Build the FG segmenter + class ids by reusing _build_segmenters.
+        # That helper returns 5 things; we only need fg_segmenter,
+        # fg_class_ids, fg_only_class_ids. The person_* outputs are
+        # discarded -- we already loaded a YOLOv8 person_segmenter
+        # above. This is slightly wasteful (we may load the YOLOv8
+        # weights twice when fg_model is yolov8 too) but keeps the
+        # build logic single-sourced.
+        (_p_segmenter_unused, _p_class_ids_unused,
+         fg_segmenter_3cam, fg_class_ids_3cam, fg_only_class_ids_3cam) = (
+            _build_segmenters(args, dev)
+        )
+        if fg_only_class_ids_3cam:
+            from stitcher.static_fg import FG_DEPTH_THRESHOLD
+            fg_depth_threshold_3cam = (
+                args.static_fg_depth_threshold
+                if args.static_fg_depth_threshold is not None
+                else FG_DEPTH_THRESHOLD
+            )
+            print(
+                "[info] 3-cam FG: YOLOE with depth filter "
+                f"(threshold={fg_depth_threshold_3cam:.2f}, "
+                f"classes={fg_class_ids_3cam}, "
+                f"fg-only={fg_only_class_ids_3cam})"
+            )
+        else:
+            print(
+                "[info] 3-cam FG: YOLO segmentation "
+                f"(classes={fg_class_ids_3cam})"
+            )
+
+        # Compute the initial canvas-wide FG mask, slice into both bboxes.
+        t0 = time.time()
+        if dev["cuda_available"]:
+            grid_L_for_mask_t_init = grid_triplet_t[0:1]
+            grid_C_for_mask_t_init = grid_triplet_t[1:2]
+            grid_R_for_mask_t_init = grid_triplet_t[2:3]
+            fg_canvas_t = compute_fg_mask_seg_triplet_canvas_gpu(
+                fg_segmenter_3cam, frame_L, frame_C, frame_R,
+                fg_class_ids_3cam,
+                grid_L_for_mask_t_init,
+                grid_C_for_mask_t_init,
+                grid_R_for_mask_t_init,
+                args.fg_dilate,
+                fg_only_class_ids=fg_only_class_ids_3cam,
+                depth_threshold=fg_depth_threshold_3cam,
+            )
+            # AND each slice with that overlap's overlap_in_bbox mask so
+            # the FG penalty only applies where both contributing cams
+            # see the pixel (same gate as 2-cam compute_fg_mask_seg_gpu).
+            xL0, yL0, xL1, yL1 = bbox_LC
+            xC0, yC0, xC1, yC1 = bbox_CR
+            fg_LC_slice = fg_canvas_t[yL0:yL1, xL0:xL1].contiguous()
+            fg_CR_slice = fg_canvas_t[yC0:yC1, xC0:xC1].contiguous()
+            fg_mask_bbox_LC_t = torch.where(
+                overlap_LC_t > 0,
+                fg_LC_slice,
+                torch.zeros_like(fg_LC_slice),
+            )
+            fg_mask_bbox_CR_t = torch.where(
+                overlap_CR_t > 0,
+                fg_CR_slice,
+                torch.zeros_like(fg_CR_slice),
+            )
+            cov_LC = (fg_mask_bbox_LC_t > 0).float().mean().item() * 100
+            cov_CR = (fg_mask_bbox_CR_t > 0).float().mean().item() * 100
+        else:
+            fg_canvas = compute_fg_mask_seg_triplet_canvas_cpu(
+                fg_segmenter_3cam, frame_L, frame_C, frame_R,
+                fg_class_ids_3cam,
+                map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+                fg_dilate_kernel_3cam,
+                fg_only_class_ids=fg_only_class_ids_3cam,
+                depth_threshold=fg_depth_threshold_3cam,
+            )
+            xL0, yL0, xL1, yL1 = bbox_LC
+            xC0, yC0, xC1, yC1 = bbox_CR
+            fg_mask_bbox_LC = cv2.bitwise_and(
+                fg_canvas[yL0:yL1, xL0:xL1].copy(),
+                ctx_LC.overlap,
+            )
+            fg_mask_bbox_CR = cv2.bitwise_and(
+                fg_canvas[yC0:yC1, xC0:xC1].copy(),
+                ctx_CR.overlap,
+            )
+            cov_LC = float((fg_mask_bbox_LC > 0).mean()) * 100
+            cov_CR = float((fg_mask_bbox_CR > 0).mean()) * 100
+        print(
+            f"[info] 3-cam FG mask computed in "
+            f"{(time.time() - t0) * 1000:.1f} ms  "
+            f"(L<>C: {cov_LC:.1f}% of bbox flagged, "
+            f"C<>R: {cov_CR:.1f}%)."
+        )
+        if fg_recompute_frames_3cam > 0:
+            print(
+                f"[info] 3-cam FG recompute every "
+                f"{fg_recompute_frames_3cam} frames "
+                f"(~{args.fg_recompute_seconds}s)."
+            )
+
     # --- 6. Person tracker (operates on output canvas; camera-count agnostic)
     tracker = None
     writer_output_size = output_size
@@ -2156,6 +2286,54 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                 if trip is None:
                     break
                 fL, fC, fR, ts_us = trip
+
+            # --- Periodic FG mask recompute (every fg_recompute_frames) ---
+            if (use_fg_3cam
+                    and fg_recompute_frames_3cam > 0
+                    and frame_idx > 0
+                    and frame_idx % fg_recompute_frames_3cam == 0):
+                if dev["cuda_available"]:
+                    fg_canvas_t = compute_fg_mask_seg_triplet_canvas_gpu(
+                        fg_segmenter_3cam, fL, fC, fR,
+                        fg_class_ids_3cam,
+                        grid_L_for_mask_t, grid_C_for_mask_t, grid_R_for_mask_t,
+                        args.fg_dilate,
+                        fg_only_class_ids=fg_only_class_ids_3cam,
+                        depth_threshold=fg_depth_threshold_3cam,
+                    )
+                    xL0, yL0, xL1, yL1 = bbox_LC
+                    xC0, yC0, xC1, yC1 = bbox_CR
+                    fg_LC_slice = fg_canvas_t[yL0:yL1, xL0:xL1].contiguous()
+                    fg_CR_slice = fg_canvas_t[yC0:yC1, xC0:xC1].contiguous()
+                    fg_mask_bbox_LC_t = torch.where(
+                        overlap_LC_t > 0,
+                        fg_LC_slice,
+                        torch.zeros_like(fg_LC_slice),
+                    )
+                    fg_mask_bbox_CR_t = torch.where(
+                        overlap_CR_t > 0,
+                        fg_CR_slice,
+                        torch.zeros_like(fg_CR_slice),
+                    )
+                else:
+                    fg_canvas = compute_fg_mask_seg_triplet_canvas_cpu(
+                        fg_segmenter_3cam, fL, fC, fR,
+                        fg_class_ids_3cam,
+                        map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+                        fg_dilate_kernel_3cam,
+                        fg_only_class_ids=fg_only_class_ids_3cam,
+                        depth_threshold=fg_depth_threshold_3cam,
+                    )
+                    xL0, yL0, xL1, yL1 = bbox_LC
+                    xC0, yC0, xC1, yC1 = bbox_CR
+                    fg_mask_bbox_LC = cv2.bitwise_and(
+                        fg_canvas[yL0:yL1, xL0:xL1].copy(),
+                        ctx_LC.overlap,
+                    )
+                    fg_mask_bbox_CR = cv2.bitwise_and(
+                        fg_canvas[yC0:yC1, xC0:xC1].copy(),
+                        ctx_CR.overlap,
+                    )
 
             # --- Warp the triplet ---
             if dev["cuda_available"]:
@@ -2244,7 +2422,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     warped_L_t, warped_C_t, overlap_LC_t,
                     cost_ema_LC_t, ema_eff,
                     person_mask_bbox_LC_t,
-                    None,  # no fg mask in MVP
+                    fg_mask_bbox_LC_t if use_fg_3cam else None,
                     args.fg_penalty, args.person_penalty,
                     bbox_LC,
                     motion_mask_bbox_t=motion_mask_LC_t,
@@ -2271,7 +2449,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     warped_C_t, warped_R_t, overlap_CR_t,
                     cost_ema_CR_t, ema_eff,
                     person_mask_bbox_CR_t,
-                    None,  # no fg mask in MVP
+                    fg_mask_bbox_CR_t if use_fg_3cam else None,
                     args.fg_penalty, args.person_penalty,
                     bbox_CR,
                     motion_mask_bbox_t=motion_mask_CR_t,
@@ -2387,8 +2565,17 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_LC, 1.0 - ema_eff, 0, dst=cost_ema_LC,
                     )
                 cost_for_dp_LC = cost_ema_LC.copy()
-                # Motion penalty: applied where motion is detected AND
-                # the pixel is NOT a person (person takes priority).
+                # Penalty hierarchy (matches 2-cam):
+                #   fg     (lower) where mask AND NOT person
+                #   motion (lower) where mask AND NOT person
+                #   person (highest priority) where mask
+                if use_fg_3cam and fg_mask_bbox_LC is not None and fg_mask_bbox_LC.any():
+                    fg_bool_LC = fg_mask_bbox_LC > 0
+                    if person_mask_bbox_LC is not None:
+                        fg_only_LC = fg_bool_LC & (person_mask_bbox_LC == 0)
+                    else:
+                        fg_only_LC = fg_bool_LC
+                    cost_for_dp_LC[fg_only_LC] += args.fg_penalty
                 if motion_mask_LC is not None and motion_mask_LC.any():
                     motion_bool_LC = motion_mask_LC > 0
                     if person_mask_bbox_LC is not None:
@@ -2430,6 +2617,13 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_CR, 1.0 - ema_eff, 0, dst=cost_ema_CR,
                     )
                 cost_for_dp_CR = cost_ema_CR.copy()
+                if use_fg_3cam and fg_mask_bbox_CR is not None and fg_mask_bbox_CR.any():
+                    fg_bool_CR = fg_mask_bbox_CR > 0
+                    if person_mask_bbox_CR is not None:
+                        fg_only_CR = fg_bool_CR & (person_mask_bbox_CR == 0)
+                    else:
+                        fg_only_CR = fg_bool_CR
+                    cost_for_dp_CR[fg_only_CR] += args.fg_penalty
                 if motion_mask_CR is not None and motion_mask_CR.any():
                     motion_bool_CR = motion_mask_CR > 0
                     if person_mask_bbox_CR is not None:
