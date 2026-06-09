@@ -1755,20 +1755,23 @@ def run(args, source=None, sink_factory=None):
 
 def _run_3cam(args, source, sink_factory, dev, ema_eff):
     """
-    3-camera dispatch from run(). MVP scope -- joint gain compensation,
-    two-seam DP with x_mid cap, 3-camera multiband composite, autocrop,
-    person tracking. Features intentionally deferred to a follow-up
-    commit (will warn if asked for):
-      - YOLOE person mask in cost (no person penalty in 3-cam yet)
+    3-camera dispatch from run(). Scope:
+      - Joint gain compensation
+      - Triplet warp
+      - Two-seam DP with x_mid cap
+      - 3-camera multiband composite
+      - Autocrop + person tracking
+      - YOLOE person mask in seam cost (every --yolo_every frames; sync,
+        not yet pipelined into a worker thread)
+
+    Features intentionally still deferred to a follow-up commit (will
+    warn if asked for):
       - Motion detection
       - Static FG mask
       - Debug overlays
-      - Async worker threads (everything runs sequentially)
-
-    Even with those gaps this delivers a working end-to-end 3-camera
-    panorama. The architecture decisions made for this MVP (Approach A
-    two-overlap dictionary, x_mid cap with blend_width margin, joint
-    gain comp) are exactly what the follow-up commits build on.
+      - Async worker threads (YOLO + composite still run synchronously
+        on the main loop -- pipelining lands once the rest of the
+        feature parity is in place)
     """
     import numpy as np  # local re-import for clarity in this isolated path
     import cv2
@@ -1953,6 +1956,42 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         overlap_CR_t = overlap_CR_gpu["overlap_in_bbox_t"]
         print("[device] GPU contexts initialised (3-cam).")
 
+    # --- 5b. YOLO person segmenter for the seam-cost person penalty -------
+    #
+    # Synchronous integration: every --yolo_every frames we run a triplet
+    # inference, warp the three source masks into canvas space, union them,
+    # then slice the union to the L<>C and C<>R overlap bboxes for the cost
+    # injection + hand the full canvas mask to the tracker. Async pipelining
+    # is a follow-up; on a portal-grade GPU the inference is ~30-50 ms and
+    # only fires every 8th frame, so the main-loop stall is tolerable.
+    person_segmenter = PersonSegmenter(
+        args.yolo_weights, device=dev["yolo_device"],
+    )
+    print(
+        f"[info] 3-cam YOLO: loaded {args.yolo_weights} for person mask "
+        f"(every {args.yolo_every} frames)"
+    )
+    dilate_kernel_3cam = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
+    )
+    if dev["cuda_available"]:
+        # Per-source grids built for the triplet warp -- reuse them for the
+        # 3 mask warps so the canvas-space mask geometry stays consistent
+        # with the warped frames.
+        grid_L_for_mask_t = grid_triplet_t[0:1]
+        grid_C_for_mask_t = grid_triplet_t[1:2]
+        grid_R_for_mask_t = grid_triplet_t[2:3]
+    # Latest masks held across iterations (sticky between YOLO runs): the
+    # cost gets the same person penalty for up to args.yolo_every frames
+    # in a row, which is fine because the person doesn't move > a few
+    # pixels in that window.
+    person_mask_bbox_LC_t = None
+    person_mask_bbox_CR_t = None
+    person_mask_bbox_LC = None
+    person_mask_bbox_CR = None
+    canvas_person_mask_for_tracker = None  # full-canvas uint8 (CPU)
+
     # --- 6. Person tracker (operates on output canvas; camera-count agnostic)
     tracker = None
     writer_output_size = output_size
@@ -2022,12 +2061,48 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     fL, fC, fR, grid_triplet_t, gpu_ctx_3cam["device"],
                     gain_L_t=gain_L_t, gain_C_t=gain_C_t, gain_R_t=gain_R_t,
                 )
+
+                # ---- YOLO triplet (every yolo_every frames) ------------
+                # Runs synchronously on the main loop; produces the per-
+                # overlap bbox-cropped person masks fed into the cost
+                # below, AND the full-canvas mask consumed by the tracker.
+                if frame_idx % args.yolo_every == 0:
+                    mL_src_t, mC_src_t, mR_src_t = (
+                        person_segmenter.predict_classes_mask_triplet_gpu(
+                            fL, fC, fR,
+                            fL.shape[:2], fC.shape[:2], fR.shape[:2],
+                            (0,),  # PERSON_CLASS_ID for YOLOv8 COCO
+                        )
+                    )
+                    mL_canvas_t = warp_mask_gpu(mL_src_t, grid_L_for_mask_t)
+                    mC_canvas_t = warp_mask_gpu(mC_src_t, grid_C_for_mask_t)
+                    mR_canvas_t = warp_mask_gpu(mR_src_t, grid_R_for_mask_t)
+                    union_t = torch.bitwise_or(
+                        torch.bitwise_or(mL_canvas_t, mC_canvas_t),
+                        mR_canvas_t,
+                    )
+                    union_t = dilate_gpu(union_t, args.mask_dilate)
+                    canvas_person_mask_for_tracker = (
+                        union_t.cpu().numpy() if tracker is not None
+                        else None
+                    )
+                    # Bbox slices for the two cost matrices. We zero-strip
+                    # the mask to a (H_bb, W_bb) uint8 tensor.
+                    xLb0, yLb0, xLb1, yLb1 = bbox_LC
+                    xCb0, yCb0, xCb1, yCb1 = bbox_CR
+                    person_mask_bbox_LC_t = (
+                        union_t[yLb0:yLb1, xLb0:xLb1].contiguous()
+                    )
+                    person_mask_bbox_CR_t = (
+                        union_t[yCb0:yCb1, xCb0:xCb1].contiguous()
+                    )
+
                 # ---- L<>C cost + seam ----
                 cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
                     warped_L_t, warped_C_t, overlap_LC_t,
                     cost_ema_LC_t, ema_eff,
-                    None,  # no person mask in MVP
-                    None,  # no fg mask
+                    person_mask_bbox_LC_t,
+                    None,  # no fg mask in MVP
                     args.fg_penalty, args.person_penalty,
                     bbox_LC,
                     motion_mask_bbox_t=None,
@@ -2053,7 +2128,8 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                 cost_ema_CR_t, cost_for_dp_CR_t = compute_cost_and_ema_gpu(
                     warped_C_t, warped_R_t, overlap_CR_t,
                     cost_ema_CR_t, ema_eff,
-                    None, None,
+                    person_mask_bbox_CR_t,
+                    None,  # no fg mask in MVP
                     args.fg_penalty, args.person_penalty,
                     bbox_CR,
                     motion_mask_bbox_t=None,
@@ -2084,7 +2160,39 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                 warped_L = cv2.remap(fL_g, map_Lx, map_Ly, cv2.INTER_LINEAR)
                 warped_C = cv2.remap(fC_g, map_Cx, map_Cy, cv2.INTER_LINEAR)
                 warped_R = cv2.remap(fR_g, map_Rx, map_Ry, cv2.INTER_LINEAR)
-                # CPU cost: photometric only.
+
+                # ---- YOLO triplet (every yolo_every frames; CPU) -------
+                if frame_idx % args.yolo_every == 0:
+                    mL_src, mC_src, mR_src = (
+                        person_segmenter.predict_classes_mask_triplet(
+                            fL, fC, fR, (0,),  # PERSON_CLASS_ID
+                        )
+                    )
+                    mL_canvas = cv2.remap(
+                        mL_src, map_Lx, map_Ly, cv2.INTER_NEAREST,
+                    )
+                    mC_canvas = cv2.remap(
+                        mC_src, map_Cx, map_Cy, cv2.INTER_NEAREST,
+                    )
+                    mR_canvas = cv2.remap(
+                        mR_src, map_Rx, map_Ry, cv2.INTER_NEAREST,
+                    )
+                    union = cv2.bitwise_or(
+                        cv2.bitwise_or(mL_canvas, mC_canvas),
+                        mR_canvas,
+                    )
+                    union = cv2.dilate(union, dilate_kernel_3cam)
+                    canvas_person_mask_for_tracker = (
+                        union.copy() if tracker is not None else None
+                    )
+                    person_mask_bbox_LC = union[
+                        bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]
+                    ].copy()
+                    person_mask_bbox_CR = union[
+                        bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]
+                    ].copy()
+
+                # CPU cost: photometric + person penalty (if available).
                 wL_bb_LC = warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
                 wC_bb_LC = warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
                 photo_LC = compute_cost_fast_cpu(
@@ -2102,6 +2210,8 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_LC, 1.0 - ema_eff, 0, dst=cost_ema_LC,
                     )
                 cost_for_dp_LC = cost_ema_LC.copy()
+                if person_mask_bbox_LC is not None and person_mask_bbox_LC.any():
+                    cost_for_dp_LC[person_mask_bbox_LC > 0] += args.person_penalty
                 add_edge_margin_penalty(
                     cost_for_dp_LC, args.seam_edge_margin,
                     edge_penalty=args.edge_penalty,
@@ -2134,6 +2244,8 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         cost_ema_CR, 1.0 - ema_eff, 0, dst=cost_ema_CR,
                     )
                 cost_for_dp_CR = cost_ema_CR.copy()
+                if person_mask_bbox_CR is not None and person_mask_bbox_CR.any():
+                    cost_for_dp_CR[person_mask_bbox_CR > 0] += args.person_penalty
                 add_edge_margin_penalty(
                     cost_for_dp_CR, args.seam_edge_margin,
                     edge_penalty=args.edge_penalty,
@@ -2179,12 +2291,20 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             seam_LC_full = upscale_seam(seam_LC_small, bbox_shape_LC, ds)
             seam_CR_full = upscale_seam(seam_CR_small, bbox_shape_CR, ds)
 
-            # --- Person tracking update (no YOLO mask in MVP) --------------
+            # --- Person tracking update -----------------------------------
             tracking_crop = None
             if tracker is not None:
-                # MVP shortcut: no live person mask → tracker drifts back
-                # to its centre. Acceptable until YOLO support lands.
-                tracker.update(None, output_size[0], output_size[1])
+                # The canvas-wide person mask was published by the most
+                # recent YOLO run (could be from up to args.yolo_every
+                # frames ago, but the EMA inside PersonTracker smooths
+                # that latency out). When YOLO hasn't run yet on the
+                # very first frames, canvas_person_mask_for_tracker is
+                # None and the tracker drifts to its centre, which is
+                # the right behaviour for warm-up.
+                tracker.update(
+                    canvas_person_mask_for_tracker,
+                    output_size[0], output_size[1],
+                )
                 tracking_crop = tracker.get_crop_bounds()
 
             # --- Composite -------------------------------------------------

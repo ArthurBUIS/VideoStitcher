@@ -327,6 +327,113 @@ class PersonSegmenter:
             out.append(mask)
         return out[0], out[1]
 
+    # ------------------------------------------------------------------
+    # 3-frame variants -- mirror predict_classes_mask_pair* with one more
+    # frame in the batch. Same letterboxing-on-mismatch caveat applies.
+    # ------------------------------------------------------------------
+
+    def predict_classes_mask_triplet_gpu(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        target_hw_L, target_hw_C, target_hw_R,
+        class_ids=(PERSON_CLASS_ID,),
+    ):
+        """
+        Three-frame GPU inference. Batched into a single model.predict call
+        when all three source frames share a shape (the portal case);
+        otherwise falls back to three independent calls so each frame gets
+        its own letterboxing.
+        """
+        if (frame_L_bgr.shape == frame_C_bgr.shape
+                and frame_C_bgr.shape == frame_R_bgr.shape):
+            return self._predict_classes_mask_triplet_batched_gpu(
+                frame_L_bgr, frame_C_bgr, frame_R_bgr,
+                target_hw_L, target_hw_C, target_hw_R,
+                class_ids,
+            )
+        mask_L = self.predict_classes_mask_gpu(frame_L_bgr, target_hw_L, class_ids)
+        mask_C = self.predict_classes_mask_gpu(frame_C_bgr, target_hw_C, class_ids)
+        mask_R = self.predict_classes_mask_gpu(frame_R_bgr, target_hw_R, class_ids)
+        return mask_L, mask_C, mask_R
+
+    def _predict_classes_mask_triplet_batched_gpu(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        target_hw_L, target_hw_C, target_hw_R,
+        class_ids,
+    ):
+        results = self.model.predict(
+            [frame_L_bgr, frame_C_bgr, frame_R_bgr],
+            classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        targets = (target_hw_L, target_hw_C, target_hw_R)
+        for i, target_hw in enumerate(targets):
+            H_tgt, W_tgt = target_hw
+            if not results or i >= len(results):
+                out.append(torch.zeros(
+                    (H_tgt, W_tgt), dtype=torch.uint8, device=self.device,
+                ))
+                continue
+            r = results[i]
+            if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
+                out.append(torch.zeros(
+                    (H_tgt, W_tgt), dtype=torch.uint8, device=self.device,
+                ))
+                continue
+            mdata = r.masks.data
+            merged = (mdata > 0.5).any(dim=0).float()
+            m = merged.unsqueeze(0).unsqueeze(0)
+            m = F.interpolate(m, size=(H_tgt, W_tgt), mode="nearest")
+            out.append((m[0, 0] * 255).to(torch.uint8))
+        return out[0], out[1], out[2]
+
+    def predict_classes_mask_triplet(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        class_ids=(PERSON_CLASS_ID,),
+    ):
+        """CPU/numpy variant of predict_classes_mask_triplet_gpu."""
+        if (frame_L_bgr.shape == frame_C_bgr.shape
+                and frame_C_bgr.shape == frame_R_bgr.shape):
+            return self._predict_classes_mask_triplet_batched(
+                frame_L_bgr, frame_C_bgr, frame_R_bgr, class_ids,
+            )
+        mask_L = self.predict_classes_mask(frame_L_bgr, class_ids)
+        mask_C = self.predict_classes_mask(frame_C_bgr, class_ids)
+        mask_R = self.predict_classes_mask(frame_R_bgr, class_ids)
+        return mask_L, mask_C, mask_R
+
+    def _predict_classes_mask_triplet_batched(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr, class_ids,
+    ):
+        results = self.model.predict(
+            [frame_L_bgr, frame_C_bgr, frame_R_bgr],
+            classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        frames = (frame_L_bgr, frame_C_bgr, frame_R_bgr)
+        for i, frame_bgr in enumerate(frames):
+            H, W = frame_bgr.shape[:2]
+            mask = np.zeros((H, W), dtype=np.uint8)
+            if results and i < len(results):
+                r = results[i]
+                if r.masks is not None and r.masks.data is not None \
+                        and len(r.masks.data) > 0:
+                    mdata = r.masks.data.cpu().numpy()
+                    merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
+                    mask = cv2.resize(
+                        merged_small, (W, H),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+            out.append(mask)
+        return out[0], out[1], out[2]
+
 
 def _depth_filter_keep_mask(yolo_result, fg_only_class_ids,
                             depth_map_norm, depth_threshold):
