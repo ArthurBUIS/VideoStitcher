@@ -1689,6 +1689,16 @@ def run(args, source=None, sink_factory=None):
 
     frame_idx = 0
     t_start = time.time()
+    # Rolling fps log -- same cadence and format as the 3-cam path so
+    # the two pipelines can be compared apples-to-apples in the
+    # operator's logs.
+    FPS_LOG_INTERVAL_SEC = 30.0
+    last_print = t_start
+    frames_since_print = 0
+    print(
+        "[info] Streaming frames (2-cam, pipelined; "
+        f"fps log every {FPS_LOG_INTERVAL_SEC:.0f}s)..."
+    )
     try:
         while True:
             # Fast-fail: if any worker died, surface its exception
@@ -1715,6 +1725,19 @@ def run(args, source=None, sink_factory=None):
                     (time.perf_counter() - t_put0) * 1000
                 )
             frame_idx += 1
+            frames_since_print += 1
+            now = time.time()
+            if now - last_print > FPS_LOG_INTERVAL_SEC:
+                fps = frames_since_print / max(now - last_print, 1e-6)
+                comp_q_depth = composite_in_q.qsize()
+                print(
+                    f"[info] 2-cam: frame {frame_idx}  "
+                    f"{fps:.1f} fps over last {now - last_print:.1f}s  "
+                    f"({frames_since_print} frames; "
+                    f"composite_q={comp_q_depth})"
+                )
+                last_print = now
+                frames_since_print = 0
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
@@ -2280,6 +2303,29 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         writer_output_size[0], writer_output_size[1], source.output_fps,
     )
 
+    # --- 7a. CUDA streams (GPU path only) ---------------------------------
+    #
+    # Three high-priority streams for the critical path (compute / composite
+    # / yolo) and one default-priority stream for motion. Stream priorities
+    # nudge the GPU scheduler to interleave kernels from consecutive frames
+    # instead of serialising them on the default stream.
+    #   - compute_stream:   warp + cost + edge penalty + DP seam input prep
+    #   - composite_stream: multi-band blend + pinned host copy
+    #   - yolo_stream:      YOLO predict + mask warp + dilate
+    #   - motion_stream:    motion diff + dilate (default prio: yields to
+    #                       the critical path when both have work queued)
+    compute_stream_3cam = None
+    composite_stream_3cam = None
+    motion_stream_3cam = None
+    if dev["cuda_available"]:
+        compute_stream_3cam = torch.cuda.Stream(priority=-1)
+        composite_stream_3cam = torch.cuda.Stream(priority=-1)
+        motion_stream_3cam = torch.cuda.Stream(priority=0)
+        print(
+            "[device] 3-cam CUDA streams: compute, composite, yolo "
+            "(priority -1) + motion (priority 0)"
+        )
+
     # --- 7b. Async YOLO worker (GPU path only) ----------------------------
     #
     # The worker pulls (fL, fC, fR) triplets off yolo_q_3cam, runs the
@@ -2369,7 +2415,148 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         yolo_thread.start()
         print("[info] 3-cam YOLO worker started (async).")
 
-    # --- 8. Main loop (sequential MVP) -------------------------------------
+    # --- 7c. Async motion worker (GPU path only) --------------------------
+    #
+    # Mirrors the 2-cam motion_worker: takes warped triplets, computes the
+    # per-overlap motion mask on motion_stream, and publishes to
+    # motion_mask_holder_3cam. The main loop reads the most recently
+    # published mask -- which is from the PREVIOUS frame by construction
+    # (1-frame lag). At 25+ fps that lag is well under the motion_dilate
+    # radius that absorbs sub-pixel jitter anyway, so the lag is
+    # invisible in practice.
+    motion_q_3cam = None
+    motion_mask_holder_3cam = [None]
+    motion_mask_lock_3cam = threading.Lock()
+    motion_thread = None
+    if use_motion_3cam and dev["cuda_available"]:
+        motion_q_3cam = queue.Queue(maxsize=1)
+
+        def motion_worker_3cam():
+            try:
+                with torch.cuda.stream(motion_stream_3cam):
+                    while True:
+                        item = motion_q_3cam.get()
+                        if item is SENTINEL:
+                            return
+                        wL_full_t, wC_full_t, wR_full_t, warp_event = item
+                        if warp_event is not None:
+                            warp_event.wait()
+                        # L<>C overlap motion
+                        wL_in_LC_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wL_full_t, bbox_LC)
+                        )
+                        wC_in_LC_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wC_full_t, bbox_LC)
+                        )
+                        motion_half_LC_t = compute_motion_mask_gpu(
+                            wL_in_LC_t, wC_in_LC_t,
+                            baseline_L_in_LC_t, baseline_C_in_LC_t,
+                            args.motion_threshold, args.motion_dilate,
+                            overlap_in_bbox_motion_LC_t,
+                        )
+                        motion_mask_LC_full_t = upsample_mask_to_bbox_gpu(
+                            motion_half_LC_t, bbox_shape_LC,
+                        )
+                        # C<>R overlap motion
+                        wC_in_CR_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wC_full_t, bbox_CR)
+                        )
+                        wR_in_CR_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wR_full_t, bbox_CR)
+                        )
+                        motion_half_CR_t = compute_motion_mask_gpu(
+                            wC_in_CR_t, wR_in_CR_t,
+                            baseline_C_in_CR_t, baseline_R_in_CR_t,
+                            args.motion_threshold, args.motion_dilate,
+                            overlap_in_bbox_motion_CR_t,
+                        )
+                        motion_mask_CR_full_t = upsample_mask_to_bbox_gpu(
+                            motion_half_CR_t, bbox_shape_CR,
+                        )
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "motion_mask_LC_t": motion_mask_LC_full_t,
+                            "motion_mask_CR_t": motion_mask_CR_full_t,
+                            "ready_event": ready_event,
+                        }
+                        with motion_mask_lock_3cam:
+                            motion_mask_holder_3cam[0] = new_holder
+            except Exception as e:
+                print(f"[warn] 3-cam motion worker error: {e!r}")
+
+        motion_thread = threading.Thread(
+            target=motion_worker_3cam, daemon=True,
+            name="motion_worker_3cam",
+        )
+        motion_thread.start()
+        print("[info] 3-cam motion worker started (async).")
+
+    # --- 7d. Async composite worker (GPU path only) -----------------------
+    #
+    # Takes the just-computed warped tensors + seam paths + tracking_crop
+    # from the main loop, runs multiband_gpu_async_3cam on composite_stream
+    # (so the composite kernels overlap with the next frame's compute), then
+    # hands off to the writer thread. The main loop only blocks on the
+    # composite queue when downstream backpressure builds (sink can't keep
+    # up) -- otherwise it's a put() + continue.
+    composite_in_q_3cam = None
+    composite_thread = None
+    composite_worker_error = [None]
+    if dev["cuda_available"]:
+        composite_in_q_3cam = queue.Queue(maxsize=4)
+
+        def composite_worker_3cam():
+            try:
+                with torch.cuda.stream(composite_stream_3cam):
+                    while True:
+                        item = composite_in_q_3cam.get()
+                        if item is SENTINEL:
+                            return
+                        compute_event = item["compute_done_event"]
+                        if compute_event is not None:
+                            compute_event.wait()
+                        pinned = free_pinned_q.get()
+                        copy_event = composite_multiband_gpu_async_3cam(
+                            item["warped_L_t"],
+                            item["warped_C_t"],
+                            item["warped_R_t"],
+                            static_3cam,
+                            item["seam_LC_full"],
+                            item["seam_CR_full"],
+                            args.blend_width, args.blend_levels,
+                            pinned, gpu_ctx_3cam,
+                        )
+                        tracking_crop = item.get("tracking_crop")
+
+                        def post_sync_fn(arr, tc=tracking_crop):
+                            if tc is not None:
+                                x0, x1 = tc
+                                arr = arr[:, x0:x1]
+                                if not arr.flags["C_CONTIGUOUS"]:
+                                    arr = np.ascontiguousarray(arr)
+                            return arr
+
+                        sink.write_async(
+                            pinned, copy_event,
+                            post_sync_fn=post_sync_fn,
+                            free_cb=lambda p=pinned: free_pinned_q.put(p),
+                            timestamp_us=item["timestamp_us"],
+                        )
+            except Exception as e:
+                import traceback
+                print("[diag] 3-cam composite_worker EXCEPTION:")
+                traceback.print_exc()
+                composite_worker_error[0] = e
+
+        composite_thread = threading.Thread(
+            target=composite_worker_3cam, daemon=True,
+            name="composite_worker_3cam",
+        )
+        composite_thread.start()
+        print("[info] 3-cam composite worker started (async).")
+
+    # --- 8. Main loop (async-pipelined on GPU; sync on CPU) ---------------
     out_buf_cpu = (
         np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
         if not dev["cuda_available"] else None
@@ -2390,7 +2577,14 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
     frame_idx = 0
     last_print = time.time()
     frames_since_print = 0
-    print("[info] Streaming frames (3-cam, sequential MVP path)...")
+    # Interval for the rolling fps log line; user-visible cadence, not a
+    # tight loop counter, so it's intentionally on the longer side.
+    FPS_LOG_INTERVAL_SEC = 30.0
+    print(
+        "[info] Streaming frames (3-cam, "
+        f"{'async-pipelined' if dev['cuda_available'] else 'sync'} path; "
+        f"fps log every {FPS_LOG_INTERVAL_SEC:.0f}s)..."
+    )
     try:
         while True:
             if pending_first_triplet is not None:
@@ -2483,45 +2677,31 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         "canvas_person_mask"
                     )
 
-                # ---- Per-overlap motion masks (every frame) -----------
+                # ---- Submit warped tensors to async motion worker -----
+                # The worker computes per-overlap motion masks on its own
+                # stream and publishes the result; we read the LATEST
+                # published mask below (could be from frame N-1, which is
+                # within the motion_dilate tolerance for sub-pixel jitter).
                 motion_mask_LC_t = motion_mask_CR_t = None
                 if use_motion_3cam:
-                    # Crop the just-warped triplet to each overlap bbox,
-                    # half-res it, diff vs. the baseline. Same algorithm
-                    # as compute_motion_mask_gpu in the 2-cam pipeline,
-                    # called twice with different (frame, baseline,
-                    # overlap_mask) triplets.
-                    wL_in_LC_t = downsample_image_half_gpu(
-                        crop_to_bbox_gpu(warped_L_t, bbox_LC)
-                    )
-                    wC_in_LC_t = downsample_image_half_gpu(
-                        crop_to_bbox_gpu(warped_C_t, bbox_LC)
-                    )
-                    motion_half_LC_t = compute_motion_mask_gpu(
-                        wL_in_LC_t, wC_in_LC_t,
-                        baseline_L_in_LC_t, baseline_C_in_LC_t,
-                        args.motion_threshold, args.motion_dilate,
-                        overlap_in_bbox_motion_LC_t,
-                    )
-                    motion_mask_LC_t = upsample_mask_to_bbox_gpu(
-                        motion_half_LC_t, bbox_shape_LC,
-                    )
-
-                    wC_in_CR_t = downsample_image_half_gpu(
-                        crop_to_bbox_gpu(warped_C_t, bbox_CR)
-                    )
-                    wR_in_CR_t = downsample_image_half_gpu(
-                        crop_to_bbox_gpu(warped_R_t, bbox_CR)
-                    )
-                    motion_half_CR_t = compute_motion_mask_gpu(
-                        wC_in_CR_t, wR_in_CR_t,
-                        baseline_C_in_CR_t, baseline_R_in_CR_t,
-                        args.motion_threshold, args.motion_dilate,
-                        overlap_in_bbox_motion_CR_t,
-                    )
-                    motion_mask_CR_t = upsample_mask_to_bbox_gpu(
-                        motion_half_CR_t, bbox_shape_CR,
-                    )
+                    try:
+                        warp_event_for_motion = torch.cuda.Event()
+                        warp_event_for_motion.record()
+                        motion_q_3cam.put_nowait(
+                            (warped_L_t, warped_C_t, warped_R_t,
+                             warp_event_for_motion),
+                        )
+                    except queue.Full:
+                        pass  # worker busy; keep using the last published
+                    # Read the latest published motion mask.
+                    with motion_mask_lock_3cam:
+                        latest_motion_3cam = motion_mask_holder_3cam[0]
+                    if latest_motion_3cam is not None:
+                        ev = latest_motion_3cam.get("ready_event")
+                        if ev is not None:
+                            ev.wait()
+                        motion_mask_LC_t = latest_motion_3cam["motion_mask_LC_t"]
+                        motion_mask_CR_t = latest_motion_3cam["motion_mask_CR_t"]
 
                 # ---- L<>C cost + seam ----
                 cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
@@ -2800,31 +2980,28 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                 )
                 tracking_crop = tracker.get_crop_bounds()
 
-            # --- Composite -------------------------------------------------
+            # --- Composite ------------------------------------------------
+            # GPU path: hand off the warped tensors + seams to the async
+            # composite worker (own stream + thread). Records a
+            # compute_done_event on the default stream right before the
+            # put so the composite stream knows when the warps + cost EMAs
+            # are safe to read.
             if dev["cuda_available"]:
-                pinned = free_pinned_q.get()
-                copy_event = composite_multiband_gpu_async_3cam(
-                    warped_L_t, warped_C_t, warped_R_t,
-                    static_3cam,
-                    seam_LC_full, seam_CR_full,
-                    args.blend_width, args.blend_levels,
-                    pinned, gpu_ctx_3cam,
-                )
-
-                def post_sync_fn(arr, tracking_crop=tracking_crop):
-                    if tracking_crop is not None:
-                        x0, x1 = tracking_crop
-                        arr = arr[:, x0:x1]
-                        if not arr.flags["C_CONTIGUOUS"]:
-                            arr = np.ascontiguousarray(arr)
-                    return arr
-
-                sink.write_async(
-                    pinned, copy_event,
-                    post_sync_fn=post_sync_fn,
-                    free_cb=lambda p=pinned: free_pinned_q.put(p),
-                    timestamp_us=ts_us,
-                )
+                compute_done_event = torch.cuda.Event()
+                compute_done_event.record()
+                payload = {
+                    "warped_L_t": warped_L_t,
+                    "warped_C_t": warped_C_t,
+                    "warped_R_t": warped_R_t,
+                    "seam_LC_full": seam_LC_full,
+                    "seam_CR_full": seam_CR_full,
+                    "tracking_crop": tracking_crop,
+                    "timestamp_us": ts_us,
+                    "compute_done_event": compute_done_event,
+                }
+                composite_in_q_3cam.put(payload)
+                if composite_worker_error[0] is not None:
+                    raise composite_worker_error[0]
             else:
                 stitched = composite_multiband_cpu_3cam(
                     warped_L, warped_C, warped_R, static_3cam,
@@ -2841,11 +3018,20 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             frame_idx += 1
             frames_since_print += 1
             now = time.time()
-            if now - last_print > 5.0:
+            if now - last_print > FPS_LOG_INTERVAL_SEC:
                 fps = frames_since_print / max(now - last_print, 1e-6)
+                comp_q_depth = (
+                    composite_in_q_3cam.qsize()
+                    if composite_in_q_3cam is not None else -1
+                )
+                comp_q_str = (
+                    f"composite_q={comp_q_depth}"
+                    if comp_q_depth >= 0 else "composite_q=N/A(CPU)"
+                )
                 print(
-                    f"[info] 3-cam: frame {frame_idx}, "
-                    f"{fps:.1f} fps over last {now - last_print:.1f}s"
+                    f"[info] 3-cam: frame {frame_idx}  "
+                    f"{fps:.1f} fps over last {now - last_print:.1f}s  "
+                    f"({frames_since_print} frames; {comp_q_str})"
                 )
                 last_print = now
                 frames_since_print = 0
@@ -2853,25 +3039,30 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
-        # Shut down the async YOLO worker (GPU path only). Send SENTINEL,
-        # join briefly. Daemon=True means we don't strictly need this --
-        # but it makes the run summary deterministic and avoids leaking
-        # CUDA resources when the same process re-spawns _run_3cam from
-        # pipe mode in a new session.
-        if yolo_q_3cam is not None and yolo_thread is not None:
+        # Shut down all async workers (GPU path only). Send SENTINEL, join
+        # briefly. Daemon=True means we don't strictly need this -- but
+        # it makes the run summary deterministic and avoids leaking CUDA
+        # resources when the same process re-spawns _run_3cam from pipe
+        # mode in a new session.
+        def _shutdown_worker(q, thread, name):
+            if q is None or thread is None:
+                return
             try:
-                yolo_q_3cam.put_nowait(SENTINEL)
+                q.put_nowait(SENTINEL)
             except queue.Full:
-                # Drain whatever's queued so SENTINEL gets through.
                 try:
-                    yolo_q_3cam.get_nowait()
+                    q.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    yolo_q_3cam.put_nowait(SENTINEL)
+                    q.put_nowait(SENTINEL)
                 except queue.Full:
                     pass
-            yolo_thread.join(timeout=2.0)
+            thread.join(timeout=2.0)
+
+        _shutdown_worker(yolo_q_3cam, yolo_thread, "yolo")
+        _shutdown_worker(motion_q_3cam, motion_thread, "motion")
+        _shutdown_worker(composite_in_q_3cam, composite_thread, "composite")
         sink.close()
         source.close()
 
