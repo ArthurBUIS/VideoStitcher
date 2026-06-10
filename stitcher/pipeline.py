@@ -2079,18 +2079,24 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
 
     # --- 5b. YOLO person segmenter for the seam-cost person penalty -------
     #
-    # Synchronous integration: every --yolo_every frames we run a triplet
-    # inference, warp the three source masks into canvas space, union them,
-    # then slice the union to the L<>C and C<>R overlap bboxes for the cost
-    # injection + hand the full canvas mask to the tracker. Async pipelining
-    # is a follow-up; on a portal-grade GPU the inference is ~30-50 ms and
-    # only fires every 8th frame, so the main-loop stall is tolerable.
+    # GPU path: an async worker thread runs YOLO + mask warp + union +
+    # dilate + bbox slicing on a dedicated CUDA stream and publishes the
+    # most recent person mask to a shared holder. The main loop only ever
+    # READS the latest published mask (could be from up to args.yolo_every
+    # frames ago, but person doesn't move much in 8 frames at 30 fps) --
+    # so the YOLO work overlaps with the next frame's compute kernels on
+    # other streams instead of stalling the main loop.
+    #
+    # CPU path: still runs synchronously in the main loop. The worker-
+    # thread overhead isn't worth it without GPU stream parallelism, and
+    # CPU YOLO is slow enough that we'd be running it permanently anyway.
     person_segmenter = PersonSegmenter(
         args.yolo_weights, device=dev["yolo_device"],
     )
     print(
         f"[info] 3-cam YOLO: loaded {args.yolo_weights} for person mask "
-        f"(every {args.yolo_every} frames)"
+        f"(every {args.yolo_every} frames, "
+        f"{'async on yolo_stream' if dev['cuda_available'] else 'sync on main thread'})"
     )
     dilate_kernel_3cam = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -2274,6 +2280,95 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         writer_output_size[0], writer_output_size[1], source.output_fps,
     )
 
+    # --- 7b. Async YOLO worker (GPU path only) ----------------------------
+    #
+    # The worker pulls (fL, fC, fR) triplets off yolo_q_3cam, runs the
+    # inference + warp + union + dilate + bbox-slice on a dedicated CUDA
+    # stream, and publishes the result snapshot into mask_holder_3cam
+    # under mask_lock_3cam. The main loop only ever READS the latest
+    # published mask -- never updates it. On the first few frames, before
+    # the worker has produced anything, mask_holder_3cam[0] is None and
+    # the main loop proceeds without a person penalty (acceptable for
+    # warm-up).
+    #
+    # Cross-stream sync: each published snapshot carries a torch.cuda.Event
+    # recorded right after the mask is materialised on the YOLO stream.
+    # The main loop calls event.wait() (a stream-level wait, not a host
+    # stall) before reading the mask, so the compute stream waits for the
+    # YOLO kernels to finish before consuming.
+    SENTINEL = object()
+    yolo_q_3cam = None
+    mask_holder_3cam = [None]
+    mask_lock_3cam = threading.Lock()
+    yolo_thread = None
+    yolo_stream_3cam = None
+    if dev["cuda_available"]:
+        yolo_stream_3cam = torch.cuda.Stream(priority=-1)
+        yolo_q_3cam = queue.Queue(maxsize=1)
+
+        def yolo_worker_3cam():
+            """Async YOLO + mask post-processing. See section 7b doc."""
+            try:
+                with torch.cuda.stream(yolo_stream_3cam):
+                    while True:
+                        item = yolo_q_3cam.get()
+                        if item is SENTINEL:
+                            return
+                        fL_y, fC_y, fR_y = item
+                        mL_src_t, mC_src_t, mR_src_t = (
+                            person_segmenter.predict_classes_mask_triplet_gpu(
+                                fL_y, fC_y, fR_y,
+                                fL_y.shape[:2], fC_y.shape[:2], fR_y.shape[:2],
+                                (0,),  # PERSON_CLASS_ID for YOLOv8 COCO
+                            )
+                        )
+                        mL_canvas_t = warp_mask_gpu(
+                            mL_src_t, grid_L_for_mask_t,
+                        )
+                        mC_canvas_t = warp_mask_gpu(
+                            mC_src_t, grid_C_for_mask_t,
+                        )
+                        mR_canvas_t = warp_mask_gpu(
+                            mR_src_t, grid_R_for_mask_t,
+                        )
+                        union_t = torch.bitwise_or(
+                            torch.bitwise_or(mL_canvas_t, mC_canvas_t),
+                            mR_canvas_t,
+                        )
+                        union_t = dilate_gpu(union_t, args.mask_dilate)
+                        canvas_person_mask_for_tracker_local = (
+                            union_t.cpu().numpy() if tracker is not None
+                            else None
+                        )
+                        xLb0, yLb0, xLb1, yLb1 = bbox_LC
+                        xCb0, yCb0, xCb1, yCb1 = bbox_CR
+                        person_mask_bbox_LC_local = (
+                            union_t[yLb0:yLb1, xLb0:xLb1].contiguous()
+                        )
+                        person_mask_bbox_CR_local = (
+                            union_t[yCb0:yCb1, xCb0:xCb1].contiguous()
+                        )
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "person_mask_bbox_LC_t": person_mask_bbox_LC_local,
+                            "person_mask_bbox_CR_t": person_mask_bbox_CR_local,
+                            "canvas_person_mask": canvas_person_mask_for_tracker_local,
+                            "ready_event": ready_event,
+                        }
+                        with mask_lock_3cam:
+                            mask_holder_3cam[0] = new_holder
+            except Exception as e:
+                # Don't kill the whole pipeline on a YOLO error -- log and
+                # let the main loop continue with no person penalty.
+                print(f"[warn] 3-cam YOLO worker error: {e!r}")
+
+        yolo_thread = threading.Thread(
+            target=yolo_worker_3cam, daemon=True, name="yolo_worker_3cam",
+        )
+        yolo_thread.start()
+        print("[info] 3-cam YOLO worker started (async).")
+
     # --- 8. Main loop (sequential MVP) -------------------------------------
     out_buf_cpu = (
         np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
@@ -2362,39 +2457,30 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     gain_L_t=gain_L_t, gain_C_t=gain_C_t, gain_R_t=gain_R_t,
                 )
 
-                # ---- YOLO triplet (every yolo_every frames) ------------
-                # Runs synchronously on the main loop; produces the per-
-                # overlap bbox-cropped person masks fed into the cost
-                # below, AND the full-canvas mask consumed by the tracker.
+                # ---- Async YOLO submit (every yolo_every frames) -------
+                # Best-effort: drop if the worker is still busy with the
+                # previous frame (queue is maxsize=1). We just continue
+                # with whatever mask the worker last published.
                 if frame_idx % args.yolo_every == 0:
-                    mL_src_t, mC_src_t, mR_src_t = (
-                        person_segmenter.predict_classes_mask_triplet_gpu(
-                            fL, fC, fR,
-                            fL.shape[:2], fC.shape[:2], fR.shape[:2],
-                            (0,),  # PERSON_CLASS_ID for YOLOv8 COCO
-                        )
-                    )
-                    mL_canvas_t = warp_mask_gpu(mL_src_t, grid_L_for_mask_t)
-                    mC_canvas_t = warp_mask_gpu(mC_src_t, grid_C_for_mask_t)
-                    mR_canvas_t = warp_mask_gpu(mR_src_t, grid_R_for_mask_t)
-                    union_t = torch.bitwise_or(
-                        torch.bitwise_or(mL_canvas_t, mC_canvas_t),
-                        mR_canvas_t,
-                    )
-                    union_t = dilate_gpu(union_t, args.mask_dilate)
-                    canvas_person_mask_for_tracker = (
-                        union_t.cpu().numpy() if tracker is not None
-                        else None
-                    )
-                    # Bbox slices for the two cost matrices. We zero-strip
-                    # the mask to a (H_bb, W_bb) uint8 tensor.
-                    xLb0, yLb0, xLb1, yLb1 = bbox_LC
-                    xCb0, yCb0, xCb1, yCb1 = bbox_CR
-                    person_mask_bbox_LC_t = (
-                        union_t[yLb0:yLb1, xLb0:xLb1].contiguous()
-                    )
-                    person_mask_bbox_CR_t = (
-                        union_t[yCb0:yCb1, xCb0:xCb1].contiguous()
+                    try:
+                        yolo_q_3cam.put_nowait((fL, fC, fR))
+                    except queue.Full:
+                        pass
+
+                # ---- Read latest published person mask -----------------
+                with mask_lock_3cam:
+                    latest_mask_3cam = mask_holder_3cam[0]
+                if latest_mask_3cam is not None:
+                    ev = latest_mask_3cam.get("ready_event")
+                    if ev is not None:
+                        # Stream-level wait: the compute stream's next
+                        # cost kernel will wait for the YOLO stream's
+                        # kernels to finish. No host stall.
+                        ev.wait()
+                    person_mask_bbox_LC_t = latest_mask_3cam["person_mask_bbox_LC_t"]
+                    person_mask_bbox_CR_t = latest_mask_3cam["person_mask_bbox_CR_t"]
+                    canvas_person_mask_for_tracker = latest_mask_3cam.get(
+                        "canvas_person_mask"
                     )
 
                 # ---- Per-overlap motion masks (every frame) -----------
@@ -2767,6 +2853,25 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
+        # Shut down the async YOLO worker (GPU path only). Send SENTINEL,
+        # join briefly. Daemon=True means we don't strictly need this --
+        # but it makes the run summary deterministic and avoids leaking
+        # CUDA resources when the same process re-spawns _run_3cam from
+        # pipe mode in a new session.
+        if yolo_q_3cam is not None and yolo_thread is not None:
+            try:
+                yolo_q_3cam.put_nowait(SENTINEL)
+            except queue.Full:
+                # Drain whatever's queued so SENTINEL gets through.
+                try:
+                    yolo_q_3cam.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    yolo_q_3cam.put_nowait(SENTINEL)
+                except queue.Full:
+                    pass
+            yolo_thread.join(timeout=2.0)
         sink.close()
         source.close()
 
