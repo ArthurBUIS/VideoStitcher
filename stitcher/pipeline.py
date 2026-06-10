@@ -1813,6 +1813,14 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
 
+    # Capture the pre-crop H_*_to_canvas matrices so the
+    # --debug_geometry helper can draw each camera's footprint on the
+    # FULL canvas (before autocrop translates it). The matrices below
+    # may get composed with T_crop next, so we copy now.
+    H_L_to_canvas_precrop = H_L_to_canvas.copy()
+    H_C_to_canvas_precrop = H_C_to_canvas.copy()
+    H_R_to_canvas_precrop = H_R_to_canvas.copy()
+
     # --- 2. Autocrop --------------------------------------------------------
     crop_rect = None
     if args.autocrop:
@@ -1835,6 +1843,18 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         output_size = (cw, ch)
     else:
         output_size = canvas_size
+
+    # --- 2b. Debug geometry image (optional) ------------------------------
+    if getattr(args, "debug_geometry", None):
+        _save_geometry_debug_image_3cam(
+            args.debug_geometry,
+            canvas_size,
+            H_L_to_canvas_precrop,
+            H_C_to_canvas_precrop,
+            H_R_to_canvas_precrop,
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            crop_rect,
+        )
 
     # --- 3. Remap maps + static 3-cam geometry -----------------------------
     print("[info] Precomputing remap maps + static geometry (3-cam)...")
@@ -2755,3 +2775,133 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         print(source.summary_post())
     print(args.output and f"[info] Output written to {args.output}"
           or "[info] Output streamed over pipe (no file path).")
+
+
+# ===========================================================================
+# 3-camera geometry debug image
+# ===========================================================================
+
+def _save_geometry_debug_image_3cam(
+    output_path,
+    canvas_size,
+    H_L_to_canvas, H_C_to_canvas, H_R_to_canvas,
+    shape_L, shape_C, shape_R,
+    crop_rect,
+):
+    """
+    Render a PNG to `output_path` showing the four quadrangles that
+    define the 3-camera stitching geometry on the FULL pre-autocrop
+    canvas:
+
+      - Left   camera footprint   -> green
+      - Center camera footprint   -> blue
+      - Right  camera footprint   -> red
+      - Autocrop rectangle        -> orange (only when args.autocrop)
+
+    Used to diagnose cases like "the autocrop is shrinking output to a
+    thin band": the image shows whether each camera's projected
+    footprint actually overlaps the others vertically. If only a thin
+    horizontal strip is covered by all three (intersection), that's
+    all the autocrop can preserve.
+
+    Coordinates: the camera footprints are drawn using the
+    PRE-autocrop H_*_to_canvas matrices (the canvas is at full
+    canvas_size, NOT cropped). The autocrop rectangle, when present,
+    is drawn at its native canvas coordinates so the user sees how
+    much of the canvas is being kept.
+    """
+    import cv2  # local import: helper only runs when --debug_geometry set
+    import numpy as np
+
+    canvas_w, canvas_h = canvas_size
+    img = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+
+    def _project_polygon(shape, H_to_canvas):
+        h, w = shape[:2]
+        corners = np.float32(
+            [[0, 0], [w, 0], [w, h], [0, h]]
+        ).reshape(-1, 1, 2)
+        warped = cv2.perspectiveTransform(corners, H_to_canvas)
+        return warped.reshape(-1, 2).astype(np.int32)
+
+    L_poly = _project_polygon(shape_L, H_L_to_canvas)
+    C_poly = _project_polygon(shape_C, H_C_to_canvas)
+    R_poly = _project_polygon(shape_R, H_R_to_canvas)
+
+    # OpenCV uses BGR.
+    GREEN  = (0, 200, 0)
+    BLUE   = (220, 100, 0)   # a brighter blue than pure (255, 0, 0) so it
+                             # reads cleanly against the dark grey background
+    RED    = (0, 0, 220)
+    ORANGE = (0, 165, 255)
+
+    thickness = max(2, min(canvas_w, canvas_h) // 600)
+
+    cv2.polylines(img, [L_poly], True, GREEN,  thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [C_poly], True, BLUE,   thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [R_poly], True, RED,    thickness, lineType=cv2.LINE_AA)
+
+    if crop_rect is not None:
+        cx, cy, cw, ch = crop_rect
+        cv2.rectangle(
+            img, (cx, cy), (cx + cw, cy + ch),
+            ORANGE, thickness, lineType=cv2.LINE_AA,
+        )
+
+    # Per-quadrangle label, placed near the top-left of each
+    # footprint. Helps when two footprints overlap and the colour code
+    # alone isn't enough to disambiguate.
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = max(0.6, min(canvas_w, canvas_h) / 1200)
+    fth = max(1, thickness - 1)
+
+    def _label(text, poly, color):
+        # Anchor at the polygon's topmost vertex; nudge inward a bit
+        # so the text isn't clipped at the canvas edge.
+        i = int(np.argmin(poly[:, 1]))
+        x, y = int(poly[i, 0]), int(poly[i, 1])
+        x = max(8, min(canvas_w - 200, x + 8))
+        y = max(int(40 * fscale), y + int(30 * fscale))
+        cv2.putText(img, text, (x, y), font, fscale, color, fth,
+                    cv2.LINE_AA)
+
+    _label("Left",   L_poly, GREEN)
+    _label("Center", C_poly, BLUE)
+    _label("Right",  R_poly, RED)
+    if crop_rect is not None:
+        cx, cy, _, _ = crop_rect
+        cv2.putText(
+            img, "Autocrop",
+            (cx + 10, cy + int(40 * fscale)),
+            font, fscale, ORANGE, fth, cv2.LINE_AA,
+        )
+
+    # Legend in the top-right corner so the colour code is documented
+    # on the image itself.
+    legend_lines = [
+        ("Left",     GREEN),
+        ("Center",   BLUE),
+        ("Right",    RED),
+    ]
+    if crop_rect is not None:
+        legend_lines.append(("Autocrop", ORANGE))
+    leg_x = canvas_w - int(220 * fscale)
+    leg_y = int(40 * fscale)
+    for label, color in legend_lines:
+        cv2.putText(
+            img, label,
+            (leg_x, leg_y), font, fscale, color, fth, cv2.LINE_AA,
+        )
+        leg_y += int(40 * fscale)
+
+    ok = cv2.imwrite(output_path, img)
+    if ok:
+        print(
+            f"[info] 3-cam geometry debug image written to "
+            f"{output_path} ({canvas_w}x{canvas_h})"
+        )
+    else:
+        print(
+            f"[warn] 3-cam geometry debug image FAILED to write to "
+            f"{output_path}"
+        )

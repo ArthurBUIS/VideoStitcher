@@ -328,6 +328,17 @@ def main():
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--debug_seam", action="store_true")
     parser.add_argument("--debug_mask", action="store_true")
+    parser.add_argument(
+        "--debug_geometry", default=None,
+        help="(3-camera mode) save a PNG visualising the four "
+             "quadrangles -- Left footprint (green), Center (blue), "
+             "Right (red), and the Autocrop rectangle (orange) -- "
+             "drawn on the full canvas. Useful for diagnosing why the "
+             "autocrop shrinks the output to a thin band. Pass a "
+             "path (e.g. --debug_geometry geometry.png). Written "
+             "once, at startup, right after the canvas + autocrop "
+             "are computed.",
+    )
     parser.add_argument("--autocrop", action="store_true",
                         help="Crop output to the largest axis-aligned "
                              "rectangle inside the stitched canvas.")
