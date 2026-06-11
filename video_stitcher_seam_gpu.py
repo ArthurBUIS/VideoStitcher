@@ -518,6 +518,13 @@ def main():
     parser.add_argument("--profile_interval", type=float, default=5.0,
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
+    parser.add_argument("--diag_log_file", type=str, default=None,
+                        help="If set, --profile output (rolling per-stage "
+                             "timings + queue depth samples) is redirected "
+                             "to this file instead of stdout. The file is "
+                             "truncated on each run. Intended for "
+                             "portal-mode where stdout is consumed by the "
+                             "host bridge for short status lines.")
     args = parser.parse_args()
 
     # Dispatch by I/O mode. File mode is the historical default and

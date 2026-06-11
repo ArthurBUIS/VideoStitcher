@@ -68,12 +68,78 @@ def _make_profile():
     }
 
 
-def _print_profile(prof, header):
-    print()
-    print(f"=== {header} ===")
-    for name, t in prof.items():
-        print(f"  {name:<20s} {t.summary()}")
-    print()
+def _make_profile_3cam():
+    """Profile dict shape for the 3-cam pipeline. Different stage
+    layout than 2-cam: compute lives inline on the main thread
+    (warp + cost + seam), and motion lives on its own worker.
+
+    What each stage measures (all values are wall-clock ms as seen
+    by the recording thread; GPU work is async so kernel launch
+    times can look very small until a sync forces them to surface,
+    e.g. the .cpu().numpy() inside cost):
+
+      main thread (per iteration of the streaming loop):
+        read_triplet_wait    blocked on PipeFrameSource.read_triplet
+                              -> high means renderer is slow
+        warp                 warp_triplet_gpu launch overhead
+        cost                 L<>C + C<>R compute_cost_and_ema_gpu +
+                              edge margin + downscale + .cpu().numpy()
+                              -- this DOES force a sync, so it's
+                              the most informative GPU-bound number
+        seam                 add_x_mid_seam_cap + add_seam_regularizer
+                              + find_dp_seam (CPU) + upscale_seam
+        composite_put_wait   put into composite_in_q_3cam
+                              -> high means composite worker is slow
+        main_iter            total per-iteration wallclock; subtract
+                              the others to get "other CPU bookkeeping"
+
+      composite_worker_3cam:
+        composite_get_wait   blocked on composite_in_q_3cam.get
+                              -> high means main loop is slow upstream
+        composite            composite_multiband_gpu_async_3cam launch
+                              + (later) event-sync inside sink.write_async
+        composite_write      sink.write_async wallclock
+
+      motion_worker_3cam:
+        motion_get_wait      blocked on motion_q_3cam.get
+        motion               per-overlap motion mask compute (LC + CR)
+
+      yolo_worker_3cam:
+        yolo_get_wait        blocked on yolo_q_3cam.get
+        yolo                 YOLO inference + person-mask post-proc
+    """
+    return {
+        "read_triplet_wait":  StageTimer(),
+        "warp":               StageTimer(),
+        "cost":               StageTimer(),
+        "seam":               StageTimer(),
+        "composite_put_wait": StageTimer(),
+        "main_iter":          StageTimer(),
+        "composite_get_wait": StageTimer(),
+        "composite":          StageTimer(),
+        "composite_write":    StageTimer(),
+        "motion_get_wait":    StageTimer(),
+        "motion":             StageTimer(),
+        "yolo_get_wait":      StageTimer(),
+        "yolo":               StageTimer(),
+    }
+
+
+def _print_profile(prof, header, diag=None):
+    """Write a rolling profile block to `diag` (a DiagLogger). When
+    diag is None we fall back to plain stdout prints -- keeps the
+    legacy `--profile` behaviour intact for callers that haven't
+    been migrated yet."""
+    if diag is not None:
+        diag.section(header)
+        for name, t in prof.items():
+            diag.kv(2, name, t.summary())
+    else:
+        print()
+        print(f"=== {header} ===")
+        for name, t in prof.items():
+            print(f"  {name:<20s} {t.summary()}")
+        print()
 
 import cv2
 import numpy as np
@@ -88,6 +154,7 @@ from stitcher.compositing import (
     get_pyr_kernel_2d,
 )
 from stitcher.device import detect_device
+from stitcher.diag import DiagLogger
 from stitcher.geometry import (
     build_remap,
     build_static_geometry,
@@ -1143,6 +1210,16 @@ def run(args, source=None, sink_factory=None):
     # Optional per-stage timing. None when --profile is off (zero
     # overhead: each timing site checks `if prof is not None`).
     prof = _make_profile() if args.profile else None
+    # Diagnostic logger -- always created. Without --diag_log_file it
+    # falls back to stdout (legacy --profile behaviour). With a path
+    # set, profile blocks + queue-depth samples go to the file and
+    # stdout stays clean for the host bridge.
+    diag = DiagLogger(args.diag_log_file)
+    if diag.is_file():
+        diag.write(
+            f"# 2-cam pipeline diag log -- profile_interval="
+            f"{args.profile_interval:.1f}s"
+        )
     prof_stop = threading.Event()
 
     def yolo_worker():
@@ -1677,8 +1754,24 @@ def run(args, source=None, sink_factory=None):
 
     def profile_printer():
         # Rolling print every args.profile_interval seconds until shutdown.
+        # Sample queue depths at the same cadence -- they tell us
+        # where the back-pressure is:
+        #   compute_q full   -> compute worker is the bottleneck
+        #   composite_q full -> composite worker is the bottleneck
+        #   both empty       -> main loop is starved on read_pair
+        #                       (i.e. renderer not producing frames
+        #                       fast enough)
         while not prof_stop.wait(args.profile_interval):
-            _print_profile(prof, "rolling profile")
+            cq = compute_in_q.qsize()
+            xq = composite_in_q.qsize()
+            yq = yolo_q.qsize() if yolo_q is not None else -1
+            mq = motion_q.qsize() if motion_q is not None else -1
+            header = (
+                f"rolling profile  queues: compute_q={cq}/4 "
+                f"composite_q={xq}/4 yolo_q={yq} "
+                f"motion_q={mq if mq >= 0 else 'N/A'}"
+            )
+            _print_profile(prof, header, diag)
 
     profile_thread = None
     if prof is not None:
@@ -1769,7 +1862,8 @@ def run(args, source=None, sink_factory=None):
         print("[info] Output streamed over pipe (no file path).")
 
     if prof is not None:
-        _print_profile(prof, "final profile (over entire run)")
+        _print_profile(prof, "final profile (over entire run)", diag)
+    diag.close()
 
     source.close()
 
@@ -1802,6 +1896,19 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
     import cv2
     import torch
     import torch.nn.functional as F
+
+    # Diagnostic instrumentation. Same pattern as 2-cam _run(): the
+    # `prof` dict (one StageTimer per stage) is only created when
+    # --profile is set, and `diag` (the DiagLogger) routes profile
+    # output to a file when --diag_log_file is set, else to stdout.
+    # See _make_profile_3cam() for the per-stage semantics.
+    prof_3cam = _make_profile_3cam() if args.profile else None
+    diag = DiagLogger(args.diag_log_file)
+    if diag.is_file():
+        diag.write(
+            f"# 3-cam pipeline diag log -- profile_interval="
+            f"{args.profile_interval:.1f}s"
+        )
 
     if getattr(args, "person_tracking", False) and not args.autocrop:
         # Mirror the 2-cam behavior.
@@ -2357,9 +2464,15 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             try:
                 with torch.cuda.stream(yolo_stream_3cam):
                     while True:
+                        t_get0 = time.perf_counter()
                         item = yolo_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["yolo_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
                         if item is SENTINEL:
                             return
+                        t_y0 = time.perf_counter()
                         fL_y, fC_y, fR_y = item
                         mL_src_t, mC_src_t, mR_src_t = (
                             person_segmenter.predict_classes_mask_triplet_gpu(
@@ -2404,6 +2517,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         }
                         with mask_lock_3cam:
                             mask_holder_3cam[0] = new_holder
+                        if prof_3cam is not None:
+                            prof_3cam["yolo"].record(
+                                (time.perf_counter() - t_y0) * 1000
+                            )
             except Exception as e:
                 # Don't kill the whole pipeline on a YOLO error -- log and
                 # let the main loop continue with no person penalty.
@@ -2435,9 +2552,15 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             try:
                 with torch.cuda.stream(motion_stream_3cam):
                     while True:
+                        t_get0 = time.perf_counter()
                         item = motion_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["motion_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
                         if item is SENTINEL:
                             return
+                        t_m0 = time.perf_counter()
                         wL_full_t, wC_full_t, wR_full_t, warp_event = item
                         if warp_event is not None:
                             warp_event.wait()
@@ -2482,6 +2605,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         }
                         with motion_mask_lock_3cam:
                             motion_mask_holder_3cam[0] = new_holder
+                        if prof_3cam is not None:
+                            prof_3cam["motion"].record(
+                                (time.perf_counter() - t_m0) * 1000
+                            )
             except Exception as e:
                 print(f"[warn] 3-cam motion worker error: {e!r}")
 
@@ -2510,9 +2637,15 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             try:
                 with torch.cuda.stream(composite_stream_3cam):
                     while True:
+                        t_get0 = time.perf_counter()
                         item = composite_in_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["composite_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
                         if item is SENTINEL:
                             return
+                        t_c0 = time.perf_counter()
                         compute_event = item["compute_done_event"]
                         if compute_event is not None:
                             compute_event.wait()
@@ -2527,6 +2660,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                             args.blend_width, args.blend_levels,
                             pinned, gpu_ctx_3cam,
                         )
+                        if prof_3cam is not None:
+                            prof_3cam["composite"].record(
+                                (time.perf_counter() - t_c0) * 1000
+                            )
                         tracking_crop = item.get("tracking_crop")
 
                         def post_sync_fn(arr, tc=tracking_crop):
@@ -2537,12 +2674,17 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                                     arr = np.ascontiguousarray(arr)
                             return arr
 
+                        t_w0 = time.perf_counter()
                         sink.write_async(
                             pinned, copy_event,
                             post_sync_fn=post_sync_fn,
                             free_cb=lambda p=pinned: free_pinned_q.put(p),
                             timestamp_us=item["timestamp_us"],
                         )
+                        if prof_3cam is not None:
+                            prof_3cam["composite_write"].record(
+                                (time.perf_counter() - t_w0) * 1000
+                            )
             except Exception as e:
                 import traceback
                 print("[diag] 3-cam composite_worker EXCEPTION:")
@@ -2585,13 +2727,48 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         f"{'async-pipelined' if dev['cuda_available'] else 'sync'} path; "
         f"fps log every {FPS_LOG_INTERVAL_SEC:.0f}s)..."
     )
+
+    # Rolling profile printer (only when --profile is set). Mirrors the
+    # 2-cam pattern but with 3-cam-specific stage layout + queue
+    # depths. Output goes to the DiagLogger (file when
+    # --diag_log_file is set; stdout otherwise).
+    prof_stop_3cam = threading.Event()
+
+    def profile_printer_3cam():
+        while not prof_stop_3cam.wait(args.profile_interval):
+            cq = (composite_in_q_3cam.qsize()
+                  if composite_in_q_3cam is not None else -1)
+            yq = (yolo_q_3cam.qsize()
+                  if yolo_q_3cam is not None else -1)
+            mq = (motion_q_3cam.qsize()
+                  if motion_q_3cam is not None else -1)
+            header = (
+                f"3-cam rolling profile  queues: composite_q={cq}/4 "
+                f"yolo_q={yq if yq >= 0 else 'N/A'} "
+                f"motion_q={mq if mq >= 0 else 'N/A'}"
+            )
+            _print_profile(prof_3cam, header, diag)
+
+    profile_thread_3cam = None
+    if prof_3cam is not None:
+        profile_thread_3cam = threading.Thread(
+            target=profile_printer_3cam, name="profile_printer_3cam",
+            daemon=True,
+        )
+        profile_thread_3cam.start()
     try:
         while True:
+            t_iter0 = time.perf_counter()
             if pending_first_triplet is not None:
                 fL, fC, fR, ts_us = pending_first_triplet
                 pending_first_triplet = None
             else:
+                t_rd0 = time.perf_counter()
                 trip = source.read_triplet()
+                if prof_3cam is not None:
+                    prof_3cam["read_triplet_wait"].record(
+                        (time.perf_counter() - t_rd0) * 1000
+                    )
                 if trip is None:
                     break
                 fL, fC, fR, ts_us = trip
@@ -2646,10 +2823,15 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
 
             # --- Warp the triplet ---
             if dev["cuda_available"]:
+                t_warp0 = time.perf_counter()
                 warped_L_t, warped_C_t, warped_R_t = warp_triplet_gpu(
                     fL, fC, fR, grid_triplet_t, gpu_ctx_3cam["device"],
                     gain_L_t=gain_L_t, gain_C_t=gain_C_t, gain_R_t=gain_R_t,
                 )
+                if prof_3cam is not None:
+                    prof_3cam["warp"].record(
+                        (time.perf_counter() - t_warp0) * 1000
+                    )
 
                 # ---- Async YOLO submit (every yolo_every frames) -------
                 # Best-effort: drop if the worker is still busy with the
@@ -2703,6 +2885,11 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                         motion_mask_LC_t = latest_motion_3cam["motion_mask_LC_t"]
                         motion_mask_CR_t = latest_motion_3cam["motion_mask_CR_t"]
 
+                # ---- L<>C + C<>R cost (one timer for the whole GPU
+                # cost block: it includes the .cpu().numpy() calls at
+                # the end which force a sync, so the wallclock here is
+                # the dominant GPU-bound number per frame).
+                t_cost0 = time.perf_counter()
                 # ---- L<>C cost + seam ----
                 cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
                     warped_L_t, warped_C_t, overlap_LC_t,
@@ -2756,6 +2943,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                 else:
                     cost_small_CR_t = cost_for_dp_CR_t
                 cost_small_CR = cost_small_CR_t.cpu().numpy()
+                if prof_3cam is not None:
+                    prof_3cam["cost"].record(
+                        (time.perf_counter() - t_cost0) * 1000
+                    )
             else:
                 if lut_L is not None:
                     fL_g = apply_gain_lut(fL, lut_L)
@@ -2938,6 +3129,7 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             # Cap is in the small-cost matrix's x coordinate, derived from
             # x_mid on the canvas: subtract the overlap's x0, then divide
             # by seam_downscale.
+            t_seam0 = time.perf_counter()
             cap_LC_in_small = max(0, (x_mid - bbox_LC[0]) // ds)
             cap_CR_in_small = max(0, (x_mid - bbox_CR[0]) // ds)
             # Margin: blend_width // ds, so the soft alpha has room to
@@ -2963,6 +3155,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
             seam_prev_small_CR = seam_CR_small.copy()
             seam_LC_full = upscale_seam(seam_LC_small, bbox_shape_LC, ds)
             seam_CR_full = upscale_seam(seam_CR_small, bbox_shape_CR, ds)
+            if prof_3cam is not None:
+                prof_3cam["seam"].record(
+                    (time.perf_counter() - t_seam0) * 1000
+                )
 
             # --- Person tracking update -----------------------------------
             tracking_crop = None
@@ -2999,7 +3195,12 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
                     "timestamp_us": ts_us,
                     "compute_done_event": compute_done_event,
                 }
+                t_put0 = time.perf_counter()
                 composite_in_q_3cam.put(payload)
+                if prof_3cam is not None:
+                    prof_3cam["composite_put_wait"].record(
+                        (time.perf_counter() - t_put0) * 1000
+                    )
                 if composite_worker_error[0] is not None:
                     raise composite_worker_error[0]
             else:
@@ -3017,6 +3218,10 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
 
             frame_idx += 1
             frames_since_print += 1
+            if prof_3cam is not None:
+                prof_3cam["main_iter"].record(
+                    (time.perf_counter() - t_iter0) * 1000
+                )
             now = time.time()
             if now - last_print > FPS_LOG_INTERVAL_SEC:
                 fps = frames_since_print / max(now - last_print, 1e-6)
@@ -3063,6 +3268,14 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
         _shutdown_worker(yolo_q_3cam, yolo_thread, "yolo")
         _shutdown_worker(motion_q_3cam, motion_thread, "motion")
         _shutdown_worker(composite_in_q_3cam, composite_thread, "composite")
+        prof_stop_3cam.set()
+        if profile_thread_3cam is not None:
+            profile_thread_3cam.join(timeout=1.0)
+        if prof_3cam is not None:
+            _print_profile(
+                prof_3cam, "3-cam final profile (over entire run)", diag,
+            )
+        diag.close()
         sink.close()
         source.close()
 
