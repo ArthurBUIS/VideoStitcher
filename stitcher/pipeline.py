@@ -448,6 +448,13 @@ def run(args, source=None, sink_factory=None):
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
 
+    # Capture the pre-crop H_*_to_canvas matrices so the
+    # --debug_geometry helper can draw each camera's footprint on the
+    # FULL canvas (before autocrop translates it). The matrices below
+    # may get composed with T_crop next, so we copy now.
+    H_a_to_canvas_precrop = H_a_to_canvas.copy()
+    H_b_to_canvas_precrop = H_b_to_canvas.copy()
+
     # When --autocrop is on, push the crop translation through the
     # homographies. Everything downstream (remap maps, static masks,
     # overlap bbox, warp grids, warped frames, composite output, pinned
@@ -470,6 +477,16 @@ def run(args, source=None, sink_factory=None):
         output_size = (cw, ch)
     else:
         output_size = canvas_size
+
+    # Debug geometry image (optional, --debug_geometry <path>).
+    if getattr(args, "debug_geometry", None):
+        _save_geometry_debug_image_2cam(
+            args.debug_geometry,
+            canvas_size,
+            H_a_to_canvas_precrop, H_b_to_canvas_precrop,
+            frame_a.shape, frame_b.shape,
+            crop_rect,
+        )
 
     print("[info] Precomputing remap maps + static geometry...")
     map_ax, map_ay = build_remap(H_a_to_canvas, output_size)
@@ -3289,6 +3306,115 @@ def _run_3cam(args, source, sink_factory, dev, ema_eff):
 # ===========================================================================
 # 3-camera geometry debug image
 # ===========================================================================
+
+def _save_geometry_debug_image_2cam(
+    output_path,
+    canvas_size,
+    H_a_to_canvas, H_b_to_canvas,
+    shape_a, shape_b,
+    crop_rect,
+):
+    """
+    2-cam analogue of _save_geometry_debug_image_3cam. Renders a PNG
+    showing the three quadrangles that define the 2-camera stitching
+    geometry on the FULL pre-autocrop canvas:
+
+      - Camera A footprint        -> green
+      - Camera B footprint        -> red
+      - Autocrop rectangle        -> orange (only when --autocrop)
+
+    A / B are Python's internal naming for the two cameras (cam_0 /
+    cam_1 in pipe mode); in the renderer's labels these map to
+    (Left, Right) for a standard 2-cam portal or to (Left, Center)
+    when the force-2cam pill is on. The PNG doesn't care which is
+    which physically -- the quadrangle layout is what diagnoses the
+    autocrop result.
+
+    See the 3-cam version's docstring for the rationale of using
+    pre-autocrop H matrices + canvas_size with the crop_rect drawn
+    on top.
+    """
+    import cv2
+    import numpy as np
+
+    canvas_w, canvas_h = canvas_size
+    img = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+
+    def _project_polygon(shape, H_to_canvas):
+        h, w = shape[:2]
+        corners = np.float32(
+            [[0, 0], [w, 0], [w, h], [0, h]]
+        ).reshape(-1, 1, 2)
+        warped = cv2.perspectiveTransform(corners, H_to_canvas)
+        return warped.reshape(-1, 2).astype(np.int32)
+
+    A_poly = _project_polygon(shape_a, H_a_to_canvas)
+    B_poly = _project_polygon(shape_b, H_b_to_canvas)
+
+    GREEN  = (0, 200, 0)
+    RED    = (0, 0, 220)
+    ORANGE = (0, 165, 255)
+
+    thickness = max(2, min(canvas_w, canvas_h) // 600)
+
+    cv2.polylines(img, [A_poly], True, GREEN, thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [B_poly], True, RED,   thickness, lineType=cv2.LINE_AA)
+
+    if crop_rect is not None:
+        cx, cy, cw, ch = crop_rect
+        cv2.rectangle(
+            img, (cx, cy), (cx + cw, cy + ch),
+            ORANGE, thickness, lineType=cv2.LINE_AA,
+        )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = max(0.6, min(canvas_w, canvas_h) / 1200)
+    fth = max(1, thickness - 1)
+
+    def _label(text, poly, color):
+        i = int(np.argmin(poly[:, 1]))
+        x, y = int(poly[i, 0]), int(poly[i, 1])
+        x = max(8, min(canvas_w - 200, x + 8))
+        y = max(int(40 * fscale), y + int(30 * fscale))
+        cv2.putText(img, text, (x, y), font, fscale, color, fth, cv2.LINE_AA)
+
+    _label("A", A_poly, GREEN)
+    _label("B", B_poly, RED)
+    if crop_rect is not None:
+        cx, cy, _, _ = crop_rect
+        cv2.putText(
+            img, "Autocrop",
+            (cx + 10, cy + int(40 * fscale)),
+            font, fscale, ORANGE, fth, cv2.LINE_AA,
+        )
+
+    legend_lines = [
+        ("Camera A", GREEN),
+        ("Camera B", RED),
+    ]
+    if crop_rect is not None:
+        legend_lines.append(("Autocrop", ORANGE))
+    leg_x = canvas_w - int(220 * fscale)
+    leg_y = int(40 * fscale)
+    for label, color in legend_lines:
+        cv2.putText(
+            img, label,
+            (leg_x, leg_y), font, fscale, color, fth, cv2.LINE_AA,
+        )
+        leg_y += int(40 * fscale)
+
+    ok = cv2.imwrite(output_path, img)
+    if ok:
+        print(
+            f"[info] 2-cam geometry debug image written to "
+            f"{output_path} ({canvas_w}x{canvas_h})"
+        )
+    else:
+        print(
+            f"[warn] 2-cam geometry debug image FAILED to write to "
+            f"{output_path}"
+        )
+
 
 def _save_geometry_debug_image_3cam(
     output_path,
