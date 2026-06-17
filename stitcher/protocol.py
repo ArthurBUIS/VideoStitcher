@@ -20,8 +20,20 @@ PROTOCOL_VERSION = 1
 # (see docs/integration-protocol.md §6).
 OUTPUT_CAMERA_INDEX = 255
 
-# Pixel format codes. Only RGBA8888 is defined in protocol v1.
+# Pixel format codes.
+#   RGBA8888 (1): raw RGBA bytes, payload_length = w * h * 4. Used
+#                 when bandwidth between renderer and Python isn't a
+#                 concern (file-mode runs, dev page).
+#   JPEG     (2): JPEG-encoded bytes, payload_length is whatever the
+#                 encoder produced (typically 5-15% of RGBA8888 for
+#                 video content at quality 90). Used in pipe mode
+#                 from the portal-agent to cut per-frame IPC payload
+#                 ~10x and unblock the renderer-to-Python throughput
+#                 ceiling at 1280x720.
+#                 Decoded by cv2.imdecode on the Python side; the
+#                 result is already BGR, so no channel swap needed.
 FORMAT_RGBA8888 = 1
+FORMAT_JPEG = 2
 
 
 # Frame header layout (docs/integration-protocol.md §5):

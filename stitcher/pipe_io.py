@@ -7,19 +7,33 @@ the spike; Windows named pipes later in production) is abstracted
 behind stitcher.transport.Transport -- this module only knows about
 the protocol bytes.
 
-Pixel conversion note: the wire format is RGBA8888 (matches
-Electron's HTML canvas / ImageData), but the rest of VideoStitcher
-operates on OpenCV-native BGR uint8 arrays. PipeFrameSource
-converts RGBA -> BGR on input; PipeFrameSink converts BGR -> RGBA
-on output. The conversion is a numpy reindex (no copy of memory
-beyond one pass) so the cost is irrelevant compared to YOLOE +
-warping + DP.
+Pixel conversion note: the wire format on the wire can be either
+RGBA8888 or JPEG -- the renderer picks per-frame and stamps a
+`format` byte in the header.
+
+  RGBA8888 (1): raw RGBA bytes, used in dev / file mode. Decoded
+                with a numpy reindex (RGBA -> BGR).
+  JPEG     (2): JPEG-encoded bytes from the portal-agent's
+                `canvas.toBlob('image/jpeg', q)`. Decoded with
+                cv2.imdecode which produces a BGR array directly,
+                so no channel swap is needed after decode. This
+                path exists because raw RGBA at 1280x720 saturated
+                the renderer-to-Python IPC throughput at ~5 fps;
+                JPEG cuts the per-frame payload ~10x and unblocks
+                the source rate.
+
+The rest of VideoStitcher operates on OpenCV-native BGR uint8
+arrays, so either decoder produces the same shape and dtype
+downstream. PipeFrameSink converts BGR -> RGBA on output (the
+return path is always RGBA -- there's no JPEG round-trip).
 """
 
+import cv2
 import numpy as np
 
 from stitcher.frame_io import FrameSink, FrameSource
 from stitcher.protocol import (
+    FORMAT_JPEG,
     FORMAT_RGBA8888,
     HEADER_SIZE,
     OUTPUT_CAMERA_INDEX,
@@ -123,26 +137,47 @@ class PipeFrameSource(FrameSource):
             return False
 
         header = unpack_frame_header(header_bytes)
-        if header["format"] != FORMAT_RGBA8888:
+        fmt = header["format"]
+        if fmt not in (FORMAT_RGBA8888, FORMAT_JPEG):
             raise ProtocolError(
-                f"frame_format: only RGBA8888 (1) is supported, "
-                f"got {header['format']}"
+                f"frame_format: unsupported format {fmt}; expected "
+                f"RGBA8888 ({FORMAT_RGBA8888}) or JPEG ({FORMAT_JPEG})"
             )
         try:
             payload = self._fr.read_exact(header["payload_length"])
         except ConnectionError:
             return False
-        expected = header["width"] * header["height"] * 4
-        if header["payload_length"] != expected:
-            raise ProtocolError(
-                f"frame_length: header says {header['payload_length']}, "
-                f"expected w*h*4 = {expected}"
-            )
-        arr = np.frombuffer(payload, dtype=np.uint8)
-        arr = arr.reshape(header["height"], header["width"], 4)
-        # RGBA -> BGR via channel reindex. .copy() detaches from
-        # the shared payload buffer.
-        frame_bgr = arr[..., [2, 1, 0]].copy()
+        if fmt == FORMAT_RGBA8888:
+            # Sanity-check the payload size matches the geometry the
+            # header advertises. JPEG payloads are encoder-dependent
+            # so no equivalent check exists for that path.
+            expected = header["width"] * header["height"] * 4
+            if header["payload_length"] != expected:
+                raise ProtocolError(
+                    f"frame_length: header says {header['payload_length']}, "
+                    f"expected w*h*4 = {expected}"
+                )
+            arr = np.frombuffer(payload, dtype=np.uint8)
+            arr = arr.reshape(header["height"], header["width"], 4)
+            # RGBA -> BGR via channel reindex. .copy() detaches from
+            # the shared payload buffer.
+            frame_bgr = arr[..., [2, 1, 0]].copy()
+        else:  # FORMAT_JPEG
+            # cv2.imdecode returns a fresh BGR uint8 array (already
+            # detached from `payload`), shape (H, W, 3). No channel
+            # reindex needed -- JPEG decode produces BGR natively
+            # in OpenCV. Returns None on malformed bytes, which we
+            # surface as a ProtocolError so the bridge sees the
+            # disconnect-style cleanup rather than a confusing
+            # downstream crash.
+            arr = np.frombuffer(payload, dtype=np.uint8)
+            frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame_bgr is None:
+                raise ProtocolError(
+                    f"frame_jpeg_decode: cv2.imdecode failed on "
+                    f"{header['payload_length']} bytes for camera "
+                    f"{header['camera_index']}"
+                )
         cam = header["camera_index"]
         if cam not in self._pending:
             self._log_warn(
