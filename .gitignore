@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+CLAUDE.md
 
 # Local artefacts
 *.mp4
