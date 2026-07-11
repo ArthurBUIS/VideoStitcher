@@ -68,12 +68,78 @@ def _make_profile():
     }
 
 
-def _print_profile(prof, header):
-    print()
-    print(f"=== {header} ===")
-    for name, t in prof.items():
-        print(f"  {name:<20s} {t.summary()}")
-    print()
+def _make_profile_3cam():
+    """Profile dict shape for the 3-cam pipeline. Different stage
+    layout than 2-cam: compute lives inline on the main thread
+    (warp + cost + seam), and motion lives on its own worker.
+
+    What each stage measures (all values are wall-clock ms as seen
+    by the recording thread; GPU work is async so kernel launch
+    times can look very small until a sync forces them to surface,
+    e.g. the .cpu().numpy() inside cost):
+
+      main thread (per iteration of the streaming loop):
+        read_triplet_wait    blocked on PipeFrameSource.read_triplet
+                              -> high means renderer is slow
+        warp                 warp_triplet_gpu launch overhead
+        cost                 L<>C + C<>R compute_cost_and_ema_gpu +
+                              edge margin + downscale + .cpu().numpy()
+                              -- this DOES force a sync, so it's
+                              the most informative GPU-bound number
+        seam                 add_x_mid_seam_cap + add_seam_regularizer
+                              + find_dp_seam (CPU) + upscale_seam
+        composite_put_wait   put into composite_in_q_3cam
+                              -> high means composite worker is slow
+        main_iter            total per-iteration wallclock; subtract
+                              the others to get "other CPU bookkeeping"
+
+      composite_worker_3cam:
+        composite_get_wait   blocked on composite_in_q_3cam.get
+                              -> high means main loop is slow upstream
+        composite            composite_multiband_gpu_async_3cam launch
+                              + (later) event-sync inside sink.write_async
+        composite_write      sink.write_async wallclock
+
+      motion_worker_3cam:
+        motion_get_wait      blocked on motion_q_3cam.get
+        motion               per-overlap motion mask compute (LC + CR)
+
+      yolo_worker_3cam:
+        yolo_get_wait        blocked on yolo_q_3cam.get
+        yolo                 YOLO inference + person-mask post-proc
+    """
+    return {
+        "read_triplet_wait":  StageTimer(),
+        "warp":               StageTimer(),
+        "cost":               StageTimer(),
+        "seam":               StageTimer(),
+        "composite_put_wait": StageTimer(),
+        "main_iter":          StageTimer(),
+        "composite_get_wait": StageTimer(),
+        "composite":          StageTimer(),
+        "composite_write":    StageTimer(),
+        "motion_get_wait":    StageTimer(),
+        "motion":             StageTimer(),
+        "yolo_get_wait":      StageTimer(),
+        "yolo":               StageTimer(),
+    }
+
+
+def _print_profile(prof, header, diag=None):
+    """Write a rolling profile block to `diag` (a DiagLogger). When
+    diag is None we fall back to plain stdout prints -- keeps the
+    legacy `--profile` behaviour intact for callers that haven't
+    been migrated yet."""
+    if diag is not None:
+        diag.section(header)
+        for name, t in prof.items():
+            diag.kv(2, name, t.summary())
+    else:
+        print()
+        print(f"=== {header} ===")
+        for name, t in prof.items():
+            print(f"  {name:<20s} {t.summary()}")
+        print()
 
 import cv2
 import numpy as np
@@ -82,20 +148,24 @@ import torch.nn.functional as F
 
 from stitcher.compositing import (
     composite_multiband_cpu,
+    composite_multiband_cpu_3cam,
     composite_multiband_gpu_async,
+    composite_multiband_gpu_async_3cam,
     get_pyr_kernel_2d,
 )
 from stitcher.device import detect_device
+from stitcher.diag import DiagLogger
 from stitcher.geometry import (
     build_remap,
     build_static_geometry,
+    build_static_geometry_3cam,
     compute_canvas,
+    compute_canvas_3cam,
     estimate_homography,
     find_autocrop_rect,
+    find_autocrop_rect_3cam,
 )
 from stitcher.io_utils import (
-    PrefetchingFrameReader,
-    ThreadedVideoWriter,
     draw_mask_overlay,
     draw_seam_overlay,
 )
@@ -129,6 +199,7 @@ from stitcher.motion import (
 from stitcher.seam import (
     add_edge_margin_penalty,
     add_seam_regularizer,
+    add_x_mid_seam_cap,
     compute_cost_and_ema_gpu,
     compute_cost_fast_cpu,
     find_dp_seam,
@@ -140,17 +211,21 @@ from stitcher.segmentation import (
     PersonSegmenter,
     compute_fg_mask_seg_cpu,
     compute_fg_mask_seg_gpu,
+    compute_fg_mask_seg_triplet_canvas_cpu,
+    compute_fg_mask_seg_triplet_canvas_gpu,
 )
-from stitcher.sync_reader import FrameSyncReader
+from stitcher.frame_io import FileFrameSink, FileFrameSource, FileFrameSource3
 from stitcher.warp import (
     apply_gain_lut,
     build_gain_lut,
     build_gain_tensor,
     build_grid_sample_tensor,
     compute_gain_compensation,
+    compute_joint_gain_compensation_3cam,
     dilate_gpu,
     warp_mask_gpu,
     warp_pair_gpu,
+    warp_triplet_gpu,
 )
 
 
@@ -275,11 +350,24 @@ def _print_device_banner(dev):
     print("=" * 60)
 
 
-def run(args):
+def run(args, source=None, sink_factory=None):
     """
-    Run the full stitching pipeline using the parsed args. Argparse and
-    flag definitions live in the entry script; this function only
-    consumes the resulting Namespace.
+    Run the full stitching pipeline.
+
+    Args:
+        args: parsed CLI args (argparse Namespace).
+        source: optional FrameSource. If None, constructs a
+            FileFrameSource from args.video_a / args.video_b -- the
+            default file-mode CLI path. Pass a PipeFrameSource to
+            run the pipeline in pipe mode (see stitcher.pipe_main).
+        sink_factory: optional callable
+            (width, height, fps) -> FrameSink. The pipeline calls it
+            ONCE, after the output dimensions are known (post-
+            autocrop and post-tracking-crop math). If None, defaults
+            to a factory that builds a FileFrameSink writing to
+            args.output. Pipe mode passes a factory that constructs
+            a PipeFrameSink and notifies the host via
+            session_started in the same call.
     """
     # --person_tracking implies --autocrop -- tracking on the raw
     # canvas would track inside the polygonal black borders. Bump
@@ -312,23 +400,44 @@ def run(args):
     print(f"[info] seam_lambda={args.seam_lambda}  "
           f"seam_edge_margin={args.seam_edge_margin}")
 
-    args.video_a = _resolve_relpath(args.video_a)
-    args.video_b = _resolve_relpath(args.video_b)
+    # Source: default file-mode (FileFrameSource wraps two
+    # cv2.VideoCapture handles + FrameSyncReader + PrefetchingFrameReader).
+    # Pipe mode passes a PipeFrameSource explicitly, so the file-path
+    # resolution / capture-open path stays guarded behind source==None.
+    #
+    # 3-camera file-mode dispatch: presence of args.video_center is the
+    # trigger -- if it's set we open a FileFrameSource3 across the three
+    # --video_left/center/right paths; otherwise we fall back to the
+    # existing 2-camera --video_a/b path. Pipe mode reaches this point
+    # with `source` already populated (built by pipe_main.run_pipe_session
+    # off the start_session cam list), so file-vs-pipe stays orthogonal
+    # to 2-vs-3-camera.
+    if source is None:
+        if getattr(args, "video_center", None):
+            args.video_left = _resolve_relpath(args.video_left)
+            args.video_center = _resolve_relpath(args.video_center)
+            args.video_right = _resolve_relpath(args.video_right)
+            source = FileFrameSource3(
+                args.video_left, args.video_center, args.video_right,
+            )
+        else:
+            args.video_a = _resolve_relpath(args.video_a)
+            args.video_b = _resolve_relpath(args.video_b)
+            source = FileFrameSource(args.video_a, args.video_b)
+        source.open()
+    print(source.summary())
 
-    cap_a = cv2.VideoCapture(args.video_a)
-    cap_b = cv2.VideoCapture(args.video_b)
-    if not cap_a.isOpened() or not cap_b.isOpened():
-        raise RuntimeError("Could not open one of the input videos.")
-    fps_a = cap_a.get(cv2.CAP_PROP_FPS) or 25.0
-    fps_b = cap_b.get(cv2.CAP_PROP_FPS) or 25.0
-
-    sync_reader = FrameSyncReader(cap_a, cap_b, fps_a, fps_b)
-    print(sync_reader.summary())
+    # 3-camera dispatch: divert to a dedicated implementation that uses
+    # the 3-cam primitives committed earlier in the wip/three-camera
+    # branch. The 2-camera path below this point is unchanged.
+    if source.n_cameras == 3:
+        return _run_3cam(args, source, sink_factory, dev, ema_eff)
 
     # Read the first paired frame (used for homography + gain seed).
-    ok, frame_a, frame_b = sync_reader.read()
-    if not ok:
+    first_pair = source.read_pair()
+    if first_pair is None:
         raise RuntimeError("Could not read first frame pair.")
+    frame_a, frame_b, first_ts_us = first_pair
 
     print("[info] Estimating homography from first frame pair...")
     H_b_to_a = estimate_homography(frame_a, frame_b)
@@ -338,6 +447,13 @@ def run(args):
         frame_a.shape, frame_b.shape, H_b_to_a
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
+
+    # Capture the pre-crop H_*_to_canvas matrices so the
+    # --debug_geometry helper can draw each camera's footprint on the
+    # FULL canvas (before autocrop translates it). The matrices below
+    # may get composed with T_crop next, so we copy now.
+    H_a_to_canvas_precrop = H_a_to_canvas.copy()
+    H_b_to_canvas_precrop = H_b_to_canvas.copy()
 
     # When --autocrop is on, push the crop translation through the
     # homographies. Everything downstream (remap maps, static masks,
@@ -361,6 +477,16 @@ def run(args):
         output_size = (cw, ch)
     else:
         output_size = canvas_size
+
+    # Debug geometry image (optional, --debug_geometry <path>).
+    if getattr(args, "debug_geometry", None):
+        _save_geometry_debug_image_2cam(
+            args.debug_geometry,
+            canvas_size,
+            H_a_to_canvas_precrop, H_b_to_canvas_precrop,
+            frame_a.shape, frame_b.shape,
+            crop_rect,
+        )
 
     print("[info] Precomputing remap maps + static geometry...")
     map_ax, map_ay = build_remap(H_a_to_canvas, output_size)
@@ -523,7 +649,7 @@ def run(args):
               f"({coverage:.1f}% of bbox flagged).")
 
     fg_recompute_frames = (
-        int(round(args.fg_recompute_seconds * sync_reader.output_fps))
+        int(round(args.fg_recompute_seconds * source.output_fps))
         if args.fg_recompute_seconds > 0 else 0
     )
     if use_fg and fg_recompute_frames > 0:
@@ -572,12 +698,21 @@ def run(args):
             baseline_frame_a, baseline_frame_b = load_baseline_images(
                 paths_a, paths_b,
             )
-        else:
+        elif args.video_a is not None and args.video_b is not None:
+            # File mode: re-open the videos and re-grab frame 0 as the
+            # baseline. (Slightly redundant since we've already read it,
+            # but keeps the existing CLI behaviour.)
             print("[info] Motion baselines not provided; falling back to "
                   "frame 0 of each video.")
             baseline_frame_a, baseline_frame_b = grab_baseline_from_videos(
                 args.video_a, args.video_b,
             )
+        else:
+            # Pipe mode + no baselines provided: reuse the first paired
+            # frame the source already gave us for homography.
+            print("[info] Motion baselines not provided; falling back to "
+                  "the first frame pair received from the source.")
+            baseline_frame_a, baseline_frame_b = frame_a.copy(), frame_b.copy()
         validate_baseline_shape(
             frame_a, frame_b, baseline_frame_a, baseline_frame_b,
         )
@@ -699,7 +834,7 @@ def run(args):
         tracker = PersonTracker(
             smooth_seconds=args.person_tracking_smooth_seconds,
             drift_seconds=args.person_tracking_drift_seconds,
-            fps=sync_reader.output_fps,
+            fps=source.output_fps,
             aspect=args.person_tracking_aspect,
         )
         writer_output_size = tracker.get_crop_size(
@@ -712,17 +847,23 @@ def run(args):
               f"smooth {args.person_tracking_smooth_seconds:.1f}s, "
               f"drift {args.person_tracking_drift_seconds:.1f}s).")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, writer_output_size)
-    if not raw_writer.isOpened():
-        raise RuntimeError(f"Could not open output writer for {args.output}")
-    writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
+    # File-mode sink wraps cv2.VideoWriter + ThreadedVideoWriter.
+    # Pipe mode plugs in PipeFrameSink behind the same FrameSink ABC.
+    # Sink factory: default file-mode (FileFrameSink at args.output).
+    # Pipe mode passes a factory that builds a PipeFrameSink + sends
+    # session_started to the host with these dimensions.
+    if sink_factory is None:
+        def sink_factory(w, h, fps):
+            s = FileFrameSink(args.output)
+            s.open(w, h, fps)
+            return s
+    sink = sink_factory(writer_output_size[0], writer_output_size[1],
+                        source.output_fps)
 
     # Reuse the homography frame as the first iteration; subsequent
-    # iterations pull from a background thread that decodes the next
-    # paired frame in parallel with the compute loop.
-    pending_first_pair = (frame_a, frame_b)
-    prefetch_reader = PrefetchingFrameReader(sync_reader, queue_depth=3)
+    # iterations pull from source.read_pair() (file mode: backed by
+    # the prefetch decoder thread inside FileFrameSource).
+    pending_first_pair = (frame_a, frame_b, first_ts_us)
 
     # --- Per-frame compute and composite, as nested closures ---------------
     #
@@ -734,7 +875,7 @@ def run(args):
     # the final stitched image (composite_one). The two stages run on
     # consecutive frames at the same time.
 
-    def compute_one(frame_a, frame_b, frame_idx):
+    def compute_one(frame_a, frame_b, frame_idx, timestamp_us):
         """Warp + cost + EMA + DP seam. YOLO runs async on its own
         worker; we submit a request when it's time and read the latest
         published person mask from mask_holder.
@@ -962,6 +1103,7 @@ def run(args):
 
         return {
             "frame_idx": frame_idx,
+            "timestamp_us": timestamp_us,
             "warped_a_t": warped_a_t,
             "warped_b_t": warped_b_t,
             "warped_a": warped_a,
@@ -978,11 +1120,11 @@ def run(args):
         """Run the multi-band composite + debug overlays + autocrop.
 
         On GPU: returns ("async", pinned, event, post_sync_fn, free_cb)
-        — composite_worker hands this off to writer.write_async, which
+        — composite_worker hands this off to sink.write_async, which
         synchronises on the event before encoding. composite_one itself
         does NOT wait for the GPU.
 
-        On CPU: returns ("sync", stitched_ndarray) — the writer takes
+        On CPU: returns ("sync", stitched_ndarray) — the sink takes
         the already-materialized frame.
         """
         # Wait for the compute stage's output tensors to be ready (their
@@ -1085,6 +1227,16 @@ def run(args):
     # Optional per-stage timing. None when --profile is off (zero
     # overhead: each timing site checks `if prof is not None`).
     prof = _make_profile() if args.profile else None
+    # Diagnostic logger -- always created. Without --diag_log_file it
+    # falls back to stdout (legacy --profile behaviour). With a path
+    # set, profile blocks + queue-depth samples go to the file and
+    # stdout stays clean for the host bridge.
+    diag = DiagLogger(args.diag_log_file)
+    if diag.is_file():
+        diag.write(
+            f"# 2-cam pipeline diag log -- profile_interval="
+            f"{args.profile_interval:.1f}s"
+        )
     prof_stop = threading.Event()
 
     def yolo_worker():
@@ -1208,6 +1360,9 @@ def run(args):
                             (time.perf_counter() - t_work0) * 1000
                         )
         except Exception as e:
+            import traceback
+            print("[diag] yolo_worker EXCEPTION:", flush=True)
+            traceback.print_exc()
             worker_error[0] = e
 
     def motion_worker():
@@ -1503,6 +1658,9 @@ def run(args):
                     with motion_mask_lock:
                         motion_mask_holder[0] = new_holder
         except Exception as e:
+            import traceback
+            print("[diag] motion_worker EXCEPTION:", flush=True)
+            traceback.print_exc()
             worker_error[0] = e
 
     def compute_worker():
@@ -1525,9 +1683,9 @@ def run(args):
                     if item is SENTINEL:
                         composite_in_q.put(SENTINEL)
                         return
-                    fa, fb, idx = item
+                    fa, fb, idx, ts_us = item
                     t_work0 = time.perf_counter()
-                    payload = compute_one(fa, fb, idx)
+                    payload = compute_one(fa, fb, idx, ts_us)
                     if prof is not None:
                         prof["compute"].record(
                             (time.perf_counter() - t_work0) * 1000
@@ -1539,6 +1697,9 @@ def run(args):
                             (time.perf_counter() - t_put0) * 1000
                         )
         except Exception as e:
+            import traceback
+            print("[diag] compute_worker EXCEPTION:", flush=True)
+            traceback.print_exc()
             worker_error[0] = e
             composite_in_q.put(SENTINEL)
 
@@ -1566,18 +1727,23 @@ def run(args):
                             (time.perf_counter() - t_work0) * 1000
                         )
                     t_write0 = time.perf_counter()
+                    payload_ts_us = item.get("timestamp_us", 0)
                     if result[0] == "async":
                         _, pinned, event, post_sync_fn, free_cb = result
-                        writer.write_async(pinned, event,
-                                           post_sync_fn, free_cb)
+                        sink.write_async(pinned, event,
+                                         post_sync_fn, free_cb,
+                                         timestamp_us=payload_ts_us)
                     else:
                         _, stitched = result
-                        writer.write(stitched)
+                        sink.write(stitched, timestamp_us=payload_ts_us)
                     if prof is not None:
                         prof["composite_write"].record(
                             (time.perf_counter() - t_write0) * 1000
                         )
         except Exception as e:
+            import traceback
+            print("[diag] composite_worker EXCEPTION:", flush=True)
+            traceback.print_exc()
             worker_error[0] = e
 
     compute_thread = threading.Thread(
@@ -1605,8 +1771,24 @@ def run(args):
 
     def profile_printer():
         # Rolling print every args.profile_interval seconds until shutdown.
+        # Sample queue depths at the same cadence -- they tell us
+        # where the back-pressure is:
+        #   compute_q full   -> compute worker is the bottleneck
+        #   composite_q full -> composite worker is the bottleneck
+        #   both empty       -> main loop is starved on read_pair
+        #                       (i.e. renderer not producing frames
+        #                       fast enough)
         while not prof_stop.wait(args.profile_interval):
-            _print_profile(prof, "rolling profile")
+            cq = compute_in_q.qsize()
+            xq = composite_in_q.qsize()
+            yq = yolo_q.qsize() if yolo_q is not None else -1
+            mq = motion_q.qsize() if motion_q is not None else -1
+            header = (
+                f"rolling profile  queues: compute_q={cq}/4 "
+                f"composite_q={xq}/4 yolo_q={yq} "
+                f"motion_q={mq if mq >= 0 else 'N/A'}"
+            )
+            _print_profile(prof, header, diag)
 
     profile_thread = None
     if prof is not None:
@@ -1617,27 +1799,55 @@ def run(args):
 
     frame_idx = 0
     t_start = time.time()
+    # Rolling fps log -- same cadence and format as the 3-cam path so
+    # the two pipelines can be compared apples-to-apples in the
+    # operator's logs.
+    FPS_LOG_INTERVAL_SEC = 30.0
+    last_print = t_start
+    frames_since_print = 0
+    print(
+        "[info] Streaming frames (2-cam, pipelined; "
+        f"fps log every {FPS_LOG_INTERVAL_SEC:.0f}s)..."
+    )
     try:
         while True:
+            # Fast-fail: if any worker died, surface its exception
+            # instead of blocking forever on a queue.put().
+            if worker_error[0] is not None:
+                raise worker_error[0]
             if pending_first_pair is not None:
-                fa, fb = pending_first_pair
+                fa, fb, ts_us = pending_first_pair
                 pending_first_pair = None
             else:
                 t_dec0 = time.perf_counter()
-                ok, fa, fb = prefetch_reader.read()
+                pair = source.read_pair()
                 if prof is not None:
                     prof["decode"].record(
                         (time.perf_counter() - t_dec0) * 1000
                     )
-                if not ok:
+                if pair is None:
                     break
+                fa, fb, ts_us = pair
             t_put0 = time.perf_counter()
-            compute_in_q.put((fa, fb, frame_idx))
+            compute_in_q.put((fa, fb, frame_idx, ts_us))
             if prof is not None:
                 prof["main_put_wait"].record(
                     (time.perf_counter() - t_put0) * 1000
                 )
             frame_idx += 1
+            frames_since_print += 1
+            now = time.time()
+            if now - last_print > FPS_LOG_INTERVAL_SEC:
+                fps = frames_since_print / max(now - last_print, 1e-6)
+                comp_q_depth = composite_in_q.qsize()
+                print(
+                    f"[info] 2-cam: frame {frame_idx}  "
+                    f"{fps:.1f} fps over last {now - last_print:.1f}s  "
+                    f"({frames_since_print} frames; "
+                    f"composite_q={comp_q_depth})"
+                )
+                last_print = now
+                frames_since_print = 0
             if args.max_frames and frame_idx >= args.max_frames:
                 break
     finally:
@@ -1652,8 +1862,7 @@ def run(args):
         prof_stop.set()
         if profile_thread is not None:
             profile_thread.join()
-        prefetch_reader.close()
-        writer.close()
+        sink.close()
 
     if worker_error[0] is not None:
         raise worker_error[0]
@@ -1663,11 +1872,1671 @@ def run(args):
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps) "
           f"-- pipelined (compute + composite + yolo on separate threads)")
-    print(sync_reader.summary_post())
-    print(f"[info] Output written to {args.output}")
+    print(source.summary_post())
+    if args.output is not None:
+        print(f"[info] Output written to {args.output}")
+    else:
+        print("[info] Output streamed over pipe (no file path).")
 
     if prof is not None:
-        _print_profile(prof, "final profile (over entire run)")
+        _print_profile(prof, "final profile (over entire run)", diag)
+    diag.close()
 
-    cap_a.release()
-    cap_b.release()
+    source.close()
+
+
+# ===========================================================================
+# 3-camera pipeline
+# ===========================================================================
+
+def _run_3cam(args, source, sink_factory, dev, ema_eff):
+    """
+    3-camera dispatch from run(). Scope:
+      - Joint gain compensation
+      - Triplet warp
+      - Two-seam DP with x_mid cap
+      - 3-camera multiband composite
+      - Autocrop + person tracking
+      - YOLOE person mask in seam cost (every --yolo_every frames; sync,
+        not yet pipelined into a worker thread)
+
+    Features intentionally still deferred to a follow-up commit (will
+    warn if asked for):
+      - Motion detection
+      - Static FG mask
+      - Debug overlays
+      - Async worker threads (YOLO + composite still run synchronously
+        on the main loop -- pipelining lands once the rest of the
+        feature parity is in place)
+    """
+    import numpy as np  # local re-import for clarity in this isolated path
+    import cv2
+    import torch
+    import torch.nn.functional as F
+
+    # Diagnostic instrumentation. Same pattern as 2-cam _run(): the
+    # `prof` dict (one StageTimer per stage) is only created when
+    # --profile is set, and `diag` (the DiagLogger) routes profile
+    # output to a file when --diag_log_file is set, else to stdout.
+    # See _make_profile_3cam() for the per-stage semantics.
+    prof_3cam = _make_profile_3cam() if args.profile else None
+    diag = DiagLogger(args.diag_log_file)
+    if diag.is_file():
+        diag.write(
+            f"# 3-cam pipeline diag log -- profile_interval="
+            f"{args.profile_interval:.1f}s"
+        )
+
+    if getattr(args, "person_tracking", False) and not args.autocrop:
+        # Mirror the 2-cam behavior.
+        print("[info] --person_tracking implies --autocrop; enabling it.")
+        args.autocrop = True
+
+    # FG mask is now supported in 3-cam mode (set up after we have grids,
+    # in section 5c below). Motion is also supported (section 5a). The
+    # remaining 3-cam-only no-ops are debug overlays + async pipelining.
+    # Motion is now supported in 3-cam mode (set up in section 5a below).
+    # --motion_baseline_a/b are still 2-cam-specific and are ignored here;
+    # 3-cam baselines come from the first frame triplet.
+
+    # --- 1. First frame triplet + homographies -----------------------------
+    first_triplet = source.read_triplet()
+    if first_triplet is None:
+        raise RuntimeError("Could not read first frame triplet.")
+    frame_L, frame_C, frame_R, first_ts_us = first_triplet
+
+    print("[info] Estimating homographies from first frame triplet...")
+    # estimate_homography(img_a, img_b) returns H mapping B's coords into A's.
+    # We want H mapping each non-Center camera's coords into Center's, so
+    # call with Center as the "a" anchor.
+    H_L_to_C = estimate_homography(frame_C, frame_L)
+    H_R_to_C = estimate_homography(frame_C, frame_R)
+
+    canvas_size, T, H_L_to_canvas, H_C_to_canvas, H_R_to_canvas = (
+        compute_canvas_3cam(
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            H_L_to_C, H_R_to_C,
+        )
+    )
+    print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
+
+    # Capture the pre-crop H_*_to_canvas matrices so the
+    # --debug_geometry helper can draw each camera's footprint on the
+    # FULL canvas (before autocrop translates it). The matrices below
+    # may get composed with T_crop next, so we copy now.
+    H_L_to_canvas_precrop = H_L_to_canvas.copy()
+    H_C_to_canvas_precrop = H_C_to_canvas.copy()
+    H_R_to_canvas_precrop = H_R_to_canvas.copy()
+
+    # --- 2. Autocrop --------------------------------------------------------
+    crop_rect = None
+    if args.autocrop:
+        crop_rect = find_autocrop_rect_3cam(
+            H_L_to_C, H_R_to_C,
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            canvas_size, T,
+        )
+        cx, cy, cw, ch = crop_rect
+        print(
+            f"[info] Autocrop: x={cx} y={cy} size={cw}x{ch} "
+            f"(from full canvas {canvas_size[0]}x{canvas_size[1]})"
+        )
+        T_crop = np.array(
+            [[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64
+        )
+        H_L_to_canvas = T_crop @ H_L_to_canvas
+        H_C_to_canvas = T_crop @ H_C_to_canvas
+        H_R_to_canvas = T_crop @ H_R_to_canvas
+        output_size = (cw, ch)
+    else:
+        output_size = canvas_size
+
+    # --- 2b. Debug geometry image (optional) ------------------------------
+    if getattr(args, "debug_geometry", None):
+        _save_geometry_debug_image_3cam(
+            args.debug_geometry,
+            canvas_size,
+            H_L_to_canvas_precrop,
+            H_C_to_canvas_precrop,
+            H_R_to_canvas_precrop,
+            frame_L.shape, frame_C.shape, frame_R.shape,
+            crop_rect,
+        )
+
+    # --- 3. Remap maps + static 3-cam geometry -----------------------------
+    print("[info] Precomputing remap maps + static geometry (3-cam)...")
+    map_Lx, map_Ly = build_remap(H_L_to_canvas, output_size)
+    map_Cx, map_Cy = build_remap(H_C_to_canvas, output_size)
+    map_Rx, map_Ry = build_remap(H_R_to_canvas, output_size)
+    static_3cam = build_static_geometry_3cam(
+        frame_L.shape, frame_C.shape, frame_R.shape,
+        map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+        output_size,
+    )
+    ctx_LC = static_3cam["overlap_LC"]
+    ctx_CR = static_3cam["overlap_CR"]
+    bbox_LC = ctx_LC.bbox
+    bbox_CR = ctx_CR.bbox
+    print(
+        f"[info] L<>C overlap bbox: x=[{bbox_LC[0]},{bbox_LC[2]}) "
+        f"y=[{bbox_LC[1]},{bbox_LC[3]}) "
+        f"size={bbox_LC[2]-bbox_LC[0]}x{bbox_LC[3]-bbox_LC[1]}"
+    )
+    print(
+        f"[info] C<>R overlap bbox: x=[{bbox_CR[0]},{bbox_CR[2]}) "
+        f"y=[{bbox_CR[1]},{bbox_CR[3]}) "
+        f"size={bbox_CR[2]-bbox_CR[0]}x{bbox_CR[3]-bbox_CR[1]}"
+    )
+    print(f"[info] x_mid (canvas x): {static_3cam['x_mid']}")
+    # Per-overlap shapes used by the per-frame cost matrices.
+    bbox_shape_LC = (bbox_LC[3] - bbox_LC[1], bbox_LC[2] - bbox_LC[0])
+    bbox_shape_CR = (bbox_CR[3] - bbox_CR[1], bbox_CR[2] - bbox_CR[0])
+
+    # --- 4. Joint gain compensation ----------------------------------------
+    lut_L = lut_C = lut_R = None
+    gain_L_t = gain_C_t = gain_R_t = None
+    if not args.no_gain_comp:
+        print("[info] Computing joint gain compensation from first triplet...")
+        wL0 = cv2.remap(frame_L, map_Lx, map_Ly, cv2.INTER_LINEAR)
+        wC0 = cv2.remap(frame_C, map_Cx, map_Cy, cv2.INTER_LINEAR)
+        wR0 = cv2.remap(frame_R, map_Rx, map_Ry, cv2.INTER_LINEAR)
+        gains_L, gains_C, gains_R = compute_joint_gain_compensation_3cam(
+            wL0, wC0, wR0,
+            bbox_LC, ctx_LC.overlap,
+            bbox_CR, ctx_CR.overlap,
+        )
+        print(
+            f"[info] gains_L = [{gains_L[0]:.3f}, "
+            f"{gains_L[1]:.3f}, {gains_L[2]:.3f}]"
+        )
+        print(
+            f"[info] gains_C = [{gains_C[0]:.3f}, "
+            f"{gains_C[1]:.3f}, {gains_C[2]:.3f}]"
+        )
+        print(
+            f"[info] gains_R = [{gains_R[0]:.3f}, "
+            f"{gains_R[1]:.3f}, {gains_R[2]:.3f}]"
+        )
+        if dev["cuda_available"]:
+            gain_L_t = build_gain_tensor(gains_L, torch.device("cuda"))
+            gain_C_t = build_gain_tensor(gains_C, torch.device("cuda"))
+            gain_R_t = build_gain_tensor(gains_R, torch.device("cuda"))
+        else:
+            lut_L = build_gain_lut(gains_L)
+            lut_C = build_gain_lut(gains_C)
+            lut_R = build_gain_lut(gains_R)
+
+    # --- 5. GPU context (3-cam) --------------------------------------------
+    gpu_ctx_3cam = None
+    grid_triplet_t = None
+    overlap_LC_t = None
+    overlap_CR_t = None
+    if dev["cuda_available"]:
+        torch_device = torch.device("cuda")
+        # Per-overlap GPU validity masks for the composite.
+        valid_in_LC_np = cv2.bitwise_or(ctx_LC.mask_left, ctx_LC.mask_right)
+        valid_in_CR_np = cv2.bitwise_or(ctx_CR.mask_left, ctx_CR.mask_right)
+        # Per-overlap GPU dicts for the composite helper.
+        overlap_LC_gpu = {
+            "overlap_in_bbox_t": torch.from_numpy(ctx_LC.overlap).to(torch_device),
+            "only_a_in_bbox_t": torch.from_numpy(ctx_LC.only_left).to(torch_device),
+            "only_b_in_bbox_t": torch.from_numpy(ctx_LC.only_right).to(torch_device),
+            "valid_in_bbox_t": torch.from_numpy(valid_in_LC_np).to(torch_device),
+        }
+        overlap_CR_gpu = {
+            "overlap_in_bbox_t": torch.from_numpy(ctx_CR.overlap).to(torch_device),
+            "only_a_in_bbox_t": torch.from_numpy(ctx_CR.only_left).to(torch_device),
+            "only_b_in_bbox_t": torch.from_numpy(ctx_CR.only_right).to(torch_device),
+            "valid_in_bbox_t": torch.from_numpy(valid_in_CR_np).to(torch_device),
+        }
+        gpu_ctx_3cam = {
+            "device": torch_device,
+            "kernel2d": get_pyr_kernel_2d(torch_device),
+            "only_L_u8_t": torch.from_numpy(static_3cam["only_L_u8"]).to(torch_device),
+            "only_C_u8_t": torch.from_numpy(static_3cam["only_C_u8"]).to(torch_device),
+            "only_R_u8_t": torch.from_numpy(static_3cam["only_R_u8"]).to(torch_device),
+            "overlap_LC_gpu": overlap_LC_gpu,
+            "overlap_CR_gpu": overlap_CR_gpu,
+        }
+        # Pinned ring buffer for the async writer handoff.
+        out_W, out_H = output_size
+        pinned_ring_size = 6
+        free_pinned_q = queue.Queue(maxsize=pinned_ring_size)
+        pinned_ring = []
+        for _ in range(pinned_ring_size):
+            buf = torch.empty(
+                (out_H, out_W, 3), dtype=torch.uint8, pin_memory=True,
+            )
+            pinned_ring.append(buf)
+            free_pinned_q.put(buf)
+        # Triplet warp grid: cat of three single-grid tensors.
+        grid_L_t = build_grid_sample_tensor(map_Lx, map_Ly, frame_L.shape, torch_device)
+        grid_C_t = build_grid_sample_tensor(map_Cx, map_Cy, frame_C.shape, torch_device)
+        grid_R_t = build_grid_sample_tensor(map_Rx, map_Ry, frame_R.shape, torch_device)
+        grid_triplet_t = torch.cat([grid_L_t, grid_C_t, grid_R_t], dim=0)
+        overlap_LC_t = overlap_LC_gpu["overlap_in_bbox_t"]
+        overlap_CR_t = overlap_CR_gpu["overlap_in_bbox_t"]
+        print("[device] GPU contexts initialised (3-cam).")
+
+    # --- 5a. Motion detection baselines (per overlap) --------------------
+    #
+    # 3-camera motion mirrors the 2-camera path but with two contexts:
+    # baselines for the L<>C overlap and baselines for the C<>R overlap.
+    # Center's baseline is held twice -- once cropped to bbox_LC and once
+    # to bbox_CR -- which costs nothing in practice (a few hundred KB at
+    # half-res) and keeps the per-frame code shape-symmetric with the
+    # 2-cam compute_motion_mask_gpu/cpu signatures.
+    #
+    # We reuse the first frame triplet as the baseline -- same fall-back
+    # rule the 2-cam path uses when no baseline images are provided. The
+    # --motion_baseline_a/b CLI args are NOT consulted in 3-cam mode
+    # (deliberate: they're inherently 2-camera).
+    use_motion_3cam = not bool(getattr(args, "no_motion", False))
+    motion_dilate_kernel_3cam = None
+    baseline_L_in_LC_t = baseline_C_in_LC_t = None
+    baseline_C_in_CR_t = baseline_R_in_CR_t = None
+    baseline_L_in_LC = baseline_C_in_LC = None
+    baseline_C_in_CR = baseline_R_in_CR = None
+    overlap_in_bbox_motion_LC_t = overlap_in_bbox_motion_CR_t = None
+    overlap_in_bbox_motion_LC = overlap_in_bbox_motion_CR = None
+    if use_motion_3cam:
+        print(
+            f"[info] 3-cam motion: pixel method, threshold={args.motion_threshold} "
+            f"dilate={args.motion_dilate} penalty={args.motion_penalty:g} "
+            f"(running at half-res inside each overlap bbox)"
+        )
+        motion_dilate_kernel_3cam = (
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * args.motion_dilate + 1, 2 * args.motion_dilate + 1),
+            ) if args.motion_dilate > 0 else None
+        )
+        # Use the just-read first triplet as the baseline.
+        baseline_L = frame_L.copy()
+        baseline_C = frame_C.copy()
+        baseline_R = frame_R.copy()
+        if dev["cuda_available"]:
+            # Warp + crop to each overlap bbox, then downsample to half-res
+            # so per-frame motion runs on ~1/4 the pixel count of the bbox.
+            full_baseline_L_t, full_baseline_C_t, full_baseline_R_t = (
+                warp_triplet_gpu(
+                    baseline_L, baseline_C, baseline_R,
+                    grid_triplet_t, gpu_ctx_3cam["device"],
+                    gain_L_t=gain_L_t,
+                    gain_C_t=gain_C_t,
+                    gain_R_t=gain_R_t,
+                )
+            )
+            baseline_L_in_LC_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_L_t, bbox_LC)
+            ).float()
+            baseline_C_in_LC_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_C_t, bbox_LC)
+            ).float()
+            baseline_C_in_CR_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_C_t, bbox_CR)
+            ).float()
+            baseline_R_in_CR_t = downsample_image_half_gpu(
+                crop_to_bbox_gpu(full_baseline_R_t, bbox_CR)
+            ).float()
+            overlap_in_bbox_motion_LC_t = downsample_mask_half_gpu(
+                overlap_LC_t,
+            )
+            overlap_in_bbox_motion_CR_t = downsample_mask_half_gpu(
+                overlap_CR_t,
+            )
+            del full_baseline_L_t, full_baseline_C_t, full_baseline_R_t
+        else:
+            if lut_L is not None:
+                baseline_L = apply_gain_lut(baseline_L, lut_L)
+                baseline_C = apply_gain_lut(baseline_C, lut_C)
+                baseline_R = apply_gain_lut(baseline_R, lut_R)
+            full_baseline_L = cv2.remap(
+                baseline_L, map_Lx, map_Ly, cv2.INTER_LINEAR,
+            )
+            full_baseline_C = cv2.remap(
+                baseline_C, map_Cx, map_Cy, cv2.INTER_LINEAR,
+            )
+            full_baseline_R = cv2.remap(
+                baseline_R, map_Rx, map_Ry, cv2.INTER_LINEAR,
+            )
+
+            def _crop_cpu(img, bbox):
+                x0, y0, x1, y1 = bbox
+                return img[y0:y1, x0:x1].copy()
+
+            baseline_L_in_LC = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_L, bbox_LC),
+            ).astype(np.float32)
+            baseline_C_in_LC = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_C, bbox_LC),
+            ).astype(np.float32)
+            baseline_C_in_CR = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_C, bbox_CR),
+            ).astype(np.float32)
+            baseline_R_in_CR = downsample_image_half_cpu(
+                _crop_cpu(full_baseline_R, bbox_CR),
+            ).astype(np.float32)
+            overlap_in_bbox_motion_LC = downsample_mask_half_cpu(
+                ctx_LC.overlap,
+            )
+            overlap_in_bbox_motion_CR = downsample_mask_half_cpu(
+                ctx_CR.overlap,
+            )
+
+    # --- 5b. YOLO person segmenter for the seam-cost person penalty -------
+    #
+    # GPU path: an async worker thread runs YOLO + mask warp + union +
+    # dilate + bbox slicing on a dedicated CUDA stream and publishes the
+    # most recent person mask to a shared holder. The main loop only ever
+    # READS the latest published mask (could be from up to args.yolo_every
+    # frames ago, but person doesn't move much in 8 frames at 30 fps) --
+    # so the YOLO work overlaps with the next frame's compute kernels on
+    # other streams instead of stalling the main loop.
+    #
+    # CPU path: still runs synchronously in the main loop. The worker-
+    # thread overhead isn't worth it without GPU stream parallelism, and
+    # CPU YOLO is slow enough that we'd be running it permanently anyway.
+    person_segmenter = PersonSegmenter(
+        args.yolo_weights, device=dev["yolo_device"],
+    )
+    print(
+        f"[info] 3-cam YOLO: loaded {args.yolo_weights} for person mask "
+        f"(every {args.yolo_every} frames, "
+        f"{'async on yolo_stream' if dev['cuda_available'] else 'sync on main thread'})"
+    )
+    dilate_kernel_3cam = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
+    )
+    if dev["cuda_available"]:
+        # Per-source grids built for the triplet warp -- reuse them for the
+        # 3 mask warps so the canvas-space mask geometry stays consistent
+        # with the warped frames.
+        grid_L_for_mask_t = grid_triplet_t[0:1]
+        grid_C_for_mask_t = grid_triplet_t[1:2]
+        grid_R_for_mask_t = grid_triplet_t[2:3]
+    # Latest masks held across iterations (sticky between YOLO runs): the
+    # cost gets the same person penalty for up to args.yolo_every frames
+    # in a row, which is fine because the person doesn't move > a few
+    # pixels in that window.
+    person_mask_bbox_LC_t = None
+    person_mask_bbox_CR_t = None
+    person_mask_bbox_LC = None
+    person_mask_bbox_CR = None
+    canvas_person_mask_for_tracker = None  # full-canvas uint8 (CPU)
+
+    # --- 5c. Static FG mask (per-overlap slices of a canvas-wide mask) ----
+    #
+    # FG runs YOLO segmentation on all three source frames once at
+    # startup, warps each into canvas space, unions + dilates, then
+    # slices the canvas-wide result into bbox_LC and bbox_CR. The
+    # canvas-wide form is recomputed every fg_recompute_frames frames
+    # (same cadence as 2-cam) to track furniture/people that arrive or
+    # leave the room over the course of a long call.
+    #
+    # YOLOE + depth-filter FG is supported with the same args as 2-cam
+    # (--fg_model yoloe, --static_fg_depth_threshold). We re-use the
+    # person_segmenter as the fg_segmenter when --fg_model matches
+    # --person_model (YOLOv8 default), or build a separate YOLOE one
+    # via the same _build_segmenters helper if requested.
+    use_fg_3cam = not args.no_fg
+    fg_segmenter_3cam = None
+    fg_class_ids_3cam = []
+    fg_only_class_ids_3cam = []
+    fg_depth_threshold_3cam = None
+    fg_dilate_kernel_3cam = (
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * args.fg_dilate + 1, 2 * args.fg_dilate + 1),
+        ) if args.fg_dilate > 0 else None
+    )
+    fg_mask_bbox_LC_t = fg_mask_bbox_CR_t = None
+    fg_mask_bbox_LC = fg_mask_bbox_CR = None
+    fg_recompute_frames_3cam = (
+        int(round(args.fg_recompute_seconds * source.output_fps))
+        if args.fg_recompute_seconds > 0 else 0
+    )
+    if use_fg_3cam:
+        # Build the FG segmenter + class ids by reusing _build_segmenters.
+        # That helper returns 5 things; we only need fg_segmenter,
+        # fg_class_ids, fg_only_class_ids. The person_* outputs are
+        # discarded -- we already loaded a YOLOv8 person_segmenter
+        # above. This is slightly wasteful (we may load the YOLOv8
+        # weights twice when fg_model is yolov8 too) but keeps the
+        # build logic single-sourced.
+        (_p_segmenter_unused, _p_class_ids_unused,
+         fg_segmenter_3cam, fg_class_ids_3cam, fg_only_class_ids_3cam) = (
+            _build_segmenters(args, dev)
+        )
+        if fg_only_class_ids_3cam:
+            from stitcher.static_fg import FG_DEPTH_THRESHOLD
+            fg_depth_threshold_3cam = (
+                args.static_fg_depth_threshold
+                if args.static_fg_depth_threshold is not None
+                else FG_DEPTH_THRESHOLD
+            )
+            print(
+                "[info] 3-cam FG: YOLOE with depth filter "
+                f"(threshold={fg_depth_threshold_3cam:.2f}, "
+                f"classes={fg_class_ids_3cam}, "
+                f"fg-only={fg_only_class_ids_3cam})"
+            )
+        else:
+            print(
+                "[info] 3-cam FG: YOLO segmentation "
+                f"(classes={fg_class_ids_3cam})"
+            )
+
+        # Compute the initial canvas-wide FG mask, slice into both bboxes.
+        t0 = time.time()
+        if dev["cuda_available"]:
+            grid_L_for_mask_t_init = grid_triplet_t[0:1]
+            grid_C_for_mask_t_init = grid_triplet_t[1:2]
+            grid_R_for_mask_t_init = grid_triplet_t[2:3]
+            fg_canvas_t = compute_fg_mask_seg_triplet_canvas_gpu(
+                fg_segmenter_3cam, frame_L, frame_C, frame_R,
+                fg_class_ids_3cam,
+                grid_L_for_mask_t_init,
+                grid_C_for_mask_t_init,
+                grid_R_for_mask_t_init,
+                args.fg_dilate,
+                fg_only_class_ids=fg_only_class_ids_3cam,
+                depth_threshold=fg_depth_threshold_3cam,
+            )
+            # AND each slice with that overlap's overlap_in_bbox mask so
+            # the FG penalty only applies where both contributing cams
+            # see the pixel (same gate as 2-cam compute_fg_mask_seg_gpu).
+            xL0, yL0, xL1, yL1 = bbox_LC
+            xC0, yC0, xC1, yC1 = bbox_CR
+            fg_LC_slice = fg_canvas_t[yL0:yL1, xL0:xL1].contiguous()
+            fg_CR_slice = fg_canvas_t[yC0:yC1, xC0:xC1].contiguous()
+            fg_mask_bbox_LC_t = torch.where(
+                overlap_LC_t > 0,
+                fg_LC_slice,
+                torch.zeros_like(fg_LC_slice),
+            )
+            fg_mask_bbox_CR_t = torch.where(
+                overlap_CR_t > 0,
+                fg_CR_slice,
+                torch.zeros_like(fg_CR_slice),
+            )
+            cov_LC = (fg_mask_bbox_LC_t > 0).float().mean().item() * 100
+            cov_CR = (fg_mask_bbox_CR_t > 0).float().mean().item() * 100
+        else:
+            fg_canvas = compute_fg_mask_seg_triplet_canvas_cpu(
+                fg_segmenter_3cam, frame_L, frame_C, frame_R,
+                fg_class_ids_3cam,
+                map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+                fg_dilate_kernel_3cam,
+                fg_only_class_ids=fg_only_class_ids_3cam,
+                depth_threshold=fg_depth_threshold_3cam,
+            )
+            xL0, yL0, xL1, yL1 = bbox_LC
+            xC0, yC0, xC1, yC1 = bbox_CR
+            fg_mask_bbox_LC = cv2.bitwise_and(
+                fg_canvas[yL0:yL1, xL0:xL1].copy(),
+                ctx_LC.overlap,
+            )
+            fg_mask_bbox_CR = cv2.bitwise_and(
+                fg_canvas[yC0:yC1, xC0:xC1].copy(),
+                ctx_CR.overlap,
+            )
+            cov_LC = float((fg_mask_bbox_LC > 0).mean()) * 100
+            cov_CR = float((fg_mask_bbox_CR > 0).mean()) * 100
+        print(
+            f"[info] 3-cam FG mask computed in "
+            f"{(time.time() - t0) * 1000:.1f} ms  "
+            f"(L<>C: {cov_LC:.1f}% of bbox flagged, "
+            f"C<>R: {cov_CR:.1f}%)."
+        )
+        if fg_recompute_frames_3cam > 0:
+            print(
+                f"[info] 3-cam FG recompute every "
+                f"{fg_recompute_frames_3cam} frames "
+                f"(~{args.fg_recompute_seconds}s)."
+            )
+
+    # --- 6. Person tracker (operates on output canvas; camera-count agnostic)
+    tracker = None
+    writer_output_size = output_size
+    if getattr(args, "person_tracking", False):
+        tracker = PersonTracker(
+            smooth_seconds=args.person_tracking_smooth_seconds,
+            drift_seconds=args.person_tracking_drift_seconds,
+            fps=source.output_fps,
+            aspect=args.person_tracking_aspect,
+        )
+        writer_output_size = tracker.get_crop_size(
+            output_size[0], output_size[1],
+        )
+        print(
+            f"[info] Person tracking enabled: output cropped from "
+            f"{output_size[0]}x{output_size[1]} to "
+            f"{writer_output_size[0]}x{writer_output_size[1]} "
+            f"(aspect {args.person_tracking_aspect:.2f})."
+        )
+
+    # --- 7. Output sink ----------------------------------------------------
+    if sink_factory is None:
+        def sink_factory(w, h, fps):
+            s = FileFrameSink(args.output)
+            s.open(w, h, fps)
+            return s
+    sink = sink_factory(
+        writer_output_size[0], writer_output_size[1], source.output_fps,
+    )
+
+    # --- 7a. CUDA streams (GPU path only) ---------------------------------
+    #
+    # Three high-priority streams for the critical path (compute / composite
+    # / yolo) and one default-priority stream for motion. Stream priorities
+    # nudge the GPU scheduler to interleave kernels from consecutive frames
+    # instead of serialising them on the default stream.
+    #   - compute_stream:   warp + cost + edge penalty + DP seam input prep
+    #   - composite_stream: multi-band blend + pinned host copy
+    #   - yolo_stream:      YOLO predict + mask warp + dilate
+    #   - motion_stream:    motion diff + dilate (default prio: yields to
+    #                       the critical path when both have work queued)
+    compute_stream_3cam = None
+    composite_stream_3cam = None
+    motion_stream_3cam = None
+    if dev["cuda_available"]:
+        compute_stream_3cam = torch.cuda.Stream(priority=-1)
+        composite_stream_3cam = torch.cuda.Stream(priority=-1)
+        motion_stream_3cam = torch.cuda.Stream(priority=0)
+        print(
+            "[device] 3-cam CUDA streams: compute, composite, yolo "
+            "(priority -1) + motion (priority 0)"
+        )
+
+    # --- 7b. Async YOLO worker (GPU path only) ----------------------------
+    #
+    # The worker pulls (fL, fC, fR) triplets off yolo_q_3cam, runs the
+    # inference + warp + union + dilate + bbox-slice on a dedicated CUDA
+    # stream, and publishes the result snapshot into mask_holder_3cam
+    # under mask_lock_3cam. The main loop only ever READS the latest
+    # published mask -- never updates it. On the first few frames, before
+    # the worker has produced anything, mask_holder_3cam[0] is None and
+    # the main loop proceeds without a person penalty (acceptable for
+    # warm-up).
+    #
+    # Cross-stream sync: each published snapshot carries a torch.cuda.Event
+    # recorded right after the mask is materialised on the YOLO stream.
+    # The main loop calls event.wait() (a stream-level wait, not a host
+    # stall) before reading the mask, so the compute stream waits for the
+    # YOLO kernels to finish before consuming.
+    SENTINEL = object()
+    yolo_q_3cam = None
+    mask_holder_3cam = [None]
+    mask_lock_3cam = threading.Lock()
+    yolo_thread = None
+    yolo_stream_3cam = None
+    if dev["cuda_available"]:
+        yolo_stream_3cam = torch.cuda.Stream(priority=-1)
+        yolo_q_3cam = queue.Queue(maxsize=1)
+
+        def yolo_worker_3cam():
+            """Async YOLO + mask post-processing. See section 7b doc."""
+            try:
+                with torch.cuda.stream(yolo_stream_3cam):
+                    while True:
+                        t_get0 = time.perf_counter()
+                        item = yolo_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["yolo_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
+                        if item is SENTINEL:
+                            return
+                        t_y0 = time.perf_counter()
+                        fL_y, fC_y, fR_y = item
+                        mL_src_t, mC_src_t, mR_src_t = (
+                            person_segmenter.predict_classes_mask_triplet_gpu(
+                                fL_y, fC_y, fR_y,
+                                fL_y.shape[:2], fC_y.shape[:2], fR_y.shape[:2],
+                                (0,),  # PERSON_CLASS_ID for YOLOv8 COCO
+                            )
+                        )
+                        mL_canvas_t = warp_mask_gpu(
+                            mL_src_t, grid_L_for_mask_t,
+                        )
+                        mC_canvas_t = warp_mask_gpu(
+                            mC_src_t, grid_C_for_mask_t,
+                        )
+                        mR_canvas_t = warp_mask_gpu(
+                            mR_src_t, grid_R_for_mask_t,
+                        )
+                        union_t = torch.bitwise_or(
+                            torch.bitwise_or(mL_canvas_t, mC_canvas_t),
+                            mR_canvas_t,
+                        )
+                        union_t = dilate_gpu(union_t, args.mask_dilate)
+                        canvas_person_mask_for_tracker_local = (
+                            union_t.cpu().numpy() if tracker is not None
+                            else None
+                        )
+                        xLb0, yLb0, xLb1, yLb1 = bbox_LC
+                        xCb0, yCb0, xCb1, yCb1 = bbox_CR
+                        person_mask_bbox_LC_local = (
+                            union_t[yLb0:yLb1, xLb0:xLb1].contiguous()
+                        )
+                        person_mask_bbox_CR_local = (
+                            union_t[yCb0:yCb1, xCb0:xCb1].contiguous()
+                        )
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "person_mask_bbox_LC_t": person_mask_bbox_LC_local,
+                            "person_mask_bbox_CR_t": person_mask_bbox_CR_local,
+                            "canvas_person_mask": canvas_person_mask_for_tracker_local,
+                            "ready_event": ready_event,
+                        }
+                        with mask_lock_3cam:
+                            mask_holder_3cam[0] = new_holder
+                        if prof_3cam is not None:
+                            prof_3cam["yolo"].record(
+                                (time.perf_counter() - t_y0) * 1000
+                            )
+            except Exception as e:
+                # Don't kill the whole pipeline on a YOLO error -- log and
+                # let the main loop continue with no person penalty.
+                print(f"[warn] 3-cam YOLO worker error: {e!r}")
+
+        yolo_thread = threading.Thread(
+            target=yolo_worker_3cam, daemon=True, name="yolo_worker_3cam",
+        )
+        yolo_thread.start()
+        print("[info] 3-cam YOLO worker started (async).")
+
+    # --- 7c. Async motion worker (GPU path only) --------------------------
+    #
+    # Mirrors the 2-cam motion_worker: takes warped triplets, computes the
+    # per-overlap motion mask on motion_stream, and publishes to
+    # motion_mask_holder_3cam. The main loop reads the most recently
+    # published mask -- which is from the PREVIOUS frame by construction
+    # (1-frame lag). At 25+ fps that lag is well under the motion_dilate
+    # radius that absorbs sub-pixel jitter anyway, so the lag is
+    # invisible in practice.
+    motion_q_3cam = None
+    motion_mask_holder_3cam = [None]
+    motion_mask_lock_3cam = threading.Lock()
+    motion_thread = None
+    if use_motion_3cam and dev["cuda_available"]:
+        motion_q_3cam = queue.Queue(maxsize=1)
+
+        def motion_worker_3cam():
+            try:
+                with torch.cuda.stream(motion_stream_3cam):
+                    while True:
+                        t_get0 = time.perf_counter()
+                        item = motion_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["motion_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
+                        if item is SENTINEL:
+                            return
+                        t_m0 = time.perf_counter()
+                        wL_full_t, wC_full_t, wR_full_t, warp_event = item
+                        if warp_event is not None:
+                            warp_event.wait()
+                        # L<>C overlap motion
+                        wL_in_LC_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wL_full_t, bbox_LC)
+                        )
+                        wC_in_LC_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wC_full_t, bbox_LC)
+                        )
+                        motion_half_LC_t = compute_motion_mask_gpu(
+                            wL_in_LC_t, wC_in_LC_t,
+                            baseline_L_in_LC_t, baseline_C_in_LC_t,
+                            args.motion_threshold, args.motion_dilate,
+                            overlap_in_bbox_motion_LC_t,
+                        )
+                        motion_mask_LC_full_t = upsample_mask_to_bbox_gpu(
+                            motion_half_LC_t, bbox_shape_LC,
+                        )
+                        # C<>R overlap motion
+                        wC_in_CR_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wC_full_t, bbox_CR)
+                        )
+                        wR_in_CR_t = downsample_image_half_gpu(
+                            crop_to_bbox_gpu(wR_full_t, bbox_CR)
+                        )
+                        motion_half_CR_t = compute_motion_mask_gpu(
+                            wC_in_CR_t, wR_in_CR_t,
+                            baseline_C_in_CR_t, baseline_R_in_CR_t,
+                            args.motion_threshold, args.motion_dilate,
+                            overlap_in_bbox_motion_CR_t,
+                        )
+                        motion_mask_CR_full_t = upsample_mask_to_bbox_gpu(
+                            motion_half_CR_t, bbox_shape_CR,
+                        )
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        new_holder = {
+                            "motion_mask_LC_t": motion_mask_LC_full_t,
+                            "motion_mask_CR_t": motion_mask_CR_full_t,
+                            "ready_event": ready_event,
+                        }
+                        with motion_mask_lock_3cam:
+                            motion_mask_holder_3cam[0] = new_holder
+                        if prof_3cam is not None:
+                            prof_3cam["motion"].record(
+                                (time.perf_counter() - t_m0) * 1000
+                            )
+            except Exception as e:
+                print(f"[warn] 3-cam motion worker error: {e!r}")
+
+        motion_thread = threading.Thread(
+            target=motion_worker_3cam, daemon=True,
+            name="motion_worker_3cam",
+        )
+        motion_thread.start()
+        print("[info] 3-cam motion worker started (async).")
+
+    # --- 7d. Async composite worker (GPU path only) -----------------------
+    #
+    # Takes the just-computed warped tensors + seam paths + tracking_crop
+    # from the main loop, runs multiband_gpu_async_3cam on composite_stream
+    # (so the composite kernels overlap with the next frame's compute), then
+    # hands off to the writer thread. The main loop only blocks on the
+    # composite queue when downstream backpressure builds (sink can't keep
+    # up) -- otherwise it's a put() + continue.
+    composite_in_q_3cam = None
+    composite_thread = None
+    composite_worker_error = [None]
+    if dev["cuda_available"]:
+        composite_in_q_3cam = queue.Queue(maxsize=4)
+
+        def composite_worker_3cam():
+            try:
+                with torch.cuda.stream(composite_stream_3cam):
+                    while True:
+                        t_get0 = time.perf_counter()
+                        item = composite_in_q_3cam.get()
+                        if prof_3cam is not None:
+                            prof_3cam["composite_get_wait"].record(
+                                (time.perf_counter() - t_get0) * 1000
+                            )
+                        if item is SENTINEL:
+                            return
+                        t_c0 = time.perf_counter()
+                        compute_event = item["compute_done_event"]
+                        if compute_event is not None:
+                            compute_event.wait()
+                        pinned = free_pinned_q.get()
+                        copy_event = composite_multiband_gpu_async_3cam(
+                            item["warped_L_t"],
+                            item["warped_C_t"],
+                            item["warped_R_t"],
+                            static_3cam,
+                            item["seam_LC_full"],
+                            item["seam_CR_full"],
+                            args.blend_width, args.blend_levels,
+                            pinned, gpu_ctx_3cam,
+                        )
+                        if prof_3cam is not None:
+                            prof_3cam["composite"].record(
+                                (time.perf_counter() - t_c0) * 1000
+                            )
+                        tracking_crop = item.get("tracking_crop")
+
+                        def post_sync_fn(arr, tc=tracking_crop):
+                            if tc is not None:
+                                x0, x1 = tc
+                                arr = arr[:, x0:x1]
+                                if not arr.flags["C_CONTIGUOUS"]:
+                                    arr = np.ascontiguousarray(arr)
+                            return arr
+
+                        t_w0 = time.perf_counter()
+                        sink.write_async(
+                            pinned, copy_event,
+                            post_sync_fn=post_sync_fn,
+                            free_cb=lambda p=pinned: free_pinned_q.put(p),
+                            timestamp_us=item["timestamp_us"],
+                        )
+                        if prof_3cam is not None:
+                            prof_3cam["composite_write"].record(
+                                (time.perf_counter() - t_w0) * 1000
+                            )
+            except Exception as e:
+                import traceback
+                print("[diag] 3-cam composite_worker EXCEPTION:")
+                traceback.print_exc()
+                composite_worker_error[0] = e
+
+        composite_thread = threading.Thread(
+            target=composite_worker_3cam, daemon=True,
+            name="composite_worker_3cam",
+        )
+        composite_thread.start()
+        print("[info] 3-cam composite worker started (async).")
+
+    # --- 8. Main loop (async-pipelined on GPU; sync on CPU) ---------------
+    out_buf_cpu = (
+        np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
+        if not dev["cuda_available"] else None
+    )
+
+    cost_ema_LC_t = None
+    cost_ema_CR_t = None
+    cost_ema_LC = None
+    cost_ema_CR = None
+    seam_prev_small_LC = None
+    seam_prev_small_CR = None
+    x_mid = static_3cam["x_mid"]
+    # In bbox-local cost-matrix coords: cap = (x_mid - bbox.x0) // seam_downscale.
+    # For the LC seam we forbid x >= cap; for the CR seam we forbid x <= cap.
+    ds = max(1, args.seam_downscale)
+
+    pending_first_triplet = (frame_L, frame_C, frame_R, first_ts_us)
+    frame_idx = 0
+    last_print = time.time()
+    frames_since_print = 0
+    # Interval for the rolling fps log line; user-visible cadence, not a
+    # tight loop counter, so it's intentionally on the longer side.
+    FPS_LOG_INTERVAL_SEC = 30.0
+    print(
+        "[info] Streaming frames (3-cam, "
+        f"{'async-pipelined' if dev['cuda_available'] else 'sync'} path; "
+        f"fps log every {FPS_LOG_INTERVAL_SEC:.0f}s)..."
+    )
+
+    # Rolling profile printer (only when --profile is set). Mirrors the
+    # 2-cam pattern but with 3-cam-specific stage layout + queue
+    # depths. Output goes to the DiagLogger (file when
+    # --diag_log_file is set; stdout otherwise).
+    prof_stop_3cam = threading.Event()
+
+    def profile_printer_3cam():
+        while not prof_stop_3cam.wait(args.profile_interval):
+            cq = (composite_in_q_3cam.qsize()
+                  if composite_in_q_3cam is not None else -1)
+            yq = (yolo_q_3cam.qsize()
+                  if yolo_q_3cam is not None else -1)
+            mq = (motion_q_3cam.qsize()
+                  if motion_q_3cam is not None else -1)
+            header = (
+                f"3-cam rolling profile  queues: composite_q={cq}/4 "
+                f"yolo_q={yq if yq >= 0 else 'N/A'} "
+                f"motion_q={mq if mq >= 0 else 'N/A'}"
+            )
+            _print_profile(prof_3cam, header, diag)
+
+    profile_thread_3cam = None
+    if prof_3cam is not None:
+        profile_thread_3cam = threading.Thread(
+            target=profile_printer_3cam, name="profile_printer_3cam",
+            daemon=True,
+        )
+        profile_thread_3cam.start()
+    try:
+        while True:
+            t_iter0 = time.perf_counter()
+            if pending_first_triplet is not None:
+                fL, fC, fR, ts_us = pending_first_triplet
+                pending_first_triplet = None
+            else:
+                t_rd0 = time.perf_counter()
+                trip = source.read_triplet()
+                if prof_3cam is not None:
+                    prof_3cam["read_triplet_wait"].record(
+                        (time.perf_counter() - t_rd0) * 1000
+                    )
+                if trip is None:
+                    break
+                fL, fC, fR, ts_us = trip
+
+            # --- Periodic FG mask recompute (every fg_recompute_frames) ---
+            if (use_fg_3cam
+                    and fg_recompute_frames_3cam > 0
+                    and frame_idx > 0
+                    and frame_idx % fg_recompute_frames_3cam == 0):
+                if dev["cuda_available"]:
+                    fg_canvas_t = compute_fg_mask_seg_triplet_canvas_gpu(
+                        fg_segmenter_3cam, fL, fC, fR,
+                        fg_class_ids_3cam,
+                        grid_L_for_mask_t, grid_C_for_mask_t, grid_R_for_mask_t,
+                        args.fg_dilate,
+                        fg_only_class_ids=fg_only_class_ids_3cam,
+                        depth_threshold=fg_depth_threshold_3cam,
+                    )
+                    xL0, yL0, xL1, yL1 = bbox_LC
+                    xC0, yC0, xC1, yC1 = bbox_CR
+                    fg_LC_slice = fg_canvas_t[yL0:yL1, xL0:xL1].contiguous()
+                    fg_CR_slice = fg_canvas_t[yC0:yC1, xC0:xC1].contiguous()
+                    fg_mask_bbox_LC_t = torch.where(
+                        overlap_LC_t > 0,
+                        fg_LC_slice,
+                        torch.zeros_like(fg_LC_slice),
+                    )
+                    fg_mask_bbox_CR_t = torch.where(
+                        overlap_CR_t > 0,
+                        fg_CR_slice,
+                        torch.zeros_like(fg_CR_slice),
+                    )
+                else:
+                    fg_canvas = compute_fg_mask_seg_triplet_canvas_cpu(
+                        fg_segmenter_3cam, fL, fC, fR,
+                        fg_class_ids_3cam,
+                        map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+                        fg_dilate_kernel_3cam,
+                        fg_only_class_ids=fg_only_class_ids_3cam,
+                        depth_threshold=fg_depth_threshold_3cam,
+                    )
+                    xL0, yL0, xL1, yL1 = bbox_LC
+                    xC0, yC0, xC1, yC1 = bbox_CR
+                    fg_mask_bbox_LC = cv2.bitwise_and(
+                        fg_canvas[yL0:yL1, xL0:xL1].copy(),
+                        ctx_LC.overlap,
+                    )
+                    fg_mask_bbox_CR = cv2.bitwise_and(
+                        fg_canvas[yC0:yC1, xC0:xC1].copy(),
+                        ctx_CR.overlap,
+                    )
+
+            # --- Warp the triplet ---
+            if dev["cuda_available"]:
+                t_warp0 = time.perf_counter()
+                warped_L_t, warped_C_t, warped_R_t = warp_triplet_gpu(
+                    fL, fC, fR, grid_triplet_t, gpu_ctx_3cam["device"],
+                    gain_L_t=gain_L_t, gain_C_t=gain_C_t, gain_R_t=gain_R_t,
+                )
+                if prof_3cam is not None:
+                    prof_3cam["warp"].record(
+                        (time.perf_counter() - t_warp0) * 1000
+                    )
+
+                # ---- Async YOLO submit (every yolo_every frames) -------
+                # Best-effort: drop if the worker is still busy with the
+                # previous frame (queue is maxsize=1). We just continue
+                # with whatever mask the worker last published.
+                if frame_idx % args.yolo_every == 0:
+                    try:
+                        yolo_q_3cam.put_nowait((fL, fC, fR))
+                    except queue.Full:
+                        pass
+
+                # ---- Read latest published person mask -----------------
+                with mask_lock_3cam:
+                    latest_mask_3cam = mask_holder_3cam[0]
+                if latest_mask_3cam is not None:
+                    ev = latest_mask_3cam.get("ready_event")
+                    if ev is not None:
+                        # Stream-level wait: the compute stream's next
+                        # cost kernel will wait for the YOLO stream's
+                        # kernels to finish. No host stall.
+                        ev.wait()
+                    person_mask_bbox_LC_t = latest_mask_3cam["person_mask_bbox_LC_t"]
+                    person_mask_bbox_CR_t = latest_mask_3cam["person_mask_bbox_CR_t"]
+                    canvas_person_mask_for_tracker = latest_mask_3cam.get(
+                        "canvas_person_mask"
+                    )
+
+                # ---- Submit warped tensors to async motion worker -----
+                # The worker computes per-overlap motion masks on its own
+                # stream and publishes the result; we read the LATEST
+                # published mask below (could be from frame N-1, which is
+                # within the motion_dilate tolerance for sub-pixel jitter).
+                motion_mask_LC_t = motion_mask_CR_t = None
+                if use_motion_3cam:
+                    try:
+                        warp_event_for_motion = torch.cuda.Event()
+                        warp_event_for_motion.record()
+                        motion_q_3cam.put_nowait(
+                            (warped_L_t, warped_C_t, warped_R_t,
+                             warp_event_for_motion),
+                        )
+                    except queue.Full:
+                        pass  # worker busy; keep using the last published
+                    # Read the latest published motion mask.
+                    with motion_mask_lock_3cam:
+                        latest_motion_3cam = motion_mask_holder_3cam[0]
+                    if latest_motion_3cam is not None:
+                        ev = latest_motion_3cam.get("ready_event")
+                        if ev is not None:
+                            ev.wait()
+                        motion_mask_LC_t = latest_motion_3cam["motion_mask_LC_t"]
+                        motion_mask_CR_t = latest_motion_3cam["motion_mask_CR_t"]
+
+                # ---- L<>C + C<>R cost (one timer for the whole GPU
+                # cost block: it includes the .cpu().numpy() calls at
+                # the end which force a sync, so the wallclock here is
+                # the dominant GPU-bound number per frame).
+                t_cost0 = time.perf_counter()
+                # ---- L<>C cost + seam ----
+                cost_ema_LC_t, cost_for_dp_LC_t = compute_cost_and_ema_gpu(
+                    warped_L_t, warped_C_t, overlap_LC_t,
+                    cost_ema_LC_t, ema_eff,
+                    person_mask_bbox_LC_t,
+                    fg_mask_bbox_LC_t if use_fg_3cam else None,
+                    args.fg_penalty, args.person_penalty,
+                    bbox_LC,
+                    motion_mask_bbox_t=motion_mask_LC_t,
+                    motion_penalty=args.motion_penalty,
+                )
+                if args.seam_edge_margin > 0:
+                    m = min(
+                        args.seam_edge_margin,
+                        cost_for_dp_LC_t.shape[1] // 2,
+                    )
+                    cost_for_dp_LC_t[:, :m] += args.edge_penalty
+                    cost_for_dp_LC_t[:, -m:] += args.edge_penalty
+                if ds > 1:
+                    cost_small_LC_t = F.avg_pool2d(
+                        cost_for_dp_LC_t.unsqueeze(0).unsqueeze(0),
+                        kernel_size=ds, stride=ds,
+                    )[0, 0]
+                else:
+                    cost_small_LC_t = cost_for_dp_LC_t
+                cost_small_LC = cost_small_LC_t.cpu().numpy()
+
+                # ---- C<>R cost + seam ----
+                cost_ema_CR_t, cost_for_dp_CR_t = compute_cost_and_ema_gpu(
+                    warped_C_t, warped_R_t, overlap_CR_t,
+                    cost_ema_CR_t, ema_eff,
+                    person_mask_bbox_CR_t,
+                    fg_mask_bbox_CR_t if use_fg_3cam else None,
+                    args.fg_penalty, args.person_penalty,
+                    bbox_CR,
+                    motion_mask_bbox_t=motion_mask_CR_t,
+                    motion_penalty=args.motion_penalty,
+                )
+                if args.seam_edge_margin > 0:
+                    m = min(
+                        args.seam_edge_margin,
+                        cost_for_dp_CR_t.shape[1] // 2,
+                    )
+                    cost_for_dp_CR_t[:, :m] += args.edge_penalty
+                    cost_for_dp_CR_t[:, -m:] += args.edge_penalty
+                if ds > 1:
+                    cost_small_CR_t = F.avg_pool2d(
+                        cost_for_dp_CR_t.unsqueeze(0).unsqueeze(0),
+                        kernel_size=ds, stride=ds,
+                    )[0, 0]
+                else:
+                    cost_small_CR_t = cost_for_dp_CR_t
+                cost_small_CR = cost_small_CR_t.cpu().numpy()
+                if prof_3cam is not None:
+                    prof_3cam["cost"].record(
+                        (time.perf_counter() - t_cost0) * 1000
+                    )
+            else:
+                if lut_L is not None:
+                    fL_g = apply_gain_lut(fL, lut_L)
+                    fC_g = apply_gain_lut(fC, lut_C)
+                    fR_g = apply_gain_lut(fR, lut_R)
+                else:
+                    fL_g, fC_g, fR_g = fL, fC, fR
+                warped_L = cv2.remap(fL_g, map_Lx, map_Ly, cv2.INTER_LINEAR)
+                warped_C = cv2.remap(fC_g, map_Cx, map_Cy, cv2.INTER_LINEAR)
+                warped_R = cv2.remap(fR_g, map_Rx, map_Ry, cv2.INTER_LINEAR)
+
+                # ---- YOLO triplet (every yolo_every frames; CPU) -------
+                if frame_idx % args.yolo_every == 0:
+                    mL_src, mC_src, mR_src = (
+                        person_segmenter.predict_classes_mask_triplet(
+                            fL, fC, fR, (0,),  # PERSON_CLASS_ID
+                        )
+                    )
+                    mL_canvas = cv2.remap(
+                        mL_src, map_Lx, map_Ly, cv2.INTER_NEAREST,
+                    )
+                    mC_canvas = cv2.remap(
+                        mC_src, map_Cx, map_Cy, cv2.INTER_NEAREST,
+                    )
+                    mR_canvas = cv2.remap(
+                        mR_src, map_Rx, map_Ry, cv2.INTER_NEAREST,
+                    )
+                    union = cv2.bitwise_or(
+                        cv2.bitwise_or(mL_canvas, mC_canvas),
+                        mR_canvas,
+                    )
+                    union = cv2.dilate(union, dilate_kernel_3cam)
+                    canvas_person_mask_for_tracker = (
+                        union.copy() if tracker is not None else None
+                    )
+                    person_mask_bbox_LC = union[
+                        bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]
+                    ].copy()
+                    person_mask_bbox_CR = union[
+                        bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]
+                    ].copy()
+
+                # ---- Per-overlap motion masks (CPU, every frame) -------
+                motion_mask_LC = motion_mask_CR = None
+                if use_motion_3cam:
+                    wL_in_LC = downsample_image_half_cpu(
+                        warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                    ).astype(np.float32)
+                    wC_in_LC = downsample_image_half_cpu(
+                        warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                    ).astype(np.float32)
+                    motion_half_LC = compute_motion_mask_cpu(
+                        wL_in_LC, wC_in_LC,
+                        baseline_L_in_LC, baseline_C_in_LC,
+                        args.motion_threshold, motion_dilate_kernel_3cam,
+                        overlap_in_bbox_motion_LC,
+                    )
+                    motion_mask_LC = upsample_mask_to_bbox_cpu(
+                        motion_half_LC, bbox_shape_LC,
+                    )
+
+                    wC_in_CR = downsample_image_half_cpu(
+                        warped_C[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                    ).astype(np.float32)
+                    wR_in_CR = downsample_image_half_cpu(
+                        warped_R[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                    ).astype(np.float32)
+                    motion_half_CR = compute_motion_mask_cpu(
+                        wC_in_CR, wR_in_CR,
+                        baseline_C_in_CR, baseline_R_in_CR,
+                        args.motion_threshold, motion_dilate_kernel_3cam,
+                        overlap_in_bbox_motion_CR,
+                    )
+                    motion_mask_CR = upsample_mask_to_bbox_cpu(
+                        motion_half_CR, bbox_shape_CR,
+                    )
+
+                # CPU cost: photometric + person penalty + motion penalty.
+                wL_bb_LC = warped_L[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                wC_bb_LC = warped_C[bbox_LC[1]:bbox_LC[3], bbox_LC[0]:bbox_LC[2]]
+                photo_LC = compute_cost_fast_cpu(
+                    wL_bb_LC, wC_bb_LC, ctx_LC.overlap,
+                    np.empty(
+                        (bbox_shape_LC[0], bbox_shape_LC[1], 3),
+                        dtype=np.float32,
+                    ),
+                )
+                if cost_ema_LC is None or cost_ema_LC.shape != photo_LC.shape:
+                    cost_ema_LC = photo_LC.copy()
+                else:
+                    cv2.addWeighted(
+                        photo_LC, ema_eff,
+                        cost_ema_LC, 1.0 - ema_eff, 0, dst=cost_ema_LC,
+                    )
+                cost_for_dp_LC = cost_ema_LC.copy()
+                # Penalty hierarchy (matches 2-cam):
+                #   fg     (lower) where mask AND NOT person
+                #   motion (lower) where mask AND NOT person
+                #   person (highest priority) where mask
+                if use_fg_3cam and fg_mask_bbox_LC is not None and fg_mask_bbox_LC.any():
+                    fg_bool_LC = fg_mask_bbox_LC > 0
+                    if person_mask_bbox_LC is not None:
+                        fg_only_LC = fg_bool_LC & (person_mask_bbox_LC == 0)
+                    else:
+                        fg_only_LC = fg_bool_LC
+                    cost_for_dp_LC[fg_only_LC] += args.fg_penalty
+                if motion_mask_LC is not None and motion_mask_LC.any():
+                    motion_bool_LC = motion_mask_LC > 0
+                    if person_mask_bbox_LC is not None:
+                        motion_only_LC = motion_bool_LC & (person_mask_bbox_LC == 0)
+                    else:
+                        motion_only_LC = motion_bool_LC
+                    cost_for_dp_LC[motion_only_LC] += args.motion_penalty
+                if person_mask_bbox_LC is not None and person_mask_bbox_LC.any():
+                    cost_for_dp_LC[person_mask_bbox_LC > 0] += args.person_penalty
+                add_edge_margin_penalty(
+                    cost_for_dp_LC, args.seam_edge_margin,
+                    edge_penalty=args.edge_penalty,
+                )
+                cost_small_LC = (
+                    cv2.resize(
+                        cost_for_dp_LC,
+                        (
+                            cost_for_dp_LC.shape[1] // ds,
+                            cost_for_dp_LC.shape[0] // ds,
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    ) if ds > 1 else cost_for_dp_LC.copy()
+                )
+
+                wC_bb_CR = warped_C[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                wR_bb_CR = warped_R[bbox_CR[1]:bbox_CR[3], bbox_CR[0]:bbox_CR[2]]
+                photo_CR = compute_cost_fast_cpu(
+                    wC_bb_CR, wR_bb_CR, ctx_CR.overlap,
+                    np.empty(
+                        (bbox_shape_CR[0], bbox_shape_CR[1], 3),
+                        dtype=np.float32,
+                    ),
+                )
+                if cost_ema_CR is None or cost_ema_CR.shape != photo_CR.shape:
+                    cost_ema_CR = photo_CR.copy()
+                else:
+                    cv2.addWeighted(
+                        photo_CR, ema_eff,
+                        cost_ema_CR, 1.0 - ema_eff, 0, dst=cost_ema_CR,
+                    )
+                cost_for_dp_CR = cost_ema_CR.copy()
+                if use_fg_3cam and fg_mask_bbox_CR is not None and fg_mask_bbox_CR.any():
+                    fg_bool_CR = fg_mask_bbox_CR > 0
+                    if person_mask_bbox_CR is not None:
+                        fg_only_CR = fg_bool_CR & (person_mask_bbox_CR == 0)
+                    else:
+                        fg_only_CR = fg_bool_CR
+                    cost_for_dp_CR[fg_only_CR] += args.fg_penalty
+                if motion_mask_CR is not None and motion_mask_CR.any():
+                    motion_bool_CR = motion_mask_CR > 0
+                    if person_mask_bbox_CR is not None:
+                        motion_only_CR = motion_bool_CR & (person_mask_bbox_CR == 0)
+                    else:
+                        motion_only_CR = motion_bool_CR
+                    cost_for_dp_CR[motion_only_CR] += args.motion_penalty
+                if person_mask_bbox_CR is not None and person_mask_bbox_CR.any():
+                    cost_for_dp_CR[person_mask_bbox_CR > 0] += args.person_penalty
+                add_edge_margin_penalty(
+                    cost_for_dp_CR, args.seam_edge_margin,
+                    edge_penalty=args.edge_penalty,
+                )
+                cost_small_CR = (
+                    cv2.resize(
+                        cost_for_dp_CR,
+                        (
+                            cost_for_dp_CR.shape[1] // ds,
+                            cost_for_dp_CR.shape[0] // ds,
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    ) if ds > 1 else cost_for_dp_CR.copy()
+                )
+
+            # --- x_mid seam cap + regularizer + DP -------------------------
+            # Cap is in the small-cost matrix's x coordinate, derived from
+            # x_mid on the canvas: subtract the overlap's x0, then divide
+            # by seam_downscale.
+            t_seam0 = time.perf_counter()
+            cap_LC_in_small = max(0, (x_mid - bbox_LC[0]) // ds)
+            cap_CR_in_small = max(0, (x_mid - bbox_CR[0]) // ds)
+            # Margin: blend_width // ds, so the soft alpha has room to
+            # taper down to 0 by x_mid (in small-cost coords).
+            margin_small = max(1, args.blend_width // ds)
+            add_x_mid_seam_cap(
+                cost_small_LC, cap_LC_in_small,
+                side="right", blend_margin=margin_small,
+            )
+            add_x_mid_seam_cap(
+                cost_small_CR, cap_CR_in_small,
+                side="left", blend_margin=margin_small,
+            )
+            add_seam_regularizer(
+                cost_small_LC, seam_prev_small_LC, args.seam_lambda,
+            )
+            add_seam_regularizer(
+                cost_small_CR, seam_prev_small_CR, args.seam_lambda,
+            )
+            seam_LC_small = find_dp_seam(cost_small_LC)
+            seam_CR_small = find_dp_seam(cost_small_CR)
+            seam_prev_small_LC = seam_LC_small.copy()
+            seam_prev_small_CR = seam_CR_small.copy()
+            seam_LC_full = upscale_seam(seam_LC_small, bbox_shape_LC, ds)
+            seam_CR_full = upscale_seam(seam_CR_small, bbox_shape_CR, ds)
+            if prof_3cam is not None:
+                prof_3cam["seam"].record(
+                    (time.perf_counter() - t_seam0) * 1000
+                )
+
+            # --- Person tracking update -----------------------------------
+            tracking_crop = None
+            if tracker is not None:
+                # The canvas-wide person mask was published by the most
+                # recent YOLO run (could be from up to args.yolo_every
+                # frames ago, but the EMA inside PersonTracker smooths
+                # that latency out). When YOLO hasn't run yet on the
+                # very first frames, canvas_person_mask_for_tracker is
+                # None and the tracker drifts to its centre, which is
+                # the right behaviour for warm-up.
+                tracker.update(
+                    canvas_person_mask_for_tracker,
+                    output_size[0], output_size[1],
+                )
+                tracking_crop = tracker.get_crop_bounds()
+
+            # --- Composite ------------------------------------------------
+            # GPU path: hand off the warped tensors + seams to the async
+            # composite worker (own stream + thread). Records a
+            # compute_done_event on the default stream right before the
+            # put so the composite stream knows when the warps + cost EMAs
+            # are safe to read.
+            if dev["cuda_available"]:
+                compute_done_event = torch.cuda.Event()
+                compute_done_event.record()
+                payload = {
+                    "warped_L_t": warped_L_t,
+                    "warped_C_t": warped_C_t,
+                    "warped_R_t": warped_R_t,
+                    "seam_LC_full": seam_LC_full,
+                    "seam_CR_full": seam_CR_full,
+                    "tracking_crop": tracking_crop,
+                    "timestamp_us": ts_us,
+                    "compute_done_event": compute_done_event,
+                }
+                t_put0 = time.perf_counter()
+                composite_in_q_3cam.put(payload)
+                if prof_3cam is not None:
+                    prof_3cam["composite_put_wait"].record(
+                        (time.perf_counter() - t_put0) * 1000
+                    )
+                if composite_worker_error[0] is not None:
+                    raise composite_worker_error[0]
+            else:
+                stitched = composite_multiband_cpu_3cam(
+                    warped_L, warped_C, warped_R, static_3cam,
+                    seam_LC_full, seam_CR_full,
+                    args.blend_width, args.blend_levels, out_buf_cpu,
+                )
+                if tracking_crop is not None:
+                    x0, x1 = tracking_crop
+                    stitched = stitched[:, x0:x1]
+                    if not stitched.flags["C_CONTIGUOUS"]:
+                        stitched = np.ascontiguousarray(stitched)
+                sink.write(stitched, timestamp_us=ts_us)
+
+            frame_idx += 1
+            frames_since_print += 1
+            if prof_3cam is not None:
+                prof_3cam["main_iter"].record(
+                    (time.perf_counter() - t_iter0) * 1000
+                )
+            now = time.time()
+            if now - last_print > FPS_LOG_INTERVAL_SEC:
+                fps = frames_since_print / max(now - last_print, 1e-6)
+                comp_q_depth = (
+                    composite_in_q_3cam.qsize()
+                    if composite_in_q_3cam is not None else -1
+                )
+                comp_q_str = (
+                    f"composite_q={comp_q_depth}"
+                    if comp_q_depth >= 0 else "composite_q=N/A(CPU)"
+                )
+                print(
+                    f"[info] 3-cam: frame {frame_idx}  "
+                    f"{fps:.1f} fps over last {now - last_print:.1f}s  "
+                    f"({frames_since_print} frames; {comp_q_str})"
+                )
+                last_print = now
+                frames_since_print = 0
+
+            if args.max_frames and frame_idx >= args.max_frames:
+                break
+    finally:
+        # Shut down all async workers (GPU path only). Send SENTINEL, join
+        # briefly. Daemon=True means we don't strictly need this -- but
+        # it makes the run summary deterministic and avoids leaking CUDA
+        # resources when the same process re-spawns _run_3cam from pipe
+        # mode in a new session.
+        def _shutdown_worker(q, thread, name):
+            if q is None or thread is None:
+                return
+            try:
+                q.put_nowait(SENTINEL)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(SENTINEL)
+                except queue.Full:
+                    pass
+            thread.join(timeout=2.0)
+
+        _shutdown_worker(yolo_q_3cam, yolo_thread, "yolo")
+        _shutdown_worker(motion_q_3cam, motion_thread, "motion")
+        _shutdown_worker(composite_in_q_3cam, composite_thread, "composite")
+        prof_stop_3cam.set()
+        if profile_thread_3cam is not None:
+            profile_thread_3cam.join(timeout=1.0)
+        if prof_3cam is not None:
+            _print_profile(
+                prof_3cam, "3-cam final profile (over entire run)", diag,
+            )
+        diag.close()
+        sink.close()
+        source.close()
+
+    print(f"[info] 3-cam: processed {frame_idx} frame(s).")
+    if hasattr(source, "summary_post"):
+        print(source.summary_post())
+    print(args.output and f"[info] Output written to {args.output}"
+          or "[info] Output streamed over pipe (no file path).")
+
+
+# ===========================================================================
+# 3-camera geometry debug image
+# ===========================================================================
+
+def _save_geometry_debug_image_2cam(
+    output_path,
+    canvas_size,
+    H_a_to_canvas, H_b_to_canvas,
+    shape_a, shape_b,
+    crop_rect,
+):
+    """
+    2-cam analogue of _save_geometry_debug_image_3cam. Renders a PNG
+    showing the three quadrangles that define the 2-camera stitching
+    geometry on the FULL pre-autocrop canvas:
+
+      - Camera A footprint        -> green
+      - Camera B footprint        -> red
+      - Autocrop rectangle        -> orange (only when --autocrop)
+
+    A / B are Python's internal naming for the two cameras (cam_0 /
+    cam_1 in pipe mode); in the renderer's labels these map to
+    (Left, Right) for a standard 2-cam portal or to (Left, Center)
+    when the force-2cam pill is on. The PNG doesn't care which is
+    which physically -- the quadrangle layout is what diagnoses the
+    autocrop result.
+
+    See the 3-cam version's docstring for the rationale of using
+    pre-autocrop H matrices + canvas_size with the crop_rect drawn
+    on top.
+    """
+    import cv2
+    import numpy as np
+
+    canvas_w, canvas_h = canvas_size
+    img = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+
+    def _project_polygon(shape, H_to_canvas):
+        h, w = shape[:2]
+        corners = np.float32(
+            [[0, 0], [w, 0], [w, h], [0, h]]
+        ).reshape(-1, 1, 2)
+        warped = cv2.perspectiveTransform(corners, H_to_canvas)
+        return warped.reshape(-1, 2).astype(np.int32)
+
+    A_poly = _project_polygon(shape_a, H_a_to_canvas)
+    B_poly = _project_polygon(shape_b, H_b_to_canvas)
+
+    GREEN  = (0, 200, 0)
+    RED    = (0, 0, 220)
+    ORANGE = (0, 165, 255)
+
+    thickness = max(2, min(canvas_w, canvas_h) // 600)
+
+    cv2.polylines(img, [A_poly], True, GREEN, thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [B_poly], True, RED,   thickness, lineType=cv2.LINE_AA)
+
+    if crop_rect is not None:
+        cx, cy, cw, ch = crop_rect
+        cv2.rectangle(
+            img, (cx, cy), (cx + cw, cy + ch),
+            ORANGE, thickness, lineType=cv2.LINE_AA,
+        )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = max(0.6, min(canvas_w, canvas_h) / 1200)
+    fth = max(1, thickness - 1)
+
+    def _label(text, poly, color):
+        i = int(np.argmin(poly[:, 1]))
+        x, y = int(poly[i, 0]), int(poly[i, 1])
+        x = max(8, min(canvas_w - 200, x + 8))
+        y = max(int(40 * fscale), y + int(30 * fscale))
+        cv2.putText(img, text, (x, y), font, fscale, color, fth, cv2.LINE_AA)
+
+    _label("A", A_poly, GREEN)
+    _label("B", B_poly, RED)
+    if crop_rect is not None:
+        cx, cy, _, _ = crop_rect
+        cv2.putText(
+            img, "Autocrop",
+            (cx + 10, cy + int(40 * fscale)),
+            font, fscale, ORANGE, fth, cv2.LINE_AA,
+        )
+
+    legend_lines = [
+        ("Camera A", GREEN),
+        ("Camera B", RED),
+    ]
+    if crop_rect is not None:
+        legend_lines.append(("Autocrop", ORANGE))
+    leg_x = canvas_w - int(220 * fscale)
+    leg_y = int(40 * fscale)
+    for label, color in legend_lines:
+        cv2.putText(
+            img, label,
+            (leg_x, leg_y), font, fscale, color, fth, cv2.LINE_AA,
+        )
+        leg_y += int(40 * fscale)
+
+    ok = cv2.imwrite(output_path, img)
+    if ok:
+        print(
+            f"[info] 2-cam geometry debug image written to "
+            f"{output_path} ({canvas_w}x{canvas_h})"
+        )
+    else:
+        print(
+            f"[warn] 2-cam geometry debug image FAILED to write to "
+            f"{output_path}"
+        )
+
+
+def _save_geometry_debug_image_3cam(
+    output_path,
+    canvas_size,
+    H_L_to_canvas, H_C_to_canvas, H_R_to_canvas,
+    shape_L, shape_C, shape_R,
+    crop_rect,
+):
+    """
+    Render a PNG to `output_path` showing the four quadrangles that
+    define the 3-camera stitching geometry on the FULL pre-autocrop
+    canvas:
+
+      - Left   camera footprint   -> green
+      - Center camera footprint   -> blue
+      - Right  camera footprint   -> red
+      - Autocrop rectangle        -> orange (only when args.autocrop)
+
+    Used to diagnose cases like "the autocrop is shrinking output to a
+    thin band": the image shows whether each camera's projected
+    footprint actually overlaps the others vertically. If only a thin
+    horizontal strip is covered by all three (intersection), that's
+    all the autocrop can preserve.
+
+    Coordinates: the camera footprints are drawn using the
+    PRE-autocrop H_*_to_canvas matrices (the canvas is at full
+    canvas_size, NOT cropped). The autocrop rectangle, when present,
+    is drawn at its native canvas coordinates so the user sees how
+    much of the canvas is being kept.
+    """
+    import cv2  # local import: helper only runs when --debug_geometry set
+    import numpy as np
+
+    canvas_w, canvas_h = canvas_size
+    img = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+
+    def _project_polygon(shape, H_to_canvas):
+        h, w = shape[:2]
+        corners = np.float32(
+            [[0, 0], [w, 0], [w, h], [0, h]]
+        ).reshape(-1, 1, 2)
+        warped = cv2.perspectiveTransform(corners, H_to_canvas)
+        return warped.reshape(-1, 2).astype(np.int32)
+
+    L_poly = _project_polygon(shape_L, H_L_to_canvas)
+    C_poly = _project_polygon(shape_C, H_C_to_canvas)
+    R_poly = _project_polygon(shape_R, H_R_to_canvas)
+
+    # OpenCV uses BGR.
+    GREEN  = (0, 200, 0)
+    BLUE   = (220, 100, 0)   # a brighter blue than pure (255, 0, 0) so it
+                             # reads cleanly against the dark grey background
+    RED    = (0, 0, 220)
+    ORANGE = (0, 165, 255)
+
+    thickness = max(2, min(canvas_w, canvas_h) // 600)
+
+    cv2.polylines(img, [L_poly], True, GREEN,  thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [C_poly], True, BLUE,   thickness, lineType=cv2.LINE_AA)
+    cv2.polylines(img, [R_poly], True, RED,    thickness, lineType=cv2.LINE_AA)
+
+    if crop_rect is not None:
+        cx, cy, cw, ch = crop_rect
+        cv2.rectangle(
+            img, (cx, cy), (cx + cw, cy + ch),
+            ORANGE, thickness, lineType=cv2.LINE_AA,
+        )
+
+    # Per-quadrangle label, placed near the top-left of each
+    # footprint. Helps when two footprints overlap and the colour code
+    # alone isn't enough to disambiguate.
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fscale = max(0.6, min(canvas_w, canvas_h) / 1200)
+    fth = max(1, thickness - 1)
+
+    def _label(text, poly, color):
+        # Anchor at the polygon's topmost vertex; nudge inward a bit
+        # so the text isn't clipped at the canvas edge.
+        i = int(np.argmin(poly[:, 1]))
+        x, y = int(poly[i, 0]), int(poly[i, 1])
+        x = max(8, min(canvas_w - 200, x + 8))
+        y = max(int(40 * fscale), y + int(30 * fscale))
+        cv2.putText(img, text, (x, y), font, fscale, color, fth,
+                    cv2.LINE_AA)
+
+    _label("Left",   L_poly, GREEN)
+    _label("Center", C_poly, BLUE)
+    _label("Right",  R_poly, RED)
+    if crop_rect is not None:
+        cx, cy, _, _ = crop_rect
+        cv2.putText(
+            img, "Autocrop",
+            (cx + 10, cy + int(40 * fscale)),
+            font, fscale, ORANGE, fth, cv2.LINE_AA,
+        )
+
+    # Legend in the top-right corner so the colour code is documented
+    # on the image itself.
+    legend_lines = [
+        ("Left",     GREEN),
+        ("Center",   BLUE),
+        ("Right",    RED),
+    ]
+    if crop_rect is not None:
+        legend_lines.append(("Autocrop", ORANGE))
+    leg_x = canvas_w - int(220 * fscale)
+    leg_y = int(40 * fscale)
+    for label, color in legend_lines:
+        cv2.putText(
+            img, label,
+            (leg_x, leg_y), font, fscale, color, fth, cv2.LINE_AA,
+        )
+        leg_y += int(40 * fscale)
+
+    ok = cv2.imwrite(output_path, img)
+    if ok:
+        print(
+            f"[info] 3-cam geometry debug image written to "
+            f"{output_path} ({canvas_w}x{canvas_h})"
+        )
+    else:
+        print(
+            f"[warn] 3-cam geometry debug image FAILED to write to "
+            f"{output_path}"
+        )

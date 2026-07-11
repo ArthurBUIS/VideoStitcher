@@ -327,6 +327,113 @@ class PersonSegmenter:
             out.append(mask)
         return out[0], out[1]
 
+    # ------------------------------------------------------------------
+    # 3-frame variants -- mirror predict_classes_mask_pair* with one more
+    # frame in the batch. Same letterboxing-on-mismatch caveat applies.
+    # ------------------------------------------------------------------
+
+    def predict_classes_mask_triplet_gpu(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        target_hw_L, target_hw_C, target_hw_R,
+        class_ids=(PERSON_CLASS_ID,),
+    ):
+        """
+        Three-frame GPU inference. Batched into a single model.predict call
+        when all three source frames share a shape (the portal case);
+        otherwise falls back to three independent calls so each frame gets
+        its own letterboxing.
+        """
+        if (frame_L_bgr.shape == frame_C_bgr.shape
+                and frame_C_bgr.shape == frame_R_bgr.shape):
+            return self._predict_classes_mask_triplet_batched_gpu(
+                frame_L_bgr, frame_C_bgr, frame_R_bgr,
+                target_hw_L, target_hw_C, target_hw_R,
+                class_ids,
+            )
+        mask_L = self.predict_classes_mask_gpu(frame_L_bgr, target_hw_L, class_ids)
+        mask_C = self.predict_classes_mask_gpu(frame_C_bgr, target_hw_C, class_ids)
+        mask_R = self.predict_classes_mask_gpu(frame_R_bgr, target_hw_R, class_ids)
+        return mask_L, mask_C, mask_R
+
+    def _predict_classes_mask_triplet_batched_gpu(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        target_hw_L, target_hw_C, target_hw_R,
+        class_ids,
+    ):
+        results = self.model.predict(
+            [frame_L_bgr, frame_C_bgr, frame_R_bgr],
+            classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        targets = (target_hw_L, target_hw_C, target_hw_R)
+        for i, target_hw in enumerate(targets):
+            H_tgt, W_tgt = target_hw
+            if not results or i >= len(results):
+                out.append(torch.zeros(
+                    (H_tgt, W_tgt), dtype=torch.uint8, device=self.device,
+                ))
+                continue
+            r = results[i]
+            if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
+                out.append(torch.zeros(
+                    (H_tgt, W_tgt), dtype=torch.uint8, device=self.device,
+                ))
+                continue
+            mdata = r.masks.data
+            merged = (mdata > 0.5).any(dim=0).float()
+            m = merged.unsqueeze(0).unsqueeze(0)
+            m = F.interpolate(m, size=(H_tgt, W_tgt), mode="nearest")
+            out.append((m[0, 0] * 255).to(torch.uint8))
+        return out[0], out[1], out[2]
+
+    def predict_classes_mask_triplet(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr,
+        class_ids=(PERSON_CLASS_ID,),
+    ):
+        """CPU/numpy variant of predict_classes_mask_triplet_gpu."""
+        if (frame_L_bgr.shape == frame_C_bgr.shape
+                and frame_C_bgr.shape == frame_R_bgr.shape):
+            return self._predict_classes_mask_triplet_batched(
+                frame_L_bgr, frame_C_bgr, frame_R_bgr, class_ids,
+            )
+        mask_L = self.predict_classes_mask(frame_L_bgr, class_ids)
+        mask_C = self.predict_classes_mask(frame_C_bgr, class_ids)
+        mask_R = self.predict_classes_mask(frame_R_bgr, class_ids)
+        return mask_L, mask_C, mask_R
+
+    def _predict_classes_mask_triplet_batched(
+        self,
+        frame_L_bgr, frame_C_bgr, frame_R_bgr, class_ids,
+    ):
+        results = self.model.predict(
+            [frame_L_bgr, frame_C_bgr, frame_R_bgr],
+            classes=list(class_ids),
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        out = []
+        frames = (frame_L_bgr, frame_C_bgr, frame_R_bgr)
+        for i, frame_bgr in enumerate(frames):
+            H, W = frame_bgr.shape[:2]
+            mask = np.zeros((H, W), dtype=np.uint8)
+            if results and i < len(results):
+                r = results[i]
+                if r.masks is not None and r.masks.data is not None \
+                        and len(r.masks.data) > 0:
+                    mdata = r.masks.data.cpu().numpy()
+                    merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
+                    mask = cv2.resize(
+                        merged_small, (W, H),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+            out.append(mask)
+        return out[0], out[1], out[2]
+
 
 def _depth_filter_keep_mask(yolo_result, fg_only_class_ids,
                             depth_map_norm, depth_threshold):
@@ -469,3 +576,122 @@ def compute_fg_mask_seg_cpu(segmenter, frame_a, frame_b, class_ids,
     x0, y0, x1, y1 = overlap_bbox
     fg_bbox = union[y0:y1, x0:x1].copy()
     return cv2.bitwise_and(fg_bbox, overlap_in_bbox)
+
+
+def compute_fg_mask_seg_triplet_canvas_gpu(
+    segmenter,
+    frame_L, frame_C, frame_R,
+    class_ids,
+    grid_L_t, grid_C_t, grid_R_t,
+    dilate_radius,
+    fg_only_class_ids=None,
+    depth_threshold=None,
+):
+    """
+    3-camera static foreground mask (GPU). Same algorithm as
+    compute_fg_mask_seg_gpu but with three source frames whose warped
+    masks get unioned, dilated, and returned as a CANVAS-WIDE uint8
+    tensor (NOT cropped to a single overlap bbox -- the 3-cam caller
+    slices it into bbox_LC and bbox_CR itself).
+
+    The depth filter, when configured, runs Depth Anything V2 on each
+    of the three source frames independently.
+    """
+    H_L, W_L = frame_L.shape[:2]
+    H_C, W_C = frame_C.shape[:2]
+    H_R, W_R = frame_R.shape[:2]
+
+    if fg_only_class_ids and depth_threshold is not None:
+        from stitcher.depth_estimation import estimate_depth, normalize_depth
+        depth_L = normalize_depth(estimate_depth(frame_L))
+        depth_C = normalize_depth(estimate_depth(frame_C))
+        depth_R = normalize_depth(estimate_depth(frame_R))
+        mask_L_src_t = segmenter.predict_filtered_mask_gpu(
+            frame_L, (H_L, W_L), class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_L,
+            depth_threshold=depth_threshold,
+        )
+        mask_C_src_t = segmenter.predict_filtered_mask_gpu(
+            frame_C, (H_C, W_C), class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_C,
+            depth_threshold=depth_threshold,
+        )
+        mask_R_src_t = segmenter.predict_filtered_mask_gpu(
+            frame_R, (H_R, W_R), class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_R,
+            depth_threshold=depth_threshold,
+        )
+    else:
+        mask_L_src_t = segmenter.predict_classes_mask_gpu(
+            frame_L, (H_L, W_L), class_ids,
+        )
+        mask_C_src_t = segmenter.predict_classes_mask_gpu(
+            frame_C, (H_C, W_C), class_ids,
+        )
+        mask_R_src_t = segmenter.predict_classes_mask_gpu(
+            frame_R, (H_R, W_R), class_ids,
+        )
+
+    mask_L_canvas_t = warp_mask_gpu(mask_L_src_t, grid_L_t)
+    mask_C_canvas_t = warp_mask_gpu(mask_C_src_t, grid_C_t)
+    mask_R_canvas_t = warp_mask_gpu(mask_R_src_t, grid_R_t)
+    union_t = torch.bitwise_or(
+        torch.bitwise_or(mask_L_canvas_t, mask_C_canvas_t),
+        mask_R_canvas_t,
+    )
+    if dilate_radius > 0:
+        union_t = dilate_gpu(union_t, dilate_radius)
+    return union_t
+
+
+def compute_fg_mask_seg_triplet_canvas_cpu(
+    segmenter,
+    frame_L, frame_C, frame_R,
+    class_ids,
+    map_Lx, map_Ly, map_Cx, map_Cy, map_Rx, map_Ry,
+    fg_dilate_kernel,
+    fg_only_class_ids=None,
+    depth_threshold=None,
+):
+    """CPU variant of compute_fg_mask_seg_triplet_canvas_gpu. Returns
+    a canvas-wide uint8 numpy mask."""
+    if fg_only_class_ids and depth_threshold is not None:
+        from stitcher.depth_estimation import estimate_depth, normalize_depth
+        depth_L = normalize_depth(estimate_depth(frame_L))
+        depth_C = normalize_depth(estimate_depth(frame_C))
+        depth_R = normalize_depth(estimate_depth(frame_R))
+        mask_L_src = segmenter.predict_filtered_mask(
+            frame_L, class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_L,
+            depth_threshold=depth_threshold,
+        )
+        mask_C_src = segmenter.predict_filtered_mask(
+            frame_C, class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_C,
+            depth_threshold=depth_threshold,
+        )
+        mask_R_src = segmenter.predict_filtered_mask(
+            frame_R, class_ids,
+            fg_only_class_ids=fg_only_class_ids,
+            depth_map_norm=depth_R,
+            depth_threshold=depth_threshold,
+        )
+    else:
+        mask_L_src = segmenter.predict_classes_mask(frame_L, class_ids)
+        mask_C_src = segmenter.predict_classes_mask(frame_C, class_ids)
+        mask_R_src = segmenter.predict_classes_mask(frame_R, class_ids)
+    mask_L_canvas = cv2.remap(mask_L_src, map_Lx, map_Ly, cv2.INTER_NEAREST)
+    mask_C_canvas = cv2.remap(mask_C_src, map_Cx, map_Cy, cv2.INTER_NEAREST)
+    mask_R_canvas = cv2.remap(mask_R_src, map_Rx, map_Ry, cv2.INTER_NEAREST)
+    union = cv2.bitwise_or(
+        cv2.bitwise_or(mask_L_canvas, mask_C_canvas),
+        mask_R_canvas,
+    )
+    if fg_dilate_kernel is not None:
+        union = cv2.dilate(union, fg_dilate_kernel)
+    return union

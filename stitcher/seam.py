@@ -248,3 +248,68 @@ def add_seam_regularizer(cost, seam_prev_small, lam):
     dx = col_idx - seam_prev_col
     penalty = (dx * dx) * float(lam)
     cost += penalty
+
+
+# ---------------------------------------------------------------------------
+# 3-camera: x_mid seam cap
+# ---------------------------------------------------------------------------
+
+def add_x_mid_seam_cap(cost, x_cap_in_bbox, side, blend_margin,
+                       cap_penalty=EDGE_PENALTY):
+    """
+    In-place: forbid the seam from crossing a fixed canvas x coordinate
+    by adding a high-cost band to one side of `x_cap_in_bbox` in the
+    cost map.
+
+    Used in the 3-camera path to keep the two DP seams spatially
+    disjoint: seam_LC must stay <= x_mid (we cap its right side),
+    seam_CR must stay >= x_mid (we cap its left side). With both seams
+    in disjoint canvas columns, the existing 2-camera DP, multi-band
+    blend, and soft-alpha-mask logic all work unchanged on each side.
+
+    Parameters
+    ----------
+    cost            : (H, W) cost matrix, in bbox coords (downscaled
+                      or full, whichever DP runs on).
+    x_cap_in_bbox   : the x_mid canvas coordinate, expressed in the
+                      cost matrix's column space (caller subtracts the
+                      bbox x-origin and divides by seam_downscale).
+    side            : 'right' to forbid x >= x_cap_in_bbox (use for
+                      seam_LC, the LEFT overlap's seam, which must stay
+                      to the left of x_mid).
+                      'left'  to forbid x <= x_cap_in_bbox (use for
+                      seam_CR).
+    blend_margin    : extra columns on the cap side that also get
+                      penalised, so the soft-alpha transition (~half
+                      of blend_width) has room to taper to 0 before
+                      hitting the cap. Typically blend_width // 2.
+    cap_penalty     : magnitude of the penalty band, default
+                      EDGE_PENALTY (1e6) -- same scale as
+                      add_edge_margin_penalty so the seam is reliably
+                      excluded but DP doesn't overflow.
+
+    No-op if the cap falls outside the cost matrix or if `cost` is
+    empty.
+    """
+    if cost.size == 0:
+        return
+    H, W = cost.shape
+    margin = max(0, int(blend_margin))
+    cap = int(x_cap_in_bbox)
+    if side == "right":
+        # Forbid the seam past x_cap_in_bbox - margin (so the soft
+        # alpha can taper to 0 by x_cap_in_bbox).
+        cap_with_margin = max(0, cap - margin)
+        if cap_with_margin >= W:
+            return
+        cost[:, cap_with_margin:] += cap_penalty
+    elif side == "left":
+        cap_with_margin = min(W, cap + margin)
+        if cap_with_margin <= 0:
+            return
+        cost[:, :cap_with_margin] += cap_penalty
+    else:
+        raise ValueError(
+            f"add_x_mid_seam_cap: side must be 'left' or 'right', "
+            f"got {side!r}"
+        )
