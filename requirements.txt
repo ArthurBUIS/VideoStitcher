@@ -1,0 +1,19 @@
+# Core runtime dependencies for the stitching pipeline (file mode and --io pipe mode).
+# Install into the Python that will run the sidecar:
+#   python -m pip install -r requirements.txt
+#
+# GPU note: the default torch wheel is CPU-only. On a CUDA machine install the
+# matching CUDA build instead (https://pytorch.org/get-started/locally/) —
+# every pipeline stage auto-detects CUDA via stitcher/device.py.
+opencv-python>=4.8
+numpy>=1.26
+torch>=2.1
+ultralytics>=8.1
+
+# Strongly recommended: ~5x faster seam dynamic programming (numpy fallback exists).
+numba>=0.59
+
+# Optional: depth-aware static-foreground filter (Depth Anything V2 via HuggingFace).
+# Only needed when the FOREGROUND_ONLY vocab tier is in use (default config uses it).
+transformers>=4.40
+pillow>=10.0
