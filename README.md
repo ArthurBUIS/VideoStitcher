@@ -91,6 +91,23 @@ Run `python video_stitcher_seam_gpu.py --help` to see every flag.
 The top-of-file docstring documents each flag with rationale, defaults,
 and tuning guidance.
 
+## Portals Electron integration (`--io pipe`)
+
+The Shared Studios Portal Agent (portals-projector-agent, branch
+`wip/stitching`) runs this repo as an in-call sidecar: it spawns
+
+```bash
+python video_stitcher_seam_gpu.py --io pipe --control_port <P1> --frames_port <P2> ...
+```
+
+streams 2-3 live camera feeds in over localhost TCP, and sends the
+stitched panorama to the video call in place of the single-camera
+stream. The wire contract lives in `docs/integration-protocol.md`;
+`tools/check_env.py` is the dependency probe the agent runs before
+spawning, and `requirements.txt` is what its `npm run stitcher:setup`
+installs. Host-side reference implementations: `tools/test_pipe_harness.py`
+and `tools/test_pipe_e2e.py`.
+
 ## Repository layout
 
 ```
