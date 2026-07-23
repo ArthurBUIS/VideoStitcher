@@ -308,7 +308,8 @@ def run(args):
           f"gain_comp={not args.no_gain_comp}  "
           f"cost_ema={ema_eff}  "
           f"blend_width={args.blend_width}  "
-          f"blend_levels={args.blend_levels}")
+          f"blend_levels={args.blend_levels}  "
+          f"blending={not getattr(args, 'no_blending', False)}")
     print(f"[info] seam_lambda={args.seam_lambda}  "
           f"seam_edge_margin={args.seam_edge_margin}")
 
@@ -1002,6 +1003,7 @@ def run(args):
                 static, seam_x_full,
                 args.blend_width, args.blend_levels,
                 pinned, gpu_ctx,
+                no_blending=getattr(args, "no_blending", False),
             )
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
@@ -1049,6 +1051,7 @@ def run(args):
             payload["warped_a"], payload["warped_b"],
             static, seam_x_full,
             args.blend_width, args.blend_levels, out_buf,
+            no_blending=getattr(args, "no_blending", False),
         )
         if args.debug_mask:
             # Layer FG (yellow) < motion (blue) < person (red).

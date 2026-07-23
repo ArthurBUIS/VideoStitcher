@@ -258,6 +258,14 @@ Multi-band blending:
                                 low-frequency blending (better exposure
                                 hiding) at the cost of more pyrDown /
                                 pyrUp per frame. Default: 3.
+    --no_blending               Disable blending entirely: hard-cut the
+                                two frames at the DP seam (A left of the
+                                seam, B right). Faster, and useful for
+                                inspecting the raw seam placement, but
+                                the seam is visible wherever the cameras
+                                differ in exposure or alignment.
+                                --blend_width and --blend_levels are
+                                ignored.
 
 Usage
 -----
@@ -377,6 +385,11 @@ def main():
     parser.add_argument("--no_cost_ema", action="store_true")
     parser.add_argument("--blend_width", type=int, default=60)
     parser.add_argument("--blend_levels", type=int, default=3)
+    parser.add_argument("--no_blending", action="store_true",
+                        help="Disable multi-band blending: hard-cut the "
+                             "two frames at the DP seam instead. "
+                             "--blend_width and --blend_levels are "
+                             "ignored.")
     parser.add_argument("--seam_lambda", type=float, default=8.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
     parser.add_argument("--person_penalty", type=float, default=PERSON_PENALTY,

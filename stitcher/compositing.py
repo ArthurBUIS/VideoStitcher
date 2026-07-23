@@ -135,7 +135,8 @@ def _reconstruct_from_laplacian_torch(lp, kernel2d):
 
 
 def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
-                              blend_width, blend_levels, gpu_ctx):
+                              blend_width, blend_levels, gpu_ctx,
+                              no_blending=False):
     """
     Shared multi-band Laplacian blend on GPU.
 
@@ -162,6 +163,11 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
     x0, y0, x1, y1 = static["overlap_bbox"]
     H_bb = y1 - y0
     W_bb = x1 - x0
+
+    if no_blending:
+        # Hard cut at the seam: the "blend" only touches the seam
+        # column itself, so the strip collapses to the seam's x-range.
+        blend_width = 0
 
     # Strip x-range in bbox-local coords.
     seam_min = int(seam_x_full.min())
@@ -219,35 +225,46 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
     }
     seam_x_strip = (seam_x_full.astype(np.int32) - x_strip_min)
     seam_x_strip = np.clip(seam_x_strip, 0, strip_w - 1)
-    mask_strip_np = build_soft_mask_fast(
-        seam_x_strip, (H_bb, strip_w), strip_static, blend_width,
-    )
-    mask_strip_t = torch.from_numpy(mask_strip_np).to(device, non_blocking=True)
 
-    # Batch A and B together so each pyramid level is built with ONE
-    # conv2d kernel launch per pyrDown/pyrUp instead of two. ab_f has
-    # shape (2, 3, H_bb, strip_w); kernel halve per-level fused across
-    # both images. Mask stays (1, 1, H, W) since it has different
-    # channel count.
-    a_f = a_strip_filled.float().unsqueeze(0)            # (1, 3, H, W)
-    b_f = b_strip_filled.float().unsqueeze(0)            # (1, 3, H, W)
-    ab_f = torch.cat([a_f, b_f], dim=0)                  # (2, 3, H, W)
-    m_f = mask_strip_t.unsqueeze(0).unsqueeze(0)         # (1, 1, H, W)
+    if no_blending:
+        # Hard cut: A strictly left of the seam, B at and right of it.
+        # Same orientation as build_soft_mask_fast's hard mask.
+        seam_t = torch.from_numpy(seam_x_strip).to(device).view(-1, 1)
+        col_idx = torch.arange(strip_w, device=device).view(1, -1)
+        hard_m = (col_idx < seam_t).unsqueeze(0)     # (1, H_bb, strip_w)
+        blended_strip_t = torch.where(hard_m, a_strip_filled, b_strip_filled)
+    else:
+        mask_strip_np = build_soft_mask_fast(
+            seam_x_strip, (H_bb, strip_w), strip_static, blend_width,
+        )
+        mask_strip_t = torch.from_numpy(mask_strip_np).to(device,
+                                                          non_blocking=True)
 
-    min_dim = min(H_bb, strip_w)
-    max_levels = max(1, int(np.log2(min_dim)) - 2)
-    levels = min(blend_levels, max_levels)
+        # Batch A and B together so each pyramid level is built with ONE
+        # conv2d kernel launch per pyrDown/pyrUp instead of two. ab_f has
+        # shape (2, 3, H_bb, strip_w); kernel halve per-level fused across
+        # both images. Mask stays (1, 1, H, W) since it has different
+        # channel count.
+        a_f = a_strip_filled.float().unsqueeze(0)        # (1, 3, H, W)
+        b_f = b_strip_filled.float().unsqueeze(0)        # (1, 3, H, W)
+        ab_f = torch.cat([a_f, b_f], dim=0)              # (2, 3, H, W)
+        m_f = mask_strip_t.unsqueeze(0).unsqueeze(0)     # (1, 1, H, W)
 
-    lp_ab = _build_laplacian_pyramid_torch(ab_f, levels, kernel2d)
-    gp_m = _build_gaussian_pyramid_torch(m_f, levels, kernel2d)
+        min_dim = min(H_bb, strip_w)
+        max_levels = max(1, int(np.log2(min_dim)) - 2)
+        levels = min(blend_levels, max_levels)
 
-    # torch.lerp(start, end, weight) = start + weight * (end - start)
-    # so lerp(B, A, gm) = B + gm*(A - B) = A*gm + B*(1-gm). One fused
-    # op per level instead of two muls + one add.
-    blended_lp = [torch.lerp(lp_ab[i][1:2], lp_ab[i][0:1], gp_m[i])
-                  for i in range(len(lp_ab))]
-    recon = _reconstruct_from_laplacian_torch(blended_lp, kernel2d).clamp(0, 255)
-    blended_strip_t = recon[0].to(torch.uint8).contiguous()  # (3, H_bb, strip_w)
+        lp_ab = _build_laplacian_pyramid_torch(ab_f, levels, kernel2d)
+        gp_m = _build_gaussian_pyramid_torch(m_f, levels, kernel2d)
+
+        # torch.lerp(start, end, weight) = start + weight * (end - start)
+        # so lerp(B, A, gm) = B + gm*(A - B) = A*gm + B*(1-gm). One fused
+        # op per level instead of two muls + one add.
+        blended_lp = [torch.lerp(lp_ab[i][1:2], lp_ab[i][0:1], gp_m[i])
+                      for i in range(len(lp_ab))]
+        recon = _reconstruct_from_laplacian_torch(blended_lp,
+                                                  kernel2d).clamp(0, 255)
+        blended_strip_t = recon[0].to(torch.uint8).contiguous()
 
     valid_strip = (gpu_ctx["valid_in_bbox_t"][:, x_strip_min:x_strip_max]
                    > 0).unsqueeze(0)
@@ -261,7 +278,7 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
 
 def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
                                    blend_width, blend_levels,
-                                   pinned_buf, gpu_ctx):
+                                   pinned_buf, gpu_ctx, no_blending=False):
     """
     Asynchronous GPU composite.
 
@@ -282,7 +299,7 @@ def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
     """
     out_t = _composite_to_gpu_tensor(
         warped_a_t, warped_b_t, static, seam_x_full,
-        blend_width, blend_levels, gpu_ctx,
+        blend_width, blend_levels, gpu_ctx, no_blending=no_blending,
     )
     out_hwc = out_t.permute(1, 2, 0).contiguous()
     pinned_buf.copy_(out_hwc, non_blocking=True)
@@ -355,7 +372,8 @@ def blend_pyramids_fast_cpu(lp_a, lp_b, gp_m):
 
 
 def composite_multiband_cpu(warped_a, warped_b, static, seam_x_full,
-                            blend_width, blend_levels, out_buf):
+                            blend_width, blend_levels, out_buf,
+                            no_blending=False):
     """CPU multi-band Laplacian blend using cv2.pyrDown / pyrUp."""
     x0, y0, x1, y1 = static["overlap_bbox"]
     out_buf.fill(0)
@@ -367,19 +385,26 @@ def composite_multiband_cpu(warped_a, warped_b, static, seam_x_full,
     a_bb = warped_a[y0:y1, x0:x1]
     b_bb = warped_b[y0:y1, x0:x1]
     a_bb_pad, b_bb_pad = fill_invalid_with_other_cpu(a_bb, b_bb, static)
-    mask_f32 = build_soft_mask_fast(seam_x_full, bbox_shape, static, blend_width)
-    min_dim = min(a_bb_pad.shape[:2])
-    max_levels = max(1, int(np.log2(min_dim)) - 2)
-    levels = min(blend_levels, max_levels)
-    a_f = a_bb_pad.astype(np.float32)
-    b_f = b_bb_pad.astype(np.float32)
-    lp_a = build_laplacian_pyramid_cpu(a_f, levels)
-    lp_b = build_laplacian_pyramid_cpu(b_f, levels)
-    gp_m = build_gaussian_pyramid_cpu(mask_f32, levels)
-    blended_lp = blend_pyramids_fast_cpu(lp_a, lp_b, gp_m)
-    recon = reconstruct_from_laplacian_cpu(blended_lp)
-    np.clip(recon, 0, 255, out=recon)
-    blended_bb = recon.astype(np.uint8)
+    if no_blending:
+        # Hard cut: A strictly left of the seam, B at and right of it.
+        col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
+        hard = col_idx < seam_x_full[:, None]
+        blended_bb = np.where(hard[:, :, None], a_bb_pad, b_bb_pad)
+    else:
+        mask_f32 = build_soft_mask_fast(seam_x_full, bbox_shape, static,
+                                        blend_width)
+        min_dim = min(a_bb_pad.shape[:2])
+        max_levels = max(1, int(np.log2(min_dim)) - 2)
+        levels = min(blend_levels, max_levels)
+        a_f = a_bb_pad.astype(np.float32)
+        b_f = b_bb_pad.astype(np.float32)
+        lp_a = build_laplacian_pyramid_cpu(a_f, levels)
+        lp_b = build_laplacian_pyramid_cpu(b_f, levels)
+        gp_m = build_gaussian_pyramid_cpu(mask_f32, levels)
+        blended_lp = blend_pyramids_fast_cpu(lp_a, lp_b, gp_m)
+        recon = reconstruct_from_laplacian_cpu(blended_lp)
+        np.clip(recon, 0, 255, out=recon)
+        blended_bb = recon.astype(np.uint8)
     valid_in_bbox = cv2.bitwise_or(static["mask_a_in_bbox"],
                                    static["mask_b_in_bbox"])
     cv2.copyTo(blended_bb, valid_in_bbox, out_buf[y0:y1, x0:x1])
