@@ -75,6 +75,103 @@ def _print_profile(prof, header):
         print(f"  {name:<20s} {t.summary()}")
     print()
 
+
+class _StageProfiler:
+    """Fine-grained per-stage latency accumulator for --profile_stages.
+
+    Unlike the --profile StageTimer set (host-side durations in a fully
+    overlapped pipeline), this measures TRUE per-stage latencies: on
+    CUDA every begin/end synchronises the calling thread's stream, so
+    each measured window contains exactly that stage's GPU work. The
+    syncs break the pipeline overlap — a --profile_stages run is slower
+    end-to-end than an unprofiled run, so use it for the per-stage
+    breakdown and a separate run for throughput.
+    """
+
+    def __init__(self, cuda_available):
+        self.cuda = cuda_available
+        self.lock = threading.Lock()
+        self.stages = {}  # name -> [total_ms, count]
+
+    def add(self, name, ms):
+        with self.lock:
+            entry = self.stages.setdefault(name, [0.0, 0])
+            entry[0] += ms
+            entry[1] += 1
+
+    def totals(self, name):
+        with self.lock:
+            total, count = self.stages.get(name, (0.0, 0))
+            return total, count
+
+
+def _stage_begin(sprof):
+    """Open a --profile_stages window. Returns t0, or None when off."""
+    if sprof is None:
+        return None
+    if sprof.cuda:
+        torch.cuda.current_stream().synchronize()
+    return time.perf_counter()
+
+
+def _stage_end(sprof, name, t0):
+    """Close a --profile_stages window opened by _stage_begin."""
+    if sprof is None:
+        return
+    if sprof.cuda:
+        torch.cuda.current_stream().synchronize()
+    sprof.add(name, (time.perf_counter() - t0) * 1000.0)
+
+
+# Table rows for the --profile_stages report: (label, stage keys summed
+# into that row). Labels match the paper's timing-breakdown table.
+_STAGE_TABLE_ROWS = [
+    ("Warping (both frames)", ("warp",)),
+    ("Segmentation (person + foreground)", ("segmentation_person",
+                                            "segmentation_fg")),
+    ("Motion detection", ("motion",)),
+    ("Cost map + penalties + EMA", ("cost_map",)),
+    ("DP seam extraction", ("dp_seam",)),
+    ("Multi-band blending", ("blend",)),
+    ("Encode / write", ("encode_write",)),
+]
+
+
+def _print_stage_report(sprof, n_frames):
+    if n_frames <= 0:
+        return
+    rows = []
+    for label, keys in _STAGE_TABLE_ROWS:
+        total = sum(sprof.totals(k)[0] for k in keys)
+        rows.append((label, total / n_frames))
+    grand = sum(ms for _, ms in rows)
+    if grand <= 0:
+        return
+    print()
+    print(f"=== per-stage breakdown (--profile_stages, {n_frames} frames) ===")
+    print("Amortized ms/frame: async stages (segmentation, motion) run "
+          "less often than every frame; their total time is spread over "
+          "all frames so the rows sum consistently.")
+    for label, ms in rows:
+        print(f"  {label:<38s} {ms:8.2f} ms/frame  {100.0 * ms / grand:5.1f}%")
+    print(f"  {'Total (sum of stages)':<38s} {grand:8.2f} ms/frame  100.0%")
+    per_call = []
+    for key, label in (("segmentation_person", "person segm."),
+                       ("segmentation_fg", "FG segm."),
+                       ("motion", "motion")):
+        total, count = sprof.totals(key)
+        if count:
+            per_call.append(f"{label} {total / count:.2f} ms/call x{count}")
+    if per_call:
+        print("  async per-invocation: " + ", ".join(per_call))
+    print()
+    print("LaTeX rows:")
+    for label, ms in rows:
+        print(f"  {label} & {ms:.1f} & {100.0 * ms / grand:.0f}\\% \\\\")
+    print(f"  \\textbf{{Total}} & \\textbf{{{grand:.1f}}} & "
+          f"\\textbf{{100\\%}} \\\\")
+    print()
+
 import cv2
 import numpy as np
 import torch
@@ -714,11 +811,24 @@ def run(args):
               f"smooth {args.person_tracking_smooth_seconds:.1f}s, "
               f"drift {args.person_tracking_drift_seconds:.1f}s).")
 
+    # Fine-grained per-stage profiler (--profile_stages). Every stage
+    # boundary syncs the calling thread's CUDA stream, so per-stage
+    # numbers are true latencies but end-to-end fps is NOT representative.
+    sprof = (_StageProfiler(dev["cuda_available"])
+             if getattr(args, "profile_stages", False) else None)
+    if sprof is not None:
+        print("[info] --profile_stages: per-stage stream syncs enabled; "
+              "measure end-to-end fps in a separate run without this flag.")
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, writer_output_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
-    writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
+    writer = ThreadedVideoWriter(
+        raw_writer, queue_depth=4,
+        encode_ms_cb=((lambda ms: sprof.add("encode_write", ms))
+                      if sprof is not None else None),
+    )
 
     # Reuse the homography frame as the first iteration; subsequent
     # iterations pull from a background thread that decodes the next
@@ -750,6 +860,7 @@ def run(args):
         # Periodic FG recompute.
         if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
                 and frame_idx % fg_recompute_frames == 0):
+            _t_st = _stage_begin(sprof)
             if dev["cuda_available"]:
                 fg_mask_bbox_t = compute_fg_mask_seg_gpu(
                     fg_segmenter, frame_a, frame_b, fg_class_ids,
@@ -767,8 +878,10 @@ def run(args):
                     fg_only_class_ids=fg_only_class_ids,
                     depth_threshold=fg_depth_threshold,
                 )
+            _stage_end(sprof, "segmentation_fg", _t_st)
 
         # Warp.
+        _t_st = _stage_begin(sprof)
         warped_a_t = warped_b_t = None
         warped_a = warped_b = None
         if dev["cuda_available"]:
@@ -785,6 +898,7 @@ def run(args):
                 frame_b_g = frame_b
             warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
             warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
+        _stage_end(sprof, "warp", _t_st)
 
         # Async motion: submit this frame's warped tensors to the motion
         # worker (best-effort — if its queue is full, the worker is
@@ -869,6 +983,7 @@ def run(args):
 
         ds = max(1, args.seam_downscale)
 
+        _t_st = _stage_begin(sprof)
         if dev["cuda_available"]:
             has_person = (person_mask_bbox_t.any().item()
                           if person_mask_bbox_t is not None else False)
@@ -937,11 +1052,14 @@ def run(args):
                 )
             else:
                 cost_small = cost_for_dp.copy()
+        _stage_end(sprof, "cost_map", _t_st)
 
+        _t_st = _stage_begin(sprof)
         add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
         seam_x_small = find_dp_seam(cost_small)
         seam_prev_small = seam_x_small.copy()
         seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
+        _stage_end(sprof, "dp_seam", _t_st)
 
         # Snapshot the FG mask for the debug overlay (composite stage
         # may run a frame later, so we capture the version that's
@@ -1123,6 +1241,7 @@ def run(args):
                         return
                     frame_a_yolo, frame_b_yolo = item
                     t_work0 = time.perf_counter()
+                    _t_st = _stage_begin(sprof)
 
                     if dev["cuda_available"]:
                         mask_a_src_t, mask_b_src_t = (
@@ -1209,6 +1328,7 @@ def run(args):
 
                     with mask_lock:
                         mask_holder[0] = new_holder
+                    _stage_end(sprof, "segmentation_person", _t_st)
                     if prof is not None:
                         prof["yolo"].record(
                             (time.perf_counter() - t_work0) * 1000
@@ -1242,6 +1362,7 @@ def run(args):
                     item = motion_q.get()
                     if item is SENTINEL:
                         return
+                    _t_st = _stage_begin(sprof)
 
                     # Dilate radius is halved on the half-res grid so the
                     # mask grows to the same effective px on the final
@@ -1508,6 +1629,7 @@ def run(args):
 
                     with motion_mask_lock:
                         motion_mask_holder[0] = new_holder
+                    _stage_end(sprof, "motion", _t_st)
         except Exception as e:
             worker_error[0] = e
 
@@ -1566,7 +1688,9 @@ def run(args):
                     if item is SENTINEL:
                         return
                     t_work0 = time.perf_counter()
+                    _t_st = _stage_begin(sprof)
                     result = composite_one(item)
+                    _stage_end(sprof, "blend", _t_st)
                     if prof is not None:
                         prof["composite"].record(
                             (time.perf_counter() - t_work0) * 1000
@@ -1674,6 +1798,9 @@ def run(args):
 
     if prof is not None:
         _print_profile(prof, "final profile (over entire run)")
+
+    if sprof is not None:
+        _print_stage_report(sprof, frame_idx)
 
     cap_a.release()
     cap_b.release()

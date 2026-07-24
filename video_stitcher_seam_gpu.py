@@ -277,6 +277,26 @@ Multi-band blending:
                                 seam. --blend_levels is ignored.
                                 Mutually exclusive with --no_blending.
 
+Diagnostics:
+    --profile                   Rolling + end-of-run per-stage host
+                                timings (decode, compute, composite,
+                                yolo, queue waits) in the overlapped
+                                pipeline. Zero overhead when off.
+    --profile_interval F        Seconds between rolling prints when
+                                --profile is set. Default: 5.0.
+    --profile_stages            True per-stage latency breakdown for
+                                the timing table: warping, segmentation
+                                (person + FG), motion detection, cost
+                                map + penalties + EMA, DP seam,
+                                blending, encode/write. Each stage is
+                                bracketed by a CUDA stream sync so the
+                                window contains exactly that stage's
+                                GPU work; prints an amortized ms/frame
+                                table plus ready-to-paste LaTeX rows at
+                                the end of the run. The syncs serialize
+                                the pipeline — measure end-to-end fps
+                                in a separate run without this flag.
+
 Usage
 -----
     python video_stitcher_seam_gpu.py \\
@@ -499,6 +519,18 @@ def main():
     parser.add_argument("--profile_interval", type=float, default=5.0,
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
+    parser.add_argument("--profile_stages", action="store_true",
+                        help="Measure true per-stage latencies (warp, "
+                             "segmentation, motion, cost map, DP seam, "
+                             "blending, encode/write): each stage is "
+                             "bracketed by a CUDA stream sync, and an "
+                             "amortized ms/frame breakdown (plus "
+                             "ready-to-paste LaTeX table rows) is "
+                             "printed at the end of the run. The syncs "
+                             "serialize the pipeline, so end-to-end fps "
+                             "under this flag is not representative — "
+                             "measure throughput in a separate run "
+                             "without it.")
     args = parser.parse_args()
     if args.no_blending and args.naive_alpha_blend:
         parser.error("--no_blending and --naive_alpha_blend are "

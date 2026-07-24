@@ -2,6 +2,7 @@
 
 import queue
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -120,12 +121,24 @@ class ThreadedVideoWriter:
 
     _SENTINEL = object()
 
-    def __init__(self, writer, queue_depth=4):
+    def __init__(self, writer, queue_depth=4, encode_ms_cb=None):
         self.writer = writer
         self.q = queue.Queue(maxsize=queue_depth)
         self.exception = None
+        # Optional callback receiving the cv2 encode duration of each
+        # frame in ms (used by --profile_stages). The GPU-event wait and
+        # post_sync_fn are deliberately excluded — they aren't encode.
+        self.encode_ms_cb = encode_ms_cb
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    def _encode(self, arr):
+        if self.encode_ms_cb is None:
+            self.writer.write(arr)
+            return
+        t0 = time.perf_counter()
+        self.writer.write(arr)
+        self.encode_ms_cb((time.perf_counter() - t0) * 1000.0)
 
     def _run(self):
         try:
@@ -139,11 +152,11 @@ class ThreadedVideoWriter:
                     arr = item.pinned.numpy()
                     if item.post_sync_fn is not None:
                         arr = item.post_sync_fn(arr)
-                    self.writer.write(arr)
+                    self._encode(arr)
                     if item.free_cb is not None:
                         item.free_cb()
                 else:
-                    self.writer.write(item)
+                    self._encode(item)
         except Exception as e:
             self.exception = e
 
