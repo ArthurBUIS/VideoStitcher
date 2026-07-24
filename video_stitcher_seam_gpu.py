@@ -266,6 +266,16 @@ Multi-band blending:
                                 differ in exposure or alignment.
                                 --blend_width and --blend_levels are
                                 ignored.
+    --naive_alpha_blend         Replace multi-band blending with a
+                                single-band alpha blend: A and B are
+                                feathered across a single soft ramp of
+                                width --blend_width around the DP seam
+                                (out = m*A + (1-m)*B). Cheaper than
+                                multi-band, but low-frequency exposure
+                                differences between the cameras stay
+                                visible as a smooth band around the
+                                seam. --blend_levels is ignored.
+                                Mutually exclusive with --no_blending.
 
 Usage
 -----
@@ -390,6 +400,12 @@ def main():
                              "two frames at the DP seam instead. "
                              "--blend_width and --blend_levels are "
                              "ignored.")
+    parser.add_argument("--naive_alpha_blend", action="store_true",
+                        help="Replace multi-band blending with a "
+                             "single-band alpha blend over one soft "
+                             "ramp of width --blend_width around the "
+                             "DP seam. --blend_levels is ignored. "
+                             "Mutually exclusive with --no_blending.")
     parser.add_argument("--seam_lambda", type=float, default=8.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
     parser.add_argument("--person_penalty", type=float, default=PERSON_PENALTY,
@@ -484,6 +500,9 @@ def main():
                         help="Seconds between rolling profile prints when "
                              "--profile is set. Default: 5.0.")
     args = parser.parse_args()
+    if args.no_blending and args.naive_alpha_blend:
+        parser.error("--no_blending and --naive_alpha_blend are "
+                     "mutually exclusive.")
     run(args)
 
 

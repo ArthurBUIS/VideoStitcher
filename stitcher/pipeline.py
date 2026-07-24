@@ -309,7 +309,8 @@ def run(args):
           f"cost_ema={ema_eff}  "
           f"blend_width={args.blend_width}  "
           f"blend_levels={args.blend_levels}  "
-          f"blending={not getattr(args, 'no_blending', False)}")
+          f"blend_mode="
+          f"{'none' if getattr(args, 'no_blending', False) else 'naive_alpha' if getattr(args, 'naive_alpha_blend', False) else 'multiband'}")
     print(f"[info] seam_lambda={args.seam_lambda}  "
           f"seam_edge_margin={args.seam_edge_margin}")
 
@@ -1004,6 +1005,7 @@ def run(args):
                 args.blend_width, args.blend_levels,
                 pinned, gpu_ctx,
                 no_blending=getattr(args, "no_blending", False),
+                naive_alpha_blend=getattr(args, "naive_alpha_blend", False),
             )
             fg_for_debug = payload["fg_for_debug"]
             person_for_debug = payload["person_for_debug"]
@@ -1052,6 +1054,7 @@ def run(args):
             static, seam_x_full,
             args.blend_width, args.blend_levels, out_buf,
             no_blending=getattr(args, "no_blending", False),
+            naive_alpha_blend=getattr(args, "naive_alpha_blend", False),
         )
         if args.debug_mask:
             # Layer FG (yellow) < motion (blue) < person (red).

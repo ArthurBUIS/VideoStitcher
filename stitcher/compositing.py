@@ -136,7 +136,7 @@ def _reconstruct_from_laplacian_torch(lp, kernel2d):
 
 def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
                               blend_width, blend_levels, gpu_ctx,
-                              no_blending=False):
+                              no_blending=False, naive_alpha_blend=False):
     """
     Shared multi-band Laplacian blend on GPU.
 
@@ -233,6 +233,18 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
         col_idx = torch.arange(strip_w, device=device).view(1, -1)
         hard_m = (col_idx < seam_t).unsqueeze(0)     # (1, H_bb, strip_w)
         blended_strip_t = torch.where(hard_m, a_strip_filled, b_strip_filled)
+    elif naive_alpha_blend:
+        # Single-band feather: out = m*A + (1-m)*B on the same soft
+        # ramp the multi-band path uses, but with no pyramid — the
+        # full-resolution mask is the only band.
+        mask_strip_np = build_soft_mask_fast(
+            seam_x_strip, (H_bb, strip_w), strip_static, blend_width,
+        )
+        mask_strip_t = torch.from_numpy(mask_strip_np).to(device,
+                                                          non_blocking=True)
+        m = mask_strip_t.unsqueeze(0)                # (1, H_bb, strip_w)
+        blended = torch.lerp(b_strip_filled.float(), a_strip_filled.float(), m)
+        blended_strip_t = blended.round().clamp(0, 255).to(torch.uint8)
     else:
         mask_strip_np = build_soft_mask_fast(
             seam_x_strip, (H_bb, strip_w), strip_static, blend_width,
@@ -278,7 +290,8 @@ def _composite_to_gpu_tensor(warped_a_t, warped_b_t, static, seam_x_full,
 
 def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
                                    blend_width, blend_levels,
-                                   pinned_buf, gpu_ctx, no_blending=False):
+                                   pinned_buf, gpu_ctx, no_blending=False,
+                                   naive_alpha_blend=False):
     """
     Asynchronous GPU composite.
 
@@ -300,6 +313,7 @@ def composite_multiband_gpu_async(warped_a_t, warped_b_t, static, seam_x_full,
     out_t = _composite_to_gpu_tensor(
         warped_a_t, warped_b_t, static, seam_x_full,
         blend_width, blend_levels, gpu_ctx, no_blending=no_blending,
+        naive_alpha_blend=naive_alpha_blend,
     )
     out_hwc = out_t.permute(1, 2, 0).contiguous()
     pinned_buf.copy_(out_hwc, non_blocking=True)
@@ -373,7 +387,7 @@ def blend_pyramids_fast_cpu(lp_a, lp_b, gp_m):
 
 def composite_multiband_cpu(warped_a, warped_b, static, seam_x_full,
                             blend_width, blend_levels, out_buf,
-                            no_blending=False):
+                            no_blending=False, naive_alpha_blend=False):
     """CPU multi-band Laplacian blend using cv2.pyrDown / pyrUp."""
     x0, y0, x1, y1 = static["overlap_bbox"]
     out_buf.fill(0)
@@ -390,6 +404,15 @@ def composite_multiband_cpu(warped_a, warped_b, static, seam_x_full,
         col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
         hard = col_idx < seam_x_full[:, None]
         blended_bb = np.where(hard[:, :, None], a_bb_pad, b_bb_pad)
+    elif naive_alpha_blend:
+        # Single-band feather: out = m*A + (1-m)*B on the same soft
+        # ramp the multi-band path uses, with no pyramid.
+        mask_f32 = build_soft_mask_fast(seam_x_full, bbox_shape, static,
+                                        blend_width)
+        m3 = mask_f32[:, :, None]
+        blended = (a_bb_pad.astype(np.float32) * m3
+                   + b_bb_pad.astype(np.float32) * (1.0 - m3))
+        blended_bb = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
     else:
         mask_f32 = build_soft_mask_fast(seam_x_full, bbox_shape, static,
                                         blend_width)
