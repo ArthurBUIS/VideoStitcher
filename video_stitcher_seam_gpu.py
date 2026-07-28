@@ -94,11 +94,14 @@ same type):
     --yoloe_person_class STR    Text prompt for the person class when
                                 --person_model is yoloe. Default:
                                 "person".
-    --yoloe_fg_classes STR ...  Text prompts for static FG classes when
-                                --fg_model is yoloe. Multi-word prompts
-                                must be quoted ("dining table"). Default:
-                                chair couch bed "dining table" tv laptop
-                                book "potted plant" backpack.
+    --yoloe_fg_classes STR ...  DEAD FLAG — parsed but never read.
+                                With --fg_model yoloe the FG vocabulary
+                                comes from stitcher/static_fg.py
+                                (ALWAYS_KEEP + FOREGROUND_ONLY); with
+                                --fg_model yolov8 it comes from
+                                --fg_classes (COCO IDs). Edit
+                                static_fg.py to change the YOLOE
+                                vocabulary.
 
 Person mask:
     --yolo_every N              Run the person model once every N frames;
@@ -395,13 +398,12 @@ def main():
                         default=["chair", "couch", "bed", "dining table",
                                  "tv", "laptop", "book", "potted plant",
                                  "backpack"],
-                        help="Text prompts for static FG classes. Used "
-                             "ONLY when --fg_model is yolov8 (alongside "
-                             "--fg_classes for COCO IDs). When --fg_model "
-                             "is yoloe, the FG vocabulary comes from "
-                             "stitcher/static_fg.py's ALWAYS_KEEP + "
-                             "FOREGROUND_ONLY lists and this flag is "
-                             "ignored. Edit those lists to tune.")
+                        help="DEAD FLAG: parsed but never read by the "
+                             "pipeline. The YOLOE FG vocabulary comes "
+                             "from stitcher/static_fg.py's ALWAYS_KEEP + "
+                             "FOREGROUND_ONLY lists; the YOLOv8 FG "
+                             "classes come from --fg_classes. Edit "
+                             "static_fg.py to tune the YOLOE vocabulary.")
     parser.add_argument("--static_fg_depth_threshold", type=float,
                         default=None,
                         help="Override the normalized-depth threshold "

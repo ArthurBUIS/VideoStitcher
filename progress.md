@@ -58,7 +58,10 @@ Root files (no directory of their own):
 - `video_stitcher_seam_gpu.py` — **entry point.** Owns the full argparse
   (every CLI flag + its docstring rationale) and calls
   `stitcher.pipeline.run`.
-- `README.md` — user-facing quick start + flag overview.
+- `README.md` — user-facing entry ramp: core idea, install, run, repo
+  layout, common-tasks / troubleshooting tables, known limitations. Points
+  here for the technical detail.
+- `requirements.txt` — dependency list (unpinned; required vs optional).
 
 ## Start here
 | If you want to… | Read |
@@ -91,7 +94,8 @@ Root files (no directory of their own):
 
 ## Build / run
 ```bash
-pip install opencv-python numpy torch ultralytics
+pip install -r requirements.txt
+# required: opencv-python numpy torch ultralytics
 # optional: numba (seam DP speedup), transformers pillow (depth filter)
 
 python video_stitcher_seam_gpu.py \
@@ -113,10 +117,14 @@ flag list; the entry-script module docstring documents every flag.
 - CUDA-capable GPU recommended (YOLO + grid_sample warp + pyramid blend all
   benefit). The depth-filter cost note in `stitcher/static_fg.py` was
   measured on a T1000. Runs fully on CPU otherwise — slower but functional.
-- No specific CUDA/driver/PyTorch versions are pinned in-repo. `TODO(verify)`
-  exact CUDA toolkit / driver / Python versions (no `requirements.txt`,
-  `pyproject.toml`, or environment file is committed).
+- No specific CUDA/driver/PyTorch versions are pinned in-repo.
+  `requirements.txt` lists the packages (required vs optional) but leaves
+  versions open; it records the dev-machine versions as a comment only.
 
 ## TODO(verify)
-- Exact dependency versions and Python version — no lockfile/manifest exists.
+- Exact CUDA toolkit / driver versions — never recorded; `requirements.txt`
+  is unpinned and no lockfile or `pyproject.toml` exists.
 - License — `README.md` states "TBD".
+- `--yoloe_fg_classes` is parsed by argparse but read nowhere (no
+  `args.yoloe_fg_classes` reference in the repo). Either wire it into the
+  YOLOE FG path or delete the flag; docstring + help now mark it dead.

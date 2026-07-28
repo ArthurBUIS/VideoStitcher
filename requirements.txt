@@ -1,0 +1,27 @@
+# VideoStitcher dependencies.
+#
+# Versions are intentionally unpinned: no specific combination has been
+# validated, and the correct torch build depends on your CUDA version.
+# For GPU, install torch from https://pytorch.org/get-started/locally/
+# BEFORE running this file, so pip doesn't pull the CPU-only wheel.
+#
+# Known-working versions on the development machine (2026-07):
+#   opencv-python 4.13.0, numpy 2.4.4, torch 2.11.0, ultralytics 8.4.56,
+#   numba 0.66.0, transformers 5.9.0, pillow 12.2.0, Python 3.13.
+
+# --- Required ---------------------------------------------------------
+opencv-python
+numpy
+torch
+ultralytics          # YOLOv8 + YOLOE segmentation
+
+# --- Optional, but recommended ----------------------------------------
+# numba: ~5x speedup on the DP seam finder. Without it, stitcher/seam.py
+# falls back to a numpy implementation.
+numba
+
+# transformers + pillow: Depth Anything V2, used only by the
+# per-detection depth filter on the --fg_model yoloe path. Without them
+# the depth filter is skipped and every detected FG object is kept.
+transformers
+pillow
